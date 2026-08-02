@@ -233,8 +233,41 @@ billing) is not open source.
 agent/                 the thin agent: root-confined capabilities, self-update, log redaction
 install.sh / .ps1      the one-liners the dashboard hands you
 deploy/                systemd / launchd / schtasks units, heal + uninstall scripts
+docs/ARCHITECTURE.md   how the pieces fit
 docs/INVARIANTS.md     53 load-bearing rules and the failure behind each one
 ```
+
+### Why some `agent/` files are one line
+
+Several modules in `agent/` are stubs that read:
+
+```js
+module.exports = require('../lib/transcript');
+```
+
+They are placeholders, not the implementation. The transcript parsers and disk primitives
+are **shared between the master and the agent**, and the master distributes them to each
+machine at install and update time (an `AGENT_FILES` manifest), so an installed agent under
+`~/.termdeck/agent/` has the full modules sitting flat beside `agent.js`.
+
+There is one copy of those rules, on purpose — two copies of a transcript parser drift, and
+a drifted parser is how you get a chat that renders differently depending on which side read
+it. The stub is what keeps a repo-run agent pointing at the same file rather than a fork of
+it.
+
+The practical consequence: **cloning this repo and running `node agent/agent.js` will not
+work** — those requires have nothing to resolve to here. Install via the one-liner above,
+which fetches a complete agent. What is fully present in this repo is the agent's own code:
+
+| File | Lines | What it is |
+|---|---:|---|
+| [`agent/capabilities.js`](agent/capabilities.js) | 1,236 | the entire capability surface — the trust boundary |
+| [`agent/limits.js`](agent/limits.js) | 649 | rate-limit and usage reading |
+| [`agent/agent.js`](agent/agent.js) | 377 | dial-out, reconnect, self-update with rollback |
+| [`agent/log.js`](agent/log.js) | 105 | bounded, rotated, token-redacted logging |
+
+If you are auditing what a Termdeck machine will do, `capabilities.js` is the file. Nothing
+outside it is reachable over the tunnel.
 
 <br />
 
