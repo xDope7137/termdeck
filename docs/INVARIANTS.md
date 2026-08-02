@@ -1716,18 +1716,6 @@ settings layer nested in it paints under the sidebar's z-indexed chrome at any z
 Machines and Accounts still render from `pages.js` because `renderMachinesSection` is
 shared with the Account page.
 
-## Deploy script flags (`deploy/deploy-web.sh`)
-
-Ships committed frontend to `termdeck.io` (Plesk box `german`, systemd `termdeck-master`):
-stamps `?v=`/`public/VERSION`, pushes `origin/main`, box `git reset --hard origin/main`.
-Default = NO restart (static files go live on pull, active chats safe). `--full` restarts
-master to apply backend/`lib`/`agent` changes and SIGKILLs in-flight remote turns.
-`--bust` forces a `sw.js` CACHE bump so a JS-only change lands on already-open tabs
-immediately (drops the 0-RTT offline shell once); otherwise the auto CACHE bump is scoped
-to `public/index.html` changes and a JS-only change still reaches open tabs on the next
-visit via the SW's stale-while-revalidate. `--force` commits a dirty tree, `--dry-run`
-previews. Full flow + one-time box setup are in the script header.
-
 ## Test-suite rules (`test.mjs`)
 
 - **A green run prints one line per tier.** The cost of a suite is its output, not its
