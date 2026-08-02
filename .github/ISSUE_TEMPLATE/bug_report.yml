@@ -1,0 +1,37 @@
+name: Bug report
+description: Something in Termdeck behaves differently than it should
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      options: ["Claude Code", "OpenAI Codex CLI", "Grok", "Not engine specific"]
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Machine OS
+      options: ["Linux", "macOS", "Windows"]
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent version
+      description: "From ~/.termdeck/agent/package.json"
+      placeholder: "0.0.52"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Agent log
+      description: "~/.termdeck/agent.log — the token is redacted on the way in, but skim it before pasting."
+      render: shell

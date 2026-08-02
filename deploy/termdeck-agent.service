@@ -1,0 +1,26 @@
+# Termdeck thin agent (Linux) — dials OUT to the cloud master and serves narrow,
+# root-confined capabilities so the master can browse/drive this box's sessions.
+# systemd USER unit (needs `loginctl enable-linger <user>` to run headless).
+#
+# Install:
+#   printf 'TERMDECK_AGENT_TOKEN=agt_…\nTERMDECK_MASTER_URL=https://termdeck.io\n' > ~/.termdeck/agent.env
+#   chmod 600 ~/.termdeck/agent.env
+#   cp deploy/termdeck-agent.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now termdeck-agent
+#
+# On the master's own box, point TERMDECK_MASTER_URL at http://127.0.0.1:4530 (loopback,
+# skips the tunnel round-trip). The agent reconnects on its own with backoff.
+[Unit]
+Description=Termdeck thin agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.termdeck/agent.env
+ExecStart=/usr/bin/env node %h/Work/Ai/projects/termdeck/agent/agent.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

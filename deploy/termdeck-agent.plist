@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Termdeck thin agent — macOS launchd user agent. install.sh writes this for you;
+     this template is for manual setup. Put it at:
+       ~/Library/LaunchAgents/in.bhavikp.termdeck-agent.plist
+     then:  launchctl load ~/Library/LaunchAgents/in.bhavikp.termdeck-agent.plist
+     Fill in the node path (which node), the agent path, and this machine's token. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>in.bhavikp.termdeck-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/YOU/.termdeck/agent/agent.js</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TERMDECK_AGENT_TOKEN</key><string>agt_...</string>
+    <key>TERMDECK_MASTER_URL</key><string>https://termdeck.io</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
