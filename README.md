@@ -20,7 +20,7 @@ Claude Code, OpenAI Codex CLI and Grok — one fleet board, every device, tool a
 
 <br />
 
-<img src="media/termdeck-dashboard.png" alt="Termdeck fleet board showing Claude Code and Codex CLI sessions across three machines, with a NEEDS YOU tray for sessions blocked on a tool approval" width="880" />
+<img src="media/termdeck-demo.gif" alt="Termdeck demo: the fleet board across three machines, approving a Claude Code tool permission from a phone, answering the agent's question inline, and Claude Code, Codex CLI and Grok running in parallel" width="880" />
 
 </div>
 
