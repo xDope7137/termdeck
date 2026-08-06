@@ -17,6 +17,7 @@ Claude Code, OpenAI Codex CLI and Grok — one fleet board, every device, tool a
 [![Uptime](https://img.shields.io/badge/uptime-99.97%25-3f9142?style=flat-square)](https://termdeck.io?ref=github)
 [![Engines](https://img.shields.io/badge/engines-Claude%20%C2%B7%20Codex%20%C2%B7%20Grok-1f2937?style=flat-square)](#three-engines-one-ui)
 [![Agent license](https://img.shields.io/badge/agent-MIT-1f2937?style=flat-square)](LICENSE)
+[![Instagram](https://img.shields.io/badge/instagram-%40termdeck-E4405F?style=flat-square&logo=instagram&logoColor=white)](https://instagram.com/termdeck)
 
 <br />
 
@@ -279,6 +280,6 @@ outside it is reachable over the tunnel.
 
 If this is the thing you keep wishing existed, a ⭐ helps other people find it.
 
-<sub>Built by <a href="https://bhavikp.in">Bhavik Patel</a> · <a href="https://termdeck.io?ref=github">termdeck.io</a></sub>
+<sub>Built by <a href="https://bhavikp.in">Bhavik Patel</a> · <a href="https://termdeck.io?ref=github">termdeck.io</a> · <a href="https://instagram.com/termdeck">@termdeck</a></sub>
 
 </div>
