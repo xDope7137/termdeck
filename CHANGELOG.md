@@ -4,6 +4,50 @@ Termdeck ships continuously — 417 production deploys in the first 37 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.54x — 2026-08-08
+
+- **A documentation site at [/docs](https://termdeck.io/docs?ref=github).** Install, the three
+  engines, permissions, machines and troubleshooting — instead of a README and a FAQ page.
+- **A machine you removed stops stranding its agent.** That box kept dialling a master which
+  no longer knew it. The owner is now told, on the machine card, with the fix.
+- **Confirmation links outlive a weekend**, and you can ask for a second one when the first
+  has expired instead of starting over.
+
+## 0.1.53x — 2026-08-07
+
+- **New chat is a page, not a modal.** The things the modal was gating — project, machine,
+  engine, model — are the page now.
+- **Every new account starts on Pro for 14 days**, no card.
+- **Annual billing**, with existing subscriptions grandfathered by construction rather than
+  by a migration anyone has to remember to run.
+
+## 0.1.52x — 2026-08-06
+
+- **The homepage leads with a run, not a screenshot of one.**
+- **One house style for every date on screen**, rendered in the reader's own clock rather
+  than the machine's.
+- **An install that will not survive a reboot says so** *(agent)*, on the machine card —
+  rather than the machine quietly going Offline the next time you log out.
+
+## 0.1.50x — 2026-08-05
+
+- **Machines & accounts is one machine-centric page**, with each engine account living
+  inside the machine card it belongs to.
+- **The connect wizard is a checkout, not a token dump.**
+- **One permission-mode vocabulary across all three engines**, so a mode means the same
+  thing whether the chat is Claude, Codex or Grok.
+- **One shared dialog chrome**, and the last native `alert()`s are gone.
+
+## 0.1.4xx — 2026-08-03/04 — deploys stop killing turns
+
+- **A restart no longer kills the turn you are watching** *(agent)*. A dropped socket used to
+  SIGKILL every CLI child on the machine, so a deploy, a Cloudflare idle drop or one missed
+  pong murdered healthy in-flight runs. The link and the child now have independent
+  lifetimes: the turn parks on your own box and re-attaches, making a master restart a pause
+  of a few seconds instead of lost work. Codex and Grok survive link gaps the same way.
+- **A message you queued survives a master restart** too.
+- **A restart says goodbye** rather than vanishing mid-stream.
+
 ## 0.1.388 — 2026-08-02
 
 - **A missing worktree folder is a notice, not a lock.** The composer went dead behind
