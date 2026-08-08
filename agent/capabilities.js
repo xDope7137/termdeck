@@ -12,7 +12,10 @@ const os = require('os');
 const path = require('path');
 const { spawn, execFile } = require('child_process');
 const { randomUUID } = require('crypto');
-let worktrees; try { worktrees = require('./worktrees'); } catch { worktrees = null; } // guarded like the U5/U8 readers: a missing module degrades one capability, never crash-loops boot
+// Park-don't-kill (LIVE-DEPLOY Phase 2): children survive socket closes in a
+// module-level registry — capabilities are remade per connection, parked
+// children must not be. killTree lives there now (one copy, both callers).
+const { registry: parkRegistry, killTree } = require('./park');
 const diffLib = require('./diff'); // stub → ../lib/diff (repo run); shipped as diff.js on installed agents
 // Tail reads — how the master gets "the last fifteen messages" without pulling
 // the whole transcript across the tunnel. Guarded like the readers below: an
@@ -29,13 +32,19 @@ let sessionSettingsLib; try { sessionSettingsLib = require('./session-settings')
 // U5/U8 readers — distributed like diff. Guarded so an agent that pulled a new
 // capabilities.js before these files land (self-update ordering) still boots and
 // serves every other capability; the op below returns a clean "outdated" error.
-let contextDocLib; try { contextDocLib = require('./context-doc'); } catch { contextDocLib = null; }
 let mcpConfigLib; try { mcpConfigLib = require('./mcp-config'); } catch { mcpConfigLib = null; }
 // /rewind — the same lib/checkpoints.js the hub restores from, so a cloud restore
 // and a local one resolve the same backups by the same rules. Guarded like the
 // rest: an agent that pulled a new capabilities.js before checkpoints.js landed
 // still boots and answers AGENT_OUTDATED for this one op.
 let checkpointsLib; try { checkpointsLib = require('./checkpoints'); } catch { checkpointsLib = null; }
+// Read-only browsing of a session's PROJECT folder — the one READ that lands
+// outside the transcript roots, and the module that IS its confinement. Guarded
+// like the rest: an agent that pulled a new capabilities.js before this file
+// landed still boots, and the op answers AGENT_OUTDATED instead of crash-looping.
+let projectFilesLib; try { projectFilesLib = require('./project-files'); } catch { projectFilesLib = null; }
+let machineConfigLib; try { machineConfigLib = require('./machine-config'); } catch { machineConfigLib = null; }
+let projectDocLib; try { projectDocLib = require('./project-doc'); } catch { projectDocLib = null; }
 // Account switching (cloud path) — same lib/accounts.js the hub uses, via the
 // agent/accounts.js stub. Its cache-invalidation hooks point at THIS agent's
 // own caches (claudeModelCache below, agent/limits.js's), not the hub's.
@@ -169,6 +178,29 @@ async function confined(p) {
   }
 }
 
+// The injected reader lib/index-head.js's parse runs against — local fs, since
+// this is the box that holds the disk. Two callers now (`indexHeads` batches it
+// across the session list, `projectFiles` runs it on ONE transcript to learn
+// where that chat's project folder is), so it is built in one place: two copies
+// would be two answers to "what is this chat's cwd", and the second one would be
+// the one that decides what may be read.
+function headIo() {
+  return {
+    path,
+    readFile: async (p, offset = 0, len = null) => {
+      const fd = await fsp.open(p, 'r');
+      try {
+        const st = await fd.stat();
+        const length = len == null ? Math.max(0, st.size - offset) : len;
+        const buf = Buffer.alloc(Math.max(0, length));
+        const { bytesRead } = length > 0 ? await fd.read(buf, 0, length, Math.max(0, offset)) : { bytesRead: 0 };
+        return buf.subarray(0, bytesRead);
+      } finally { await fd.close(); }
+    },
+    readAll: (p) => fsp.readFile(p),
+  };
+}
+
 // Could this file be a session transcript for `kind`? A coarse structural test,
 // used only to keep `indexScan` from putting obviously-irrelevant files on the
 // wire — the master re-checks every survivor against its own exact patterns, so
@@ -220,6 +252,14 @@ const ENGINES = {
 // limits.js spawns a short-lived `codex app-server` to read live usage; hand it
 // the binary resolved here so there is one answer to "which codex" on this box.
 try { require('./limits').setCodexExe(ENGINES.codex); } catch {}
+try { require('./codex-accounts').setCodexExe(ENGINES.codex); } catch {}
+// Same for claude, and for the same reason — with the same cost when it lapses.
+// accounts.js resolves independently (which.js, PATHEXT order) and on a box with
+// BOTH an npm global and a WinGet install those two orders pick DIFFERENT
+// binaries: turns ran on one, `auth login` was driven on the other, and the
+// sign-in hung with every payload internally consistent. The binary that runs
+// the turns is the one whose login matters, so it wins.
+try { require('./accounts').setClaudeExe(ENGINES.claude); } catch {}
 
 const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -458,6 +498,18 @@ async function cliStatus() {
         engine === 'claude' ? claudeLogin() : engine === 'codex' ? codexLogin() : Promise.resolve(grokLogin()),
       ]);
       const row = { engine, installed: present, path: present ? exe : null, version, ...auth };
+      // Can this machine be signed in FROM the dashboard, or only at its own
+      // keyboard? Only this box can answer — it owns the CLI and the shape it
+      // was installed in (lib/accounts.js signInSupport). Sent even when already
+      // signed in, because the answer governs whether ADDING another account is
+      // offered. Absent from an older agent, which the browser reads as "yes"
+      // and behaves exactly as it did before.
+      if (engine === 'claude' && present && accountsLib && accountsLib.signInSupport) {
+        try { row.signIn = accountsLib.signInSupport(); } catch { /* never fail the whole status over it */ }
+      }
+      if (engine === 'codex' && present && codexAccountsLib && codexAccountsLib.signInSupport) {
+        try { row.signIn = codexAccountsLib.signInSupport(); } catch { /* same */ }
+      }
       // Claude's catalog is the one the browser fetches through this agent, so the
       // status page answers "why is my model picker empty?" without a second trip.
       if (engine === 'claude' && present) {
@@ -478,6 +530,10 @@ function makeCapabilities(send) {
   const watchers = new Map(); // watchId -> chokidar watcher
   const procs = new Map();    // procId -> child process
   const persistentProcs = new Set(); // subset of procs that outlive a turn (the codex app-server, the grok agent-stdio child) — must NOT count as "busy"
+  // Children born on this connection get generation-scoped park keys, so a NEW
+  // master's procIds (a fresh Transport counts from 1 again) can never collide
+  // with a parked survivor of the old one.
+  parkRegistry.newGeneration();
 
   async function handle(m) {
     switch (m && m.t) {
@@ -550,20 +606,7 @@ function makeCapabilities(send) {
         if (!indexHeadLib) return send({ t: 'indexHeads', id: m.id, ok: false, error: 'agent is out of date (index-head module missing) — update the agent', code: 'AGENT_OUTDATED' });
         try {
           const rows = Array.isArray(m.rows) ? m.rows.slice(0, 1000) : [];
-          const io = {
-            path,
-            readFile: async (p, offset = 0, len = null) => {
-              const fd = await fsp.open(p, 'r');
-              try {
-                const st = await fd.stat();
-                const length = len == null ? Math.max(0, st.size - offset) : len;
-                const buf = Buffer.alloc(Math.max(0, length));
-                const { bytesRead } = length > 0 ? await fd.read(buf, 0, length, Math.max(0, offset)) : { bytesRead: 0 };
-                return buf.subarray(0, bytesRead);
-              } finally { await fd.close(); }
-            },
-            readAll: (p) => fsp.readFile(p),
-          };
+          const io = headIo();
           const heads = [];
           for (const row of rows) {
             // Confinement is per ROW, not per batch: one bad path must not
@@ -591,6 +634,14 @@ function makeCapabilities(send) {
           if (m.op === 'set') {
             const value = await sessionSettingsLib.writeThinking(root, m.sessionId, m.thinking ?? null);
             return send({ t: 'sessionSettings', id: m.id, ok: true, thinking: value });
+          }
+          if (m.op === 'setRunOptions') {
+            // Validation is the shared module's, run HERE as well as on the
+            // master: these values become argv for a process on this box, and a
+            // master is not the thing that gets to decide that.
+            if (!sessionSettingsLib.writeRunOptions) return send({ t: 'sessionSettings', id: m.id, ok: false, error: 'agent is out of date (run options unsupported) — update the agent', code: 'AGENT_OUTDATED' });
+            const value = await sessionSettingsLib.writeRunOptions(root, m.sessionId, m.runOptions ?? null);
+            return send({ t: 'sessionSettings', id: m.id, ok: true, runOptions: value });
           }
           return send({ t: 'sessionSettings', id: m.id, ok: true, settings: await sessionSettingsLib.readSettings(root) });
         } catch (e) { send({ t: 'sessionSettings', id: m.id, ok: false, error: e.code || e.message }); }
@@ -714,7 +765,7 @@ function makeCapabilities(send) {
             await fsp.writeFile(dst, out);
             return send({ t: 'mutate', id: m.id, ok: true });
           }
-          if (m.op === 'title' || m.op === 'tag') {
+          if (m.op === 'title' || m.op === 'tag' || m.op === 'ai-title') {
             // A title/tag the TERMINAL also sees (SDK-SIGNALS §E). Narrow and
             // typed on purpose, exactly like `limits` and `models` below: the
             // master names the session and the string, never the record, so this
@@ -724,8 +775,17 @@ function makeCapabilities(send) {
             const rp = await fsp.realpath(m.path);
             if (!(await confined(rp))) return send({ t: 'mutate', id: m.id, ok: false, error: 'path not permitted' });
             const sessionTitle = require('./session-title');
+            // `ai-title` is the DERIVED title Termdeck writes for a chat the CLI
+            // never titled (see lib/session-title.js). Guarded on its own: an
+            // agent that pulled this capabilities.js before session-title.js
+            // must say so rather than throw, exactly like the module guards up top.
+            if (m.op === 'ai-title' && typeof sessionTitle.aiTitleRecord !== 'function') {
+              return send({ t: 'mutate', id: m.id, ok: false, error: 'agent is out of date (ai-title unsupported) — update the agent', code: 'AGENT_OUTDATED' });
+            }
             const record = m.op === 'title'
               ? sessionTitle.titleRecord(m.sessionId, m.title)
+              : m.op === 'ai-title'
+              ? sessionTitle.aiTitleRecord(m.sessionId, m.title)
               : sessionTitle.tagRecord(m.sessionId, m.tag ?? null);
             await sessionTitle.appendRecord(rp, record);
             return send({ t: 'mutate', id: m.id, ok: true });
@@ -767,6 +827,121 @@ function makeCapabilities(send) {
           return send({ t: 'restore', id: m.id, ok: true, data });
         } catch (e) {
           send({ t: 'restore', id: m.id, ok: false, error: e.code || e.message });
+        }
+        return;
+      }
+      case 'projectDoc': {
+        // The project's instruction file, read and written (U5's editor, and
+        // V3 §B's `#`). The SECOND write outside the transcript roots after
+        // `restore`, and drawn on the same terms as `projectFiles` one direction
+        // over: the master names a CONFINED transcript and an engine, never a
+        // path and never a filename. The root is resolved HERE out of that
+        // transcript's own head, and the filename comes from a fixed table in
+        // the shared module — a name from the request would be a path from the
+        // request wearing a hat.
+        //
+        // Nothing throws out of this case: an uncaught rejection here takes the
+        // agent down and view-only-locks every live chat on the box.
+        try {
+          if (!projectDocLib || !indexHeadLib) return send({ t: 'projectDoc', id: m.id, ok: false, error: 'agent is out of date (project-doc module missing) — update the agent', code: 'AGENT_OUTDATED' });
+          if (!(await confined(m.path))) return send({ t: 'projectDoc', id: m.id, ok: false, error: 'path not permitted' });
+          const rp = await fsp.realpath(m.path);
+          const engine = m.engine === 'codex' || m.engine === 'grok' ? m.engine : 'claude';
+          let sizeBytes = 0;
+          try { sizeBytes = (await fsp.stat(rp)).size; } catch {}
+          const head = await indexHeadLib.readIndexHead({ path: rp, engine, zst: rp.endsWith('.zst'), sizeBytes }, headIo());
+          if (!head || !head.cwd) return send({ t: 'projectDoc', id: m.id, ok: false, error: 'This chat has no project folder on disk yet', code: 'NO_CWD' });
+          let root;
+          try { root = await fsp.realpath(head.cwd); } catch { return send({ t: 'projectDoc', id: m.id, ok: false, error: `Project folder is missing: ${head.cwd}`, code: 'NO_CWD' }); }
+
+          if (m.op === 'write') {
+            const r = await projectDocLib.writeDoc(root, engine, typeof m.content === 'string' ? m.content : '');
+            return send({ t: 'projectDoc', id: m.id, ok: true, doc: { ...r, content: typeof m.content === 'string' ? m.content : '' } });
+          }
+          if (m.op === 'append') {
+            const r = await projectDocLib.appendDoc(root, engine, m.text);
+            return send({ t: 'projectDoc', id: m.id, ok: true, doc: await projectDocLib.readDoc(root, engine), wrote: r.bytes });
+          }
+          return send({ t: 'projectDoc', id: m.id, ok: true, doc: await projectDocLib.readDoc(root, engine) });
+        } catch (e) {
+          const denied = e.code === 'EACCES' || e.code === 'EPERM';
+          send({ t: 'projectDoc', id: m.id, ok: false, error: denied ? 'Permission denied' : (e.message || e.code), code: denied ? 'DENIED' : (e.code || 'DOC_FAILED') });
+        }
+        return;
+      }
+      case 'machineConfig': {
+        // What the engine is CONFIGURED with (V3 §G + U2's viewer + U9's chain).
+        // Everything it reads is inside a transcript ROOT, so this widens
+        // nothing — it exists because a browser fetching each of these files
+        // over the tunnel would cost dozens of round trips to draw one panel.
+        // The master names no path; the root is this agent's own.
+        if (!machineConfigLib) return send({ t: 'machineConfig', id: m.id, ok: false, error: 'agent is out of date (machine-config module missing) — update the agent', code: 'AGENT_OUTDATED' });
+        try {
+          send({ t: 'machineConfig', id: m.id, ok: true, claude: await machineConfigLib.readClaudeConfig(REAL_ROOTS[0]) });
+        } catch (e) {
+          send({ t: 'machineConfig', id: m.id, ok: false, error: e.code || e.message, code: 'CONFIG_FAILED' });
+        }
+        return;
+      }
+      case 'projectFiles': {
+        // Read-only browsing of a chat's PROJECT folder. Like `restore` this
+        // reaches outside the transcript roots — it has to, the files are the
+        // customer's own checkout — so it is drawn on the same terms, one
+        // direction over: the master names a TRANSCRIPT (confined, like every
+        // other path it may name) and a RELATIVE path, and nothing else. Where
+        // the project root IS gets read HERE, out of that transcript's own head,
+        // by the same lib/index-head.js parse the session index uses. There is no
+        // cwd and no absolute path in the request, so a compromised master cannot
+        // aim this at a folder of its choosing — the worst it can do is read a
+        // real project of a real session, which is the feature.
+        //
+        // `includeHidden` IS a master-named flag, and that is an accepted
+        // widening documented like fsList's: it comes from a per-project toggle
+        // the OWNER set in Settings, the master is the only side that holds that
+        // preference, and it can only ever widen within a root already resolved
+        // from the customer's own transcript. It cannot name a different root.
+        //
+        // Nothing throws out of this case (see the `usage` case's warning): an
+        // uncaught rejection here takes the agent down and view-only-locks every
+        // live chat on the box.
+        try {
+          if (!projectFilesLib || !indexHeadLib) return send({ t: 'projectFiles', id: m.id, ok: false, error: 'agent is out of date (project-files module missing) — update the agent', code: 'AGENT_OUTDATED' });
+          // The string test first, before a single fs call — see validateRelPath.
+          const v = projectFilesLib.validateRelPath(m.relPath);
+          if (v.error) return send({ t: 'projectFiles', id: m.id, ok: false, error: v.error, code: v.code });
+          if (!(await confined(m.path))) return send({ t: 'projectFiles', id: m.id, ok: false, error: 'path not permitted' });
+          const rp = await fsp.realpath(m.path);
+          const engine = m.engine === 'codex' || m.engine === 'grok' ? m.engine : 'claude';
+          let sizeBytes = 0;
+          try { sizeBytes = (await fsp.stat(rp)).size; } catch {}
+          const head = await indexHeadLib.readIndexHead({ path: rp, engine, zst: rp.endsWith('.zst'), sizeBytes }, headIo());
+          if (!head || !head.cwd) return send({ t: 'projectFiles', id: m.id, ok: false, error: 'This chat has no project folder on disk yet', code: 'NO_CWD' });
+          let root;
+          try { root = await fsp.realpath(head.cwd); } catch { return send({ t: 'projectFiles', id: m.id, ok: false, error: `Project folder is missing: ${head.cwd}`, code: 'NO_CWD' }); }
+
+          // Policy runs on the RESOLVED segments, every one of them, so
+          // `.git/config` is refused by its first segment rather than by a rule
+          // about its last. Skipped entirely when the owner has opted in.
+          if (!m.includeHidden) {
+            const hidden = projectFilesLib.hiddenSegment(v.segments);
+            if (hidden) return send({ t: 'projectFiles', id: m.id, ok: false, error: `Hidden and sensitive files are turned off for this project (${hidden})`, code: 'HIDDEN_BLOCKED' });
+          }
+
+          const r = await projectFilesLib.resolveTarget(root, v.segments);
+          if (r.error) return send({ t: 'projectFiles', id: m.id, ok: false, error: r.error, code: r.code });
+
+          // Every read below uses r.target — the RESOLVED path — never the
+          // request string. Same TOCTOU rule as restore/mutate.
+          if (m.op === 'read') {
+            const data = await projectFilesLib.readFileCapped(r.target);
+            if (data.error) return send({ t: 'projectFiles', id: m.id, ok: false, error: data.error, code: data.code });
+            return send({ t: 'projectFiles', id: m.id, ok: true, name: path.basename(r.target), ...data });
+          }
+          const listing = await projectFilesLib.listDir(root, r.target, { includeHidden: !!m.includeHidden });
+          return send({ t: 'projectFiles', id: m.id, ok: true, root, sep: path.sep, ...listing });
+        } catch (e) {
+          const denied = e && (e.code === 'EACCES' || e.code === 'EPERM');
+          send({ t: 'projectFiles', id: m.id, ok: false, error: denied ? 'Permission denied' : (e.code || e.message), code: denied ? 'DENIED' : 'FILES_FAILED' });
         }
         return;
       }
@@ -970,62 +1145,6 @@ function makeCapabilities(send) {
         }
         return;
       }
-      case 'worktree': {
-        try {
-          if (!worktrees) return send({ t: 'worktree', id: m.id, ok: false, error: 'agent is out of date (worktrees module missing) — update the agent', code: 'AGENT_OUTDATED' });
-          const op = m.op;
-          const payload = m.payload && typeof m.payload === 'object' ? m.payload : {};
-          if (op === 'inspect') {
-            return send({ t: 'worktree', id: m.id, ok: true, data: await worktrees.inspectCwd(String(payload.cwd || '')) });
-          }
-          if (op === 'create') {
-            return send({ t: 'worktree', id: m.id, ok: true, data: await worktrees.create({ cwd: String(payload.cwd || ''), engine: payload.engine || null, allowDirtyBase: !!payload.allowDirtyBase }) });
-          }
-          if (op === 'cleanup') {
-            await worktrees.cleanup(payload.meta || null);
-            return send({ t: 'worktree', id: m.id, ok: true, data: { ok: true } });
-          }
-          if (op === 'register') {
-            return send({ t: 'worktree', id: m.id, ok: true, data: await worktrees.register(String(payload.sessionId || ''), payload.meta || null) });
-          }
-          if (op === 'lookup') {
-            return send({ t: 'worktree', id: m.id, ok: true, data: await worktrees.forSession(String(payload.sessionId || '')) });
-          }
-          if (op === 'activeBySession') {
-            return send({ t: 'worktree', id: m.id, ok: true, data: await worktrees.activeBySession() });
-          }
-          if (op === 'preview') {
-            return send({ t: 'worktree', id: m.id, ok: true, data: await worktrees.preview(String(payload.sessionId || '')) });
-          }
-          if (op === 'merge') {
-            return send({ t: 'worktree', id: m.id, ok: true, data: await worktrees.merge(String(payload.sessionId || '')) });
-          }
-          if (op === 'discard') {
-            return send({ t: 'worktree', id: m.id, ok: true, data: await worktrees.discard(String(payload.sessionId || '')) });
-          }
-          // Recovering a worktree the user deleted out from under a chat. Both are
-          // git-only, so they work for every engine.
-          if (op === 'recovery') {
-            return send({ t: 'worktree', id: m.id, ok: true, data: await worktrees.recovery(String(payload.sessionId || '')) });
-          }
-          if (op === 'restore') {
-            return send({ t: 'worktree', id: m.id, ok: true, data: await worktrees.restore(String(payload.sessionId || '')) });
-          }
-          if (op === 'reap') {
-            return send({
-              t: 'worktree',
-              id: m.id,
-              ok: true,
-              // null (index unavailable master-side) must NOT become an empty Set —
-              // an empty active filter would orphan every registered worktree.
-              data: await worktrees.reap({ activeSessionIds: Array.isArray(payload.activeSessionIds) ? new Set(payload.activeSessionIds) : null }),
-            });
-          }
-          return send({ t: 'worktree', id: m.id, ok: false, error: `unknown op: ${op}` });
-        } catch (e) {
-          return send({ t: 'worktree', id: m.id, ok: false, error: e.message, code: e.code || null, status: e.status || null, conflicts: e.conflicts, output: e.output });
-        }
-      }
       case 'git': {
         // Feature 04 (cloud path) — git diff / PR creation for a session, run where
         // the checkout actually lives. cwd is the session's PROJECT dir (like spawn's
@@ -1037,12 +1156,6 @@ function makeCapabilities(send) {
           const cwd = String(payload.cwd || '');
           if (m.op === 'diff') return send({ t: 'git', id: m.id, ok: true, data: await diffLib.collectDiff(cwd) });
           if (m.op === 'pr') return send({ t: 'git', id: m.id, ok: true, data: await diffLib.createPr(cwd, { title: payload.title, body: payload.body }) });
-          // ponytail: contextDoc is a file read, not git, but it rides this frame to
-          // reuse the same server-resolved cwd + trust model (the checkout dir).
-          if (m.op === 'contextDoc') {
-            if (!contextDocLib) return send({ t: 'git', id: m.id, ok: false, error: 'agent is out of date (context-doc module missing) — update the agent', code: 'AGENT_OUTDATED' });
-            return send({ t: 'git', id: m.id, ok: true, data: await contextDocLib.readProjectDoc(cwd, payload.engine) });
-          }
           if (m.op === 'mcpServers') {
             if (!mcpConfigLib) return send({ t: 'git', id: m.id, ok: false, error: 'agent is out of date (mcp-config module missing) — update the agent', code: 'AGENT_OUTDATED' });
             return send({ t: 'git', id: m.id, ok: true, data: await mcpConfigLib.readMcpServers(cwd, payload.engine) });
@@ -1054,7 +1167,7 @@ function makeCapabilities(send) {
       }
       case 'accounts': {
         // Switch which Claude Code account THIS box uses — see lib/accounts.js's
-        // header for the full design. Same op-ladder shape as 'worktree'/'git':
+        // header for the full design. Same op-ladder shape as 'git':
         // one frame type, several ops, each op's own try/catch surfaced as {ok:false}.
         if (!accountsLib) return send({ t: 'accounts', id: m.id, ok: false, error: 'agent is out of date (accounts module missing) — update the agent', code: 'AGENT_OUTDATED' });
         const payload = m.payload && typeof m.payload === 'object' ? m.payload : {};
@@ -1183,10 +1296,37 @@ function makeCapabilities(send) {
         // track them as persistent and exclude them from busy(). Per-turn claude CLIs still count.
         if (m.engine === 'codex' && Array.isArray(m.args) && m.args[0] === 'app-server') persistentProcs.add(m.id);
         if (m.engine === 'grok' && Array.isArray(m.args) && m.args[0] === 'agent' && m.args[1] === 'stdio') persistentProcs.add(m.id);
-        child.stdout.on('data', (d) => send({ t: 'stdout', id: m.id, data: d.toString('base64') }));
-        child.stderr.on('data', (d) => send({ t: 'stderr', id: m.id, data: d.toString('base64') }));
-        child.on('exit', (code, signal) => { procs.delete(m.id); persistentProcs.delete(m.id); send({ t: 'exit', id: m.id, code, signal }); });
-        child.on('error', (e) => { procs.delete(m.id); persistentProcs.delete(m.id); send({ t: 'exit', id: m.id, code: null, signal: null, error: e.message }); });
+        // Everything stdio routes through the park registry (LIVE-DEPLOY Phase 2):
+        // while this connection lives it forwards straight to `send` and maintains
+        // the line-boundary tail; after park() it buffers instead. The handlers
+        // capture the ENTRY, not the id — a parked child outlives this connection's
+        // maps. m.meta is opaque master context, echoed back in the hello inventory.
+        const entry = parkRegistry.track({ procId: m.id, child, engine: m.engine, meta: m.meta, persistent: persistentProcs.has(m.id), sink: send });
+        child.stdout.on('data', (d) => parkRegistry.onData(entry, 'stdout', d));
+        child.stderr.on('data', (d) => parkRegistry.onData(entry, 'stderr', d));
+        child.on('exit', (code, signal) => { procs.delete(m.id); persistentProcs.delete(m.id); parkRegistry.onExit(entry, { code, signal }); });
+        child.on('error', (e) => { procs.delete(m.id); persistentProcs.delete(m.id); parkRegistry.onExit(entry, { code: null, signal: null, error: e.message }); });
+        return;
+      }
+      // Re-attach a parked survivor (LIVE-DEPLOY Phase 3): the master names the
+      // inventory key its ledger vouches for and the new procId to stream under.
+      // Replay + live stream ride the normal stdout/stderr/exit frames, so the
+      // master-side runner needs no special read path. An unknown key answers
+      // with an exit frame — the master treats it like a child that died.
+      case 'attach': {
+        const entry = parkRegistry.attach(String(m.parkId || ''), m.id, send);
+        if (!entry) return send({ t: 'exit', id: m.id, code: null, signal: null, error: 'not parked' });
+        if (!entry.exited) {
+          procs.set(m.id, entry.child);
+          if (entry.persistent) persistentProcs.add(m.id);
+          entry.child.once('exit', () => { procs.delete(m.id); persistentProcs.delete(m.id); });
+        }
+        return;
+      }
+      // The master saw the inventory and disowned this child — reap immediately
+      // rather than letting it burn its TTL against a session lock.
+      case 'reap': {
+        parkRegistry.reapNow(String(m.parkId || ''));
         return;
       }
       case 'stdin': { const c = procs.get(m.id); if (c && c.stdin.writable) c.stdin.write(Buffer.from(m.data || '', 'base64')); return; }
@@ -1204,33 +1344,33 @@ function makeCapabilities(send) {
     }
   }
 
-  // Reap the whole process tree, not just the direct child. The claude/codex launcher is often
-  // a shim that spawns the real engine as a child (the Windows .cmd/.exe shim especially), so a
-  // bare child.kill() orphans the engine — and its live-registry pid then view-only-locks the
-  // session at turn end. Windows: taskkill /T /F. POSIX: signal the detached process group.
-  function killTree(child, signal) {
-    if (!child || child.pid == null) return;
-    try {
-      if (process.platform === 'win32') {
-        spawn('taskkill', ['/PID', String(child.pid), '/T', '/F']);
-      } else {
-        try { process.kill(-child.pid, signal); } // negative pid = the whole group (detached leader)
-        catch { child.kill(signal); }             // not a group leader — best effort
-      }
-    } catch { try { child.kill(signal); } catch {} }
-  }
-
-  function dispose() {
+  // The connection died — PARK, don't kill (LIVE-DEPLOY Phase 2). Children keep
+  // running with their output buffered from a line boundary; the registry's TTL
+  // reaps any nobody re-attaches. Watchers still close — the master re-issues
+  // them on reconnect (ensureWatches), and a watcher has no state worth keeping.
+  function park() {
     for (const w of watchers.values()) try { w.close(); } catch {}
-    for (const c of procs.values()) killTree(c, 'SIGKILL');
+    parkRegistry.parkAll();
     watchers.clear(); procs.clear(); persistentProcs.clear();
   }
 
-  // "busy" = a per-turn engine is running (a live session that self-update must not cut off).
-  // The persistent codex app-server is infrastructure, not a turn — excluded, or self-update
-  // would be permanently refused on any machine that has used codex.
+  // Real shutdown (the self-update exit path): nothing survives this process,
+  // so nothing may outlive it — an orphaned engine's live-registry pid
+  // view-only-locks its session until it happens to die.
+  function destroy() {
+    for (const w of watchers.values()) try { w.close(); } catch {}
+    parkRegistry.destroyAll();
+    watchers.clear(); procs.clear(); persistentProcs.clear();
+  }
+
+  // "busy" = a per-turn engine is running OR parked awaiting re-attach (a live
+  // session that self-update must not cut off — parked turns count because an
+  // agent restart would orphan a child the master may be seconds from
+  // re-adopting; the park TTL bounds the extra wait). Persistent codex/grok
+  // children are infrastructure, not turns — excluded, or self-update would be
+  // permanently refused on any machine that has used those engines.
   // ponytail: when remote codex WRITE turns land, gate update on the master's real run state too.
-  return { handle, dispose, busy: () => procs.size > persistentProcs.size };
+  return { handle, park, destroy, busy: () => parkRegistry.turnBusy() > 0, parkedInventory: () => parkRegistry.inventory() };
 }
 
 module.exports = { makeCapabilities, confined, ROOTS, ENGINES };

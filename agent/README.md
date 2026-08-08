@@ -12,9 +12,11 @@ are auditing what a connected machine will do, you only have to read one file.
 
 | File | Lines | What it does |
 |---|---:|---|
-| [`capabilities.js`](capabilities.js) | 1,236 | the whole capability surface: what a machine will answer, and the root confinement around it |
+| [`capabilities.js`](capabilities.js) | 1,376 | the whole capability surface: what a machine will answer, and the root confinement around it |
 | [`limits.js`](limits.js) | 649 | reads rate-limit and usage state off the engines |
-| [`agent.js`](agent.js) | 377 | dials out, reconnects, and self-updates with a rollback |
+| [`agent.js`](agent.js) | 586 | dials out, reconnects, and self-updates with a rollback |
+| [`park.js`](park.js) | 285 | holds a running turn on the machine while the master restarts, then re-attaches it |
+| [`persistence.js`](persistence.js) | 139 | checks the agent will survive logout and reboot, instead of going Offline the moment you close the session that installed it |
 | [`log.js`](log.js) | 105 | bounded, rotated logging with the token redacted on the way in |
 
 ## Some files here are one-line stubs

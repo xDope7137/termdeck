@@ -115,12 +115,19 @@ try {
   throw e;
 }
 
+// Defensive, like capabilities.js's tail-read require: an agent that pulled this
+// agent.js from a manifest fetch that failed halfway has no persistence.js, and
+// reporting how it was started is never worth refusing to boot over.
+let persistenceLib; try { persistenceLib = require('./persistence'); } catch { persistenceLib = null; }
+const PERSISTENCE = persistenceLib ? persistenceLib.detect() : null;
+
 // The opening lines of every run: what is running, and what happened to the run
 // before it. "It restarted" on its own is the least useful thing a log can say.
 {
   const first = log.isFirstRun();
   const why = log.takeExitReason();
   log.info(`--- Termdeck agent starting — version ${VERSION}, ${os.platform()} ${os.arch()}, Node ${process.versions.node} ---`);
+  if (persistenceLib) log.info(persistenceLib.describe(PERSISTENCE));
   if (first) log.info('First start on this machine after install.');
   else if (why) log.info(`Previous run stopped on purpose: ${why}.`);
   else log.warn('Previous run ended without stopping on purpose — the machine restarted, Termdeck was closed, or the agent crashed. It has been restarted automatically.');
@@ -163,7 +170,7 @@ process.on('unhandledRejection', (err) => {
 // capabilities.js. Refuses while a Termdeck-owned claude/codex turn is running so a live
 // session started by Termdeck isn't cut off. A terminal-held session can keep running:
 // the master passes force=true when it knows Termdeck itself does not own an active turn.
-const AGENT_FILES = ['agent.js', 'capabilities.js', 'log.js', 'limits.js', 'usage.js', 'worktrees.js', 'which.js', 'diff.js', 'context-doc.js', 'mcp-config.js', 'accounts.js', 'codex-accounts.js', 'session-title.js', 'tail-read.js', 'checkpoints.js', 'index-head.js', 'session-settings.js', 'session-head.js', 'transcript.js', 'claude-data.js', 'pool.js', 'package.json'];
+const AGENT_FILES = ['agent.js', 'capabilities.js', 'park.js', 'log.js', 'persistence.js', 'limits.js', 'usage.js', 'which.js', 'diff.js', 'mcp-config.js', 'accounts.js', 'codex-accounts.js', 'session-title.js', 'tail-read.js', 'checkpoints.js', 'index-head.js', 'session-settings.js', 'session-head.js', 'transcript.js', 'claude-data.js', 'pool.js', 'project-files.js', 'machine-config.js', 'project-doc.js', 'package.json'];
 
 // Compile-check before anything is installed. A truncated download, an HTML error
 // page from the tunnel, a 200 with an empty body — all of them used to be written
@@ -179,6 +186,107 @@ function validate(file, body) {
   } catch (e) { throw new Error(`${file}: ${e.message}`); }
 }
 const depsOf = (src) => { try { return JSON.stringify(JSON.parse(src).dependencies || {}); } catch { return null; } };
+
+// Deliberately OUTSIDE the pure region below, so a test can hand that region an
+// instant one and not spend the real backoff proving the retry happens.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ── Bounds on the download half of an update ────────────────────────────────
+// The fetches below used to carry no timeout at all. Measured on a customer's
+// Windows VPS: `Downloading 24 files…` sat there for 8m35s and only ended when
+// undici finally surfaced `terminated` — while the master had given up at its
+// own 90s update RPC and written `self-update declined: update timeout` into the
+// log. That reason names nothing (whose file? which failure?), and it costs the
+// machine a push try: three of them and healthOf() flips the machine to
+// `update-failing` and asks its owner to run a repair, over what was one dropped
+// connection. The same run showed the healthy path is not far off the cliff
+// either — a box that took the update needed 83s of that 90s window, because 24
+// files were fetched strictly one after another.
+//
+// So the whole phase is bounded and the budget is set from the master's window,
+// not from taste: download + a deps install must fit inside transport.js's
+// UPDATE_TIMEOUT_MS with room to spare, so that what the master records is this
+// agent's own error message instead of silence. tests/agent-update-bounds.mjs
+// pins the two sides together.
+//
+// Everything between the two markers below is PURE — it reads no module state and
+// touches no disk, so tests/agent-update-retry.mjs lifts the region out and runs it
+// against a fake fetch. That is the only way it gets tested at all: this file dials
+// the master and exits on a missing token the moment it is required, and the retry
+// logic is exactly the code that only ever runs on a link nobody can reproduce. Keep
+// the region free of requires, `caps`, `log` beyond warnings, and module globals.
+// ── update-bounds:begin ──
+const UPDATE_FETCH_TIMEOUT_MS = 15_000;    // one attempt at one file
+const UPDATE_FETCH_ATTEMPTS = 3;           // a dropped tunnel is worth re-asking; a 404 is not
+const UPDATE_FETCH_CONCURRENCY = 6;        // 24 files serially was 83s on a healthy box
+const UPDATE_DOWNLOAD_BUDGET_MS = 45_000;  // manifest + every file + every retry
+const UPDATE_NPM_TIMEOUT_MS = 120_000;     // only when the dependency set moved
+
+// The ONE place this file talks HTTP. Everything an update pulls goes through
+// here so there is no second, unbounded path to grow back later.
+//
+// Retries a timeout, a dropped connection and a 5xx — all three are what a flaky
+// tunnel looks like from this side. Never retries a 4xx: a 404 for a file this
+// master does not serve is not going to answer differently on the second ask,
+// and burning the budget on it only delays naming it.
+async function fetchUpdateFile(url, deadline, label) {
+  // The string a support reader sees when nothing was even tried. It has to say
+  // the budget ran out, or a file that was never asked for reads like a file that
+  // was asked for and stayed silent.
+  let last = 'not fetched — the download budget ran out first';
+  for (let attempt = 1; attempt <= UPDATE_FETCH_ATTEMPTS; attempt++) {
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    // Whichever runs out first: this file's own patience, or what is left of the
+    // whole download's budget.
+    const wait = Math.min(UPDATE_FETCH_TIMEOUT_MS, left);
+    try {
+      // Built per attempt: an AbortSignal.timeout starts counting the moment it
+      // is created, so one hoisted signal would hand attempt 3 a spent clock.
+      const res = await fetch(url, { signal: AbortSignal.timeout(wait) });
+      if (!res.ok) {
+        if (res.status < 500) throw Object.assign(new Error(`HTTP ${res.status}`), { fatal: true });
+        throw new Error(`HTTP ${res.status}`);
+      }
+      return await res.text();
+    } catch (e) {
+      // TimeoutError is what AbortSignal.timeout throws; its own message says
+      // nothing about how long it waited, and that number is the whole point.
+      // `wait`, not the constant: near the end of the budget the real wait is
+      // shorter, and a log that rounds it up to 15s sends the reader hunting for
+      // a stall that never happened.
+      last = e && e.name === 'TimeoutError' ? `no answer within ${Math.max(1, Math.round(wait / 1000))}s` : (e && e.message) || String(e);
+      if (e && e.fatal) break;
+      if (attempt < UPDATE_FETCH_ATTEMPTS) {
+        log.warn(`${label}: ${last} — retrying (attempt ${attempt + 1} of ${UPDATE_FETCH_ATTEMPTS}).`);
+        await sleep(Math.min(1000 * attempt, Math.max(0, deadline - Date.now())));
+      }
+    }
+  }
+  throw new Error(`${label}: ${last}`);
+}
+
+// Fetch the set with a small amount of concurrency, into memory. Staging to disk
+// stays the caller's job (and stays whole-set-then-swap) — this only shortens the
+// wall clock. Bounded rather than Promise.all over 24: the machines that need
+// this most are the ones on a link that a 24-way fan-out would simply drown.
+async function fetchAll(files, deadline, load) {
+  const out = new Map();
+  let failure = null;
+  let next = 0;
+  const worker = async () => {
+    while (failure === null) {
+      const i = next++;
+      if (i >= files.length) return;
+      try { out.set(files[i], await load(files[i])); }
+      catch (e) { if (failure === null) failure = e; return; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(UPDATE_FETCH_CONCURRENCY, files.length) }, worker));
+  if (failure) throw failure;
+  return out;
+}
+// ── update-bounds:end ──
 
 async function selfUpdate(ws, caps, req) {
   const id = req && req.id;
@@ -198,15 +306,25 @@ async function selfUpdate(ws, caps, req) {
   }
   let swapped = false;
   try {
+    // One clock over the whole network phase, started before the manifest: a
+    // per-file bound alone still lets 24 slow-but-not-timing-out files add up
+    // past the master's window, which is the case that produced no reason at all.
+    const deadline = Date.now() + UPDATE_DOWNLOAD_BUDGET_MS;
+    const startedAt = Date.now();
+
     // Pull the file list from the master, not our own baked-in AGENT_FILES: a stale agent's
     // list can't name modules added after it shipped, so it would fetch a new capabilities.js
     // without its new deps and crash-loop on require. Fall back to the local list if an older
-    // master has no manifest yet.
+    // master has no manifest yet — and note the fallback is also what a TIMED-OUT manifest
+    // lands on, which is right: this agent's own list is a worse answer than the master's,
+    // but it is a far better one than failing the update outright.
     let files = AGENT_FILES;
     try {
-      const mres = await fetch(`${MASTER_HTTP}/download/agent/manifest.json`);
-      if (mres.ok) { const list = await mres.json(); if (Array.isArray(list) && list.length) files = list; }
-    } catch {}
+      const list = JSON.parse(await fetchUpdateFile(`${MASTER_HTTP}/download/agent/manifest.json`, deadline, 'manifest.json'));
+      if (Array.isArray(list) && list.length) files = list;
+    } catch (e) {
+      log.warn(`Could not read the file list from Termdeck (${e.message}) — using the list this version shipped with.`);
+    }
 
     // Stage + validate the WHOLE set before touching the running install. The old
     // loop wrote each file as it arrived, so a 502 on file 7 of 12 left a half-new
@@ -214,15 +332,17 @@ async function selfUpdate(ws, caps, req) {
     log.info(`Downloading ${files.length} files for version ${target || 'the update'}…`);
     rmrf(STAGING_DIR);
     fs.mkdirSync(STAGING_DIR, { recursive: true });
-    for (const file of files) {
+    const bodies = await fetchAll(files, deadline, async (file) => {
       // The list is the master's, but it lands in a path join — keep it a plain filename.
       if (!/^[\w-]+\.(js|json)$/.test(file)) throw new Error(`${file}: refusing odd filename`);
-      const res = await fetch(`${MASTER_HTTP}/download/agent/${file}`);
-      if (!res.ok) throw new Error(`${file}: HTTP ${res.status}`);
-      const body = await res.text();
+      const body = await fetchUpdateFile(`${MASTER_HTTP}/download/agent/${file}`, deadline, file);
       validate(file, body);
-      fs.writeFileSync(path.join(STAGING_DIR, file), body);
-    }
+      return body;
+    });
+    // Written only once every file is in hand and has compiled, so a staging dir
+    // never holds a partial set for the swap loop below to copy out of.
+    for (const file of files) fs.writeFileSync(path.join(STAGING_DIR, file), bodies.get(file));
+    log.info(`Downloaded ${files.length} files in ${Math.round((Date.now() - startedAt) / 1000)}s.`);
 
     // Snapshot what is running now, so a rollback restores a coherent set rather
     // than whatever the last partial write left behind.
@@ -242,7 +362,12 @@ async function selfUpdate(ws, caps, req) {
     // args-array-with-shell pattern Node deprecates (DEP0190) — no interpolation, no injection.
     if (before !== after) {
       log.info('Dependencies changed — installing them (this can take a minute)…');
-      execSync('npm install --omit=dev', { cwd: __dirname, stdio: 'ignore' });
+      // Bounded like the download, and for the same reason: an npm that never
+      // returns (a dead registry, a Windows AV scanning every extracted file)
+      // held the master's update RPC open past its timeout, so a swap that had
+      // already happened was recorded as "update timeout". SIGTERM on expiry,
+      // which lands in the catch below and restores the previous files.
+      execSync('npm install --omit=dev', { cwd: __dirname, stdio: 'ignore', timeout: UPDATE_NPM_TIMEOUT_MS });
     }
 
     // The marker that makes this reversible. Cleared only by the master's welcome.
@@ -259,10 +384,32 @@ async function selfUpdate(ws, caps, req) {
   }
   log.info(`Update to ${target || 'the new version'} installed. Restarting the agent now to apply it — this machine will be offline for a few seconds.`);
   log.noteExit(`applying update to ${target || 'a new version'}`);
-  setTimeout(() => process.exit(0), 200); // let the ack flush before the supervisor restarts us
+  // Destroy children before exiting — process.exit never fires ws close, so
+  // without this the persistent codex/grok children were orphaned on every
+  // update ("one idle orphan per redial", remote-codex-runner.js) and a
+  // force:true update could orphan a live TURN whose registry pid then
+  // view-only-locks its session. The busy() gate (which counts parked turns
+  // too) keeps the normal path away from turn children entirely.
+  setTimeout(() => { try { caps.destroy(); } catch {} process.exit(0); }, 200); // let the ack flush before the supervisor restarts us
 }
 
 let backoff = 1000;
+// A refusal is not a dropped packet. `close` treats every ending alike and doubles to a
+// 30s ceiling, which is right for a Cloudflare idle-drop and wrong for an answer the
+// master is going to keep giving: one machine whose row had been deleted redialled every
+// 30s for 22 hours and wrote 1,290 of the master's 2,838 ops_events rows — 45% of the
+// entire admin error feed, from a single orphaned agent, which is exactly the condition
+// under which a real incident goes unnoticed. So an authoritative HTTP rejection gets its
+// own, far wider ceiling. It still retries, because a token re-added in the dashboard has
+// to heal without anyone logging into the box; it just stops being a flood.
+// One knob, because the first wait after a refusal and the ceiling it climbs to are the
+// same decision at two ends. Env-overridable for exactly the reason DEAD_AFTER_MS is:
+// a check has to be able to exercise the real path in milliseconds rather than half-hours.
+const BACKOFF_MAX = 30_000;
+const AUTH_BACKOFF_MS = Number(process.env.TERMDECK_AGENT_AUTH_BACKOFF_MS) || 60_000;
+const AUTH_BACKOFF_MAX = AUTH_BACKOFF_MS * 30;
+let backoffMax = BACKOFF_MAX;
+
 function dial() {
   const ws = new WebSocket(MASTER + '/agent', {
     headers: { Authorization: `Bearer ${TOKEN}` },
@@ -271,7 +418,13 @@ function dial() {
     perMessageDeflate: { threshold: 1024 },
   });
 
-  const caps = makeCapabilities((obj) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); });
+  // Returns whether the frame actually went out. park.js needs the answer: a
+  // send into a closing socket is a DROPPED frame (see its onData), and the
+  // chunk has to be buffered instead of lost.
+  const caps = makeCapabilities((obj) => {
+    if (ws.readyState !== WebSocket.OPEN) return false;
+    try { ws.send(JSON.stringify(obj)); return true; } catch { return false; }
+  });
 
   let heartbeat = null;
   let deadCheck = null;
@@ -287,8 +440,26 @@ function dial() {
   // two of those is a dead pipe, not a quiet one.
   const DEAD_AFTER_MS = Number(process.env.TERMDECK_AGENT_DEAD_MS) || 75_000;
   let lastFrameAt = Date.now();
+  // Both endings land here and exactly one fires per dial — which is not automatic once
+  // `unexpected-response` has a listener (see below), hence the guard.
+  let redialled = false;
+  const redial = () => {
+    if (redialled) return;
+    redialled = true;
+    // NOT unref'd: the reconnect timer is what keeps the process alive between a
+    // dropped socket and the redial. With the socket closed and caps disposed there
+    // are no other handles, so an unref'd timer would let Node exit cleanly (code 0)
+    // — the agent would die on the first disconnect (e.g. a master restart) instead
+    // of reconnecting, and Restart=on-failure wouldn't bring back a clean exit.
+    setTimeout(dial, backoff);
+    backoff = Math.min(backoff * 2, backoffMax);
+  };
+
   ws.on('open', () => {
     backoff = 1000;
+    // A machine that was refused and has since been re-authorised must go straight back
+    // to fast reconnects, or it would keep the half-hour ceiling for the rest of its life.
+    backoffMax = BACKOFF_MAX;
     lastFrameAt = Date.now();
     deadCheck = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) return;
@@ -299,7 +470,12 @@ function dial() {
     // codex/grok flags gate the master's new-chat engine picker (the read layer works regardless).
     // quarantine rides along so a machine that rejected a release says so in the
     // master's log — the whole point is that nobody has to ask the customer.
-    ws.send(JSON.stringify({ type: 'hello', platform: os.platform(), version: VERSION, roots: ROOTS, codex: fs.existsSync(ENGINES.codex), grok: fs.existsSync(ENGINES.grok), quarantine: readJson(QUARANTINE_FILE, null) || undefined }));
+    // `procs` = parked survivors of the previous connection (LIVE-DEPLOY Phase 2):
+    // children that kept running across the gap, plus recently-exited ones whose
+    // buffers still hold their final frames. Masters before Phase 3 ignore it.
+    // `persistence` = how this agent was started, so the machine card can say
+    // "stops when you log out" instead of the owner finding out at logout.
+    ws.send(JSON.stringify({ type: 'hello', platform: os.platform(), version: VERSION, roots: ROOTS, codex: fs.existsSync(ENGINES.codex), grok: fs.existsSync(ENGINES.grok), procs: caps.parkedInventory(), persistence: PERSISTENCE || undefined, quarantine: readJson(QUARANTINE_FILE, null) || undefined }));
     log.info(`Connected to Termdeck (${MASTER_HTTP}). This machine is now online.`);
     // Keep the tunnel warm in the agent→master direction. Cloudflare (which fronts the
     // master for remote agents) idle-drops a WebSocket at ~100s and does NOT count WS
@@ -337,7 +513,12 @@ function dial() {
   ws.on('close', (code, reason) => {
     clearInterval(heartbeat);
     clearInterval(deadCheck);
-    caps.dispose();
+    // PARK, don't kill (LIVE-DEPLOY Phase 2). This close fires for a master
+    // deploy restart, a Cloudflare idle drop, a missed pong — none of which say
+    // anything about the health of the children. They keep running, output
+    // buffered from a line boundary, and the registry's TTL reaps any child no
+    // master comes back for (agent/park.js).
+    caps.park();
     // Codes worth naming, because they are the ones customers see and they mean
     // very different things: 1001/1006 is the network or Cloudflare dropping an
     // idle tunnel (routine, reconnects), 1000 is usually Termdeck restarting for
@@ -348,13 +529,41 @@ function dial() {
       : `connection closed (code ${code || 'unknown'})`;
     const detail = String(reason || '').trim();
     log.info(`Disconnected from Termdeck — ${why}${detail ? `: ${detail}` : ''}. Reconnecting in ${Math.round(backoff / 1000)}s. Chats on this machine are paused until it reconnects.`);
-    // NOT unref'd: the reconnect timer is what keeps the process alive between a
-    // dropped socket and the redial. With the socket closed and caps disposed there
-    // are no other handles, so an unref'd timer would let Node exit cleanly (code 0)
-    // — the agent would die on the first disconnect (e.g. a master restart) instead
-    // of reconnecting, and Restart=on-failure wouldn't bring back a clean exit.
-    setTimeout(dial, backoff);
-    backoff = Math.min(backoff * 2, 30000);
+    redial();
+  });
+  // ws emits this INSTEAD of error+close when the upgrade is answered with a plain HTTP
+  // response, and ONLY when a listener is attached — websocket.js guards abortHandshake
+  // behind `!websocket.emit('unexpected-response', …)`, and emit() is falsy exactly when
+  // nothing was listening. Attaching this therefore takes ownership of the entire failure
+  // path: no 'error', no 'close', so the drain, the destroy and the redial are all ours.
+  // Leaving that last part out would not read as a bug here — it would silently stop the
+  // agent reconnecting at all, on every machine, for every transient 5xx.
+  ws.on('unexpected-response', (req, res) => {
+    const status = res.statusCode;
+    res.resume();                       // drain, or the socket is held open by an unread body
+    try { req.destroy(); } catch {}
+    caps.park();                        // symmetry with close: never kill children over a link answer
+    // 401 = this token is not in the master's machines table (revoked, or the machine was
+    // deleted and re-added, which mints a new one); 402 = the owner's plan no longer covers
+    // this machine. Both are the master's considered answer rather than a transport
+    // failure, and neither changes on the timescale of a reconnect.
+    if (status === 401 || status === 402) {
+      const first = backoffMax !== AUTH_BACKOFF_MAX;
+      backoffMax = AUTH_BACKOFF_MAX;
+      backoff = Math.max(backoff, AUTH_BACKOFF_MS);
+      const fix = status === 401
+        ? 'Termdeck does not recognise this machine\'s token — it was most likely removed, or re-added under another account, in the dashboard. Re-run the install command from termdeck.io/cloud to reconnect this machine.'
+        : 'This machine is over the plan limit for its account. Upgrade the plan or remove another machine and it will reconnect on its own.';
+      // Loud once, then quiet. This repeats until a person acts, and the agent log is the
+      // thing we ask customers to send us — it has to carry the fix, not 2,000 copies of
+      // the symptom.
+      const every = backoffMax >= 60_000 ? `${Math.round(backoffMax / 60_000)} min` : `${Math.round(backoffMax / 1000)}s`;
+      if (first) log.warn(`Termdeck refused this machine (HTTP ${status}). ${fix}`);
+      else log.info(`Still refused by Termdeck (HTTP ${status}). Retrying every ${every} until it is fixed.`);
+    } else {
+      log.warn(`Termdeck answered this connection with HTTP ${status}. Reconnecting in ${Math.round(backoff / 1000)}s.`);
+    }
+    redial();
   });
   ws.on('error', (e) => {
     // Not fatal on its own — a close always follows, and that line carries the
