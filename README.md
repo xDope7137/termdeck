@@ -11,10 +11,9 @@ Claude Code, OpenAI Codex CLI and Grok — one fleet board, every device, tool a
 
 <br />
 
-[![Developers](https://img.shields.io/badge/developers-1%2C340-e2611b?style=flat-square)](https://termdeck.io?ref=github)
-[![Machines](https://img.shields.io/badge/machines%20connected-2%2C116-e2611b?style=flat-square)](https://termdeck.io?ref=github)
-[![Teams](https://img.shields.io/badge/teams-47-e2611b?style=flat-square)](https://termdeck.io?ref=github)
-[![Uptime](https://img.shields.io/badge/uptime-99.97%25-3f9142?style=flat-square)](https://termdeck.io?ref=github)
+[![Commits](https://img.shields.io/badge/commits-1%2C281-e2611b?style=flat-square)](https://termdeck.io?ref=github)
+[![Deploys](https://img.shields.io/badge/production%20deploys-417-e2611b?style=flat-square)](https://termdeck.io?ref=github)
+[![Invariants](https://img.shields.io/badge/documented%20invariants-53-3f9142?style=flat-square)](docs/INVARIANTS.md)
 [![Engines](https://img.shields.io/badge/engines-Claude%20%C2%B7%20Codex%20%C2%B7%20Grok-1f2937?style=flat-square)](#three-engines-one-ui)
 [![Agent license](https://img.shields.io/badge/agent-MIT-1f2937?style=flat-square)](LICENSE)
 [![Instagram](https://img.shields.io/badge/instagram-%40termdeck-E4405F?style=flat-square&logo=instagram&logoColor=white)](https://instagram.com/termdeck)
