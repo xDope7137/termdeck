@@ -52,6 +52,29 @@ for ($n = 1; $n -le $Attempts; $n++) {
 }
 $env:TERMDECK_NO_PROMPT = $null
 
+# "No exception" is not "installed". install.ps1 relaunches itself elevated for the
+# scheduled task, and until it learned to wait, the parent returned instantly and
+# successfully whatever the child did — so a denied UAC prompt, a failed npm or a
+# 404 on one file all read as a clean repair. It printed "Repaired." over a machine
+# whose agent folder had just been deleted by the uninstall above and never
+# refilled, which is the exact state that pops "Can not find script file" every two
+# minutes for the rest of the machine's life.
+#
+# So check the two things that make the machine actually work: the task Windows
+# starts the agent from, and the file that task runs.
+if ($ok) {
+  $RunVbs = Join-Path $env:USERPROFILE ".termdeck\agent\run.vbs"
+  $taskThere = $false
+  try { Get-ScheduledTask -TaskName "TermdeckAgent" -ErrorAction Stop | Out-Null; $taskThere = $true } catch { $taskThere = $false }
+  if (-not $taskThere -or -not (Test-Path $RunVbs)) {
+    $ok = $false
+    Write-Host ""
+    if (-not $taskThere) { Write-Host "  The install finished but the TermdeckAgent scheduled task is not there." -ForegroundColor Red }
+    if (-not (Test-Path $RunVbs)) { Write-Host "  The install finished but run.vbs was never written." -ForegroundColor Red }
+    Write-Host "  That usually means the elevated step was declined at the UAC prompt." -ForegroundColor Yellow
+  }
+}
+
 Write-Host ""
 if ($ok) {
   Write-Host "  ------------------------------------------------------------" -ForegroundColor Green

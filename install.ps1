@@ -21,10 +21,13 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
 }
 
 # Ask the master which files the agent needs, rather than hardcoding — a stale list here
-# fetches a new capabilities.js without its new deps (e.g. worktrees.js) and the agent
-# crash-loops on require. Fallback is the full current set for masters with no manifest.
+# fetches a new capabilities.js without its new deps (e.g. project-files.js) and the agent
+# crash-loops on require. Fallback is the full current set for masters with no manifest; it
+# names a DELETED file at your peril — Invoke-WebRequest THROWS on the 404 and aborts the
+# install partway, which is how the removed worktrees.js/context-doc.js would have broken
+# every fallback install. tests/agent-manifest.mjs pins this list to AGENT_FILES.
 try { $Files = (Invoke-WebRequest -UseBasicParsing "$Master/download/agent/manifest.json").Content | ConvertFrom-Json } catch { $Files = $null }
-if (-not $Files) { $Files = @("agent.js","capabilities.js","log.js","limits.js","worktrees.js","which.js","diff.js","context-doc.js","mcp-config.js","package.json") }
+if (-not $Files) { $Files = @("agent.js","capabilities.js","park.js","proc-tree.js","log.js","persistence.js","win-launcher.js","limits.js","usage.js","which.js","diff.js","mcp-config.js","accounts.js","codex-accounts.js","session-title.js","tail-read.js","checkpoints.js","index-head.js","session-settings.js","session-head.js","transcript.js","claude-data.js","pool.js","project-files.js","machine-config.js","command-catalog.js","usage-behaviour.js","project-doc.js","package.json") }
 
 # heal.ps1 drives this unattended — a repair that stops to ask is one nobody finishes.
 $readCode = if ($env:TERMDECK_NO_PROMPT) { "n" } else { Read-Host "Read the agent source before installing? [y/N]" }
@@ -43,7 +46,17 @@ if (-not $isAdmin) {
   Write-Host "==> Re-launching elevated (needed to register the logon task) — approve the UAC prompt..." -ForegroundColor Yellow
   # Carry the unattended flag across the UAC boundary too, or the elevated child stops to ask.
   $relaunch = "`$env:TERMDECK_AGENT_TOKEN='$($env:TERMDECK_AGENT_TOKEN)'; `$env:TERMDECK_NO_PROMPT='$($env:TERMDECK_NO_PROMPT)'; iwr $Master/install.ps1 -UseBasicParsing | iex"
-  Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile", "-Command", $relaunch
+  # -Wait and a checked exit code, because the install this launches is the whole
+  # install. Without them the parent returned instantly and successfully whatever
+  # the child did — a denied UAC prompt, a failed npm, a 404 on one file — and
+  # heal.ps1, which only looks for a thrown exception, printed "Repaired." over a
+  # machine that had just had its agent folder deleted and nothing put back.
+  $p = Start-Process powershell -Verb RunAs -PassThru -Wait -ArgumentList "-NoProfile", "-Command", $relaunch
+  # `throw`, not `exit`: this script is loaded with `iwr … | iex`, so it runs inside
+  # the caller's PowerShell — `exit` would close an interactive user's window and
+  # take heal.ps1 with it. A throw lands in heal.ps1's catch, which is what its
+  # retry loop is built to read.
+  if ($p.ExitCode -ne 0) { throw "The elevated install did not finish (exit $($p.ExitCode)). Approve the UAC prompt and re-run." }
   return
 }
 
@@ -123,6 +136,17 @@ try {
   # shim so the fallback isn't the one path that leaves a console on screen.
   Start-Process -WindowStyle Hidden wscript.exe -ArgumentList "`"$RunVbs`""
 }
+
+# What the agent reports to the dashboard (agent/persistence.js). Windows is the
+# one platform with no cheap way to infer this at boot — a scheduled-task child
+# looks exactly like a hand-started one — so the marker is the only source, and
+# it records what actually happened rather than what was attempted. Without it a
+# machine whose task registration failed looks identical to a healthy one right
+# up until the next reboot.
+$Marker = Join-Path $env:USERPROFILE ".termdeck\persistence.json"
+$mode = if ($registered) { "schtask" } else { "foreground" }
+"{`"mode`":`"$mode`",`"at`":`"$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))`"}" |
+  Set-Content -Encoding ASCII $Marker
 
 function Test-Engine($name) {
   if (Get-Command $name -ErrorAction SilentlyContinue) { return $true }

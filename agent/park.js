@@ -79,6 +79,18 @@ function createRegistry(opts = {}) {
       engine,
       meta: meta && typeof meta === 'object' ? meta : null,
       persistent,
+      // How many turns the master says are running INSIDE this child. Only a
+      // persistent one can have any: the codex app-server and the grok stdio
+      // child multiplex every turn on the machine through one process, so their
+      // mere existence says nothing about whether work is in flight — see
+      // setTurnCount and the busy gate below.
+      turns: 0,
+      // 'turn' (default) or 'shell-host'. A shell host is a CLI whose turn is
+      // OVER but which still owns live background shells in its process group —
+      // parked deliberately and indefinitely rather than as a survivor waiting
+      // to be re-adopted. See parkAsShellHost below for the three rules it
+      // changes: no TTL, not busy, and named as such in the inventory.
+      role: 'turn',
       startedAt: Date.now(),
       tail: Buffer.alloc(0),
       tailPoisoned: false,
@@ -184,10 +196,46 @@ function createRegistry(opts = {}) {
       if (e.tailPoisoned) e.tornStart = true;
       else if (e.tail.length) pushBuf(e, 'stdout', e.tail);
       e.tail = Buffer.alloc(0);
-      e.ttlTimer = unref(setTimeout(() => reap(e), cfg.ttlMs));
+      // A shell host gets NO TTL. The TTL means "nobody re-attached in three
+      // minutes, so this survivor is abandoned" — but a shell host is not
+      // waiting to be re-attached, it is holding a dev server the user asked to
+      // keep running. Arming it here would kill every background shell three
+      // minutes after the turn that started it, which is the bug this whole
+      // role exists to fix. It ends by reapNow() (the user, or the master when
+      // the last shell exits) or by destroyAll() on self-update.
+      if (e.role !== 'shell-host') e.ttlTimer = unref(setTimeout(() => reap(e), cfg.ttlMs));
     }
     live.delete(e);
     parked.set(e.key, e);
+  }
+
+  // Park a LIVE child as a shell host: its turn is done, but background shells
+  // it spawned are still running inside its process group, so reaping it would
+  // take them with it (killTree signals the group). The master calls this from
+  // finishTurn instead of stop() when the turn ends holding live shells.
+  // Returns the inventory key, which is how everything afterwards names it.
+  // `meta` is merged, not replaced: the spawn-time meta names a session only when
+  // the chat already existed, so a host born on a brand-new chat would otherwise
+  // be unadoptable after a link gap — the master could see it in the inventory and
+  // still not know whose shells it holds.
+  function parkAsShellHost(procId, meta = null) {
+    for (const e of live) {
+      if (e.procId !== procId) continue;
+      if (e.exited) return null; // nothing to hold — the CLI already died
+      e.role = 'shell-host';
+      if (meta && typeof meta === 'object') e.meta = { ...(e.meta || {}), ...meta };
+      parkOne(e);
+      return e.key;
+    }
+    return null;
+  }
+
+  // The host's own pid, so the master can ask proc-tree for its descendants.
+  // Null once it has exited or been reaped — the caller treats that as "no
+  // shells left to find".
+  function parkedPid(key) {
+    const e = parked.get(key);
+    return e && e.child && !e.exited ? e.child.pid ?? null : null;
   }
 
   // The connection died — park everything still live.
@@ -259,6 +307,17 @@ function createRegistry(opts = {}) {
       startedAt: e.startedAt,
       meta: e.meta,
       persistent: e.persistent,
+      // Named so the master's re-attach join can tell a shell host from a
+      // survivor. Without it the join reaps every one of them on the next hello
+      // ("never adopt a child you can't name") — a shell host has no ledger row,
+      // because its turn already finished.
+      role: e.role,
+      // The survivor's OS pid. The master's only proof that a live-registry
+      // entry belongs to a child it started is a pid it can name, and a
+      // restarted master has no memory of the spawn — so a re-attach that
+      // cannot name the pid leaves the session view-only-locked against our own
+      // process and unreapable. Null once it has exited (nothing left to claim).
+      pid: e.child && !e.exited ? e.child.pid ?? null : null,
       buffered: e.bufBytes,
       tornStart: e.tornStart || undefined,
       overflow: e.overflow || undefined,
@@ -266,17 +325,45 @@ function createRegistry(opts = {}) {
     }));
   }
 
+  // The master telling us a persistent child has N turns running inside it.
+  // Absolute, never a delta: a lost frame heals on the next one, where a missed
+  // decrement would wedge the busy gate until the TTL. Sent on every turn start
+  // and end, and again after a re-attach — see lib/cloud/transport.js `turns`.
+  function setTurnCount(procId, n) {
+    for (const e of live) {
+      if (e.procId !== procId) continue;
+      e.turns = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+      return true;
+    }
+    return false;
+  }
+
   // A turn is running (live or parked-awaiting-reattach) — the self-update
   // busy gate. Parked turns count: updating now would orphan a child a master
   // may be seconds from re-adopting, and the TTL bounds the delay anyway.
+  //
+  // A persistent child counts only while a turn is actually running inside it.
+  // Excluding it outright (what this did until the count existed) meant a Codex
+  // chat was invisible here: the app-server is spawned once and reused, so
+  // busy() read 0 with a turn mid-flight, the agent accepted a self-update, and
+  // destroyAll() SIGKILLed the turn. Counting the CHILD instead would be the
+  // other bug — one idle app-server would block every update forever.
+  //
+  // A shell host is excluded outright, because it is not a turn and is the one
+  // entry here with no bound on its lifetime: counting it would block
+  // self-update for as long as the user keeps a dev server running — forever,
+  // in practice. destroyAll() still kills it when an update does go ahead, so
+  // nothing is orphaned by the exclusion.
+  const isTurn = (e) => !e.exited && e.role !== 'shell-host' && (!e.persistent || e.turns > 0);
+
   function turnBusy() {
     let n = 0;
-    for (const e of live) if (!e.persistent && !e.exited) n += 1;
-    for (const e of parked.values()) if (!e.persistent && !e.exited) n += 1;
+    for (const e of live) if (isTurn(e)) n += 1;
+    for (const e of parked.values()) if (isTurn(e)) n += 1;
     return n;
   }
 
-  return { newGeneration, track, onData, onExit, attach, reapNow, parkAll, destroyAll, inventory, turnBusy, _live: live, _parked: parked };
+  return { newGeneration, track, onData, onExit, attach, reapNow, parkAll, destroyAll, inventory, turnBusy, setTurnCount, parkAsShellHost, parkedPid, _live: live, _parked: parked };
 }
 
 // The one registry the agent actually runs on.

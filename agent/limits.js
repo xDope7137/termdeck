@@ -7,12 +7,16 @@
 // (non-sensitive) percentages. Codex limits come from the app-server's own
 // `account/rateLimits/read` RPC, run locally — no token leaves the box either.
 // Grok limits come from cli-chat-proxy.grok.com/v1/billing with the
-// OIDC token in ~/.grok/auth.json (same cred the CLI uses). Output shape
-// mirrors lib/limits.js so the existing SPA widget (public/js/limits.js)
-// renders it unchanged.
+// OIDC token in ~/.grok/auth.json (same cred the CLI uses).
 //
-// ponytail: the normalize logic is duplicated from lib/limits.js on purpose —
-// the thin agent must stay dependency-free, and these limit shapes are stable.
+// This is now the ONLY normalizer: the hub's lib/limits.js that these functions
+// were forked from is gone with the self-hosted local server, so the "keep the
+// two copies in lockstep" problem is over. What survives it is the SHAPE — the
+// { plan, account, limits: [{ key, label, percent, resetsAt, severity }] } the
+// SPA widget (public/js/limits.js) renders and public/js/limits-live.js folds
+// pushed engine events onto. `key` is the join between those two, so it is a
+// vocabulary of ours and not whatever enum upstream happened to send
+// (windowForClaude below).
 
 const fs = require('fs');
 const os = require('os');
@@ -47,7 +51,6 @@ function getWindowNumber(win) {
   return parseNum(win.window_minutes) ?? parseNum(win.windowMinutes) ?? parseNum(win.windowDurationMins) ?? parseNum(win.windowDurationMinutes) ?? null;
 }
 
-// Keep in lockstep with lib/limits.js's copy (KNOWN-BUGS #15 tracks the fork).
 // The field that answers decides the inversion, and every source is 0-100 —
 // there is no "small number must be a fraction" guess, because 1 is a legal
 // value on that scale and treating it as one rendered 1% used as 100% used.
@@ -90,12 +93,40 @@ function multFromTier(tier) {
   return m ? Number(m[1]) : null;
 }
 
-function labelForClaude(l) {
-  if (l.kind === 'session' || l.group === 'session') return '5-hour';
-  const model = l.scope && l.scope.model && l.scope.model.display_name;
-  if (l.kind === 'weekly_scoped' && model) return `Weekly · ${model}`;
-  if (l.group === 'weekly' || l.kind === 'weekly_all') return 'Weekly';
-  return l.kind || 'limit';
+// A scoped weekly is keyed by model FAMILY, never by the display name verbatim.
+// The name carries a version ("Claude Opus 4.6") that turns over while the window
+// underneath it does not, and the CLI's own name for the same window in a pushed
+// `rate_limit_event` is the bare family (`seven_day_opus`). The family is the one
+// spelling both sides can reach.
+const MODEL_FAMILIES = ['opus', 'sonnet', 'haiku', 'fable'];
+
+function modelFamily(display) {
+  const s = String(display || '').toLowerCase();
+  return MODEL_FAMILIES.find((f) => s.includes(f)) || null;
+}
+
+// Key AND label off the SAME branches, from one function, because deriving them
+// separately is what shipped a duplicate row. The key used to be `l.kind` taken
+// raw — so the all-model weekly keyed 'weekly_all' while every other producer of
+// this shape (demo.js, the browser specs, LIVE_WINDOW in
+// public/js/limits-live.js) says 'weekly'. foldRateLimit matches a pushed event
+// to a polled row BY KEY, missed, and appended a second "Weekly" row instead of
+// merging into the first. Measured 2026-08-18 on a live Max 20x account.
+//
+// So the key is a stable vocabulary of our own, never the upstream enum: 'session',
+// 'weekly', 'weekly_<family>'. `weekly_scoped` survives only as the fallback for a
+// scoped window that names no model, and it must stay distinct from 'weekly' —
+// collapsing the two would merge two genuinely different limits into one row.
+function windowForClaude(l) {
+  if (l.kind === 'session' || l.group === 'session') return { key: 'session', label: '5-hour' };
+  if (l.kind === 'weekly_scoped') {
+    const model = l.scope && l.scope.model && l.scope.model.display_name;
+    const family = model ? modelFamily(model) : null;
+    return { key: family ? `weekly_${family}` : 'weekly_scoped', label: model ? `Weekly · ${model}` : 'Weekly' };
+  }
+  if (l.group === 'weekly' || l.kind === 'weekly_all') return { key: 'weekly', label: 'Weekly' };
+  const kind = l.kind || l.group || 'limit';
+  return { key: kind, label: l.kind || 'limit' };
 }
 
 // Modern limits[] (kind/percent/resets_at) is richest; fall back to flat
@@ -106,7 +137,8 @@ function normalizeClaude(body) {
   if (Array.isArray(body.limits) && body.limits.length) {
     for (const l of body.limits) {
       if (l.percent == null) continue;
-      out.push({ key: l.kind || l.group || 'limit', label: labelForClaude(l), percent: l.percent, resetsAt: l.resets_at || null, severity: l.severity || 'normal' });
+      const w = windowForClaude(l);
+      out.push({ key: w.key, label: w.label, percent: l.percent, resetsAt: l.resets_at || null, severity: l.severity || 'normal' });
     }
   } else {
     if (body.five_hour) out.push({ key: 'session', label: '5-hour', percent: body.five_hour.utilization ?? null, resetsAt: body.five_hour.resets_at || null, severity: 'normal' });
@@ -123,15 +155,15 @@ function planLabel(sub) {
 }
 
 // Account identity ({ id: uuid, email, name }) AND the plan, from the oauth
-// /profile endpoint — the same single call, and the same source lib/limits.js
-// reads. Not secret: no token, just who the account is. Long-cached, best-effort.
+// /profile endpoint — one call for both. Not secret: no token, just who the
+// account is. Long-cached, best-effort.
 //
 // The plan used to come from ~/.claude/.credentials.json instead, which the CLI
 // writes at login and never rewrites — so the same machine reported one plan
 // through the hub and a different one through the cloud master, and the cloud
-// answer went stale the moment the user changed plan (KNOWN-BUGS #14). The
-// multi-machine usage panel shows this, so the mismatch was on screen. The
-// credentials file stays as the fallback for when the profile call fails.
+// answer went stale the moment the user changed plan. The multi-machine usage
+// panel shows this, so the mismatch was on screen. The credentials file stays
+// as the fallback for when the profile call fails.
 async function getClaudeProfile(cred) {
   if (profileCache && Date.now() - profileCache.at < PROFILE_TTL) return profileCache.profile;
   const ctrl = new AbortController();
@@ -146,7 +178,6 @@ async function getClaudeProfile(cred) {
     const acct = body.account || {};
     const org = body.organization || {};
     const account = acct.uuid ? { id: acct.uuid, email: acct.email || null, name: acct.display_name || acct.full_name || null } : null;
-    // Same derivation as lib/limits.js, field for field.
     const plan = org.organization_type || (acct.has_claude_max ? 'claude_max' : acct.has_claude_pro ? 'claude_pro' : null);
     const profile = { account, plan: plan || null, planMult: multFromTier(org.rate_limit_tier) };
     profileCache = { profile, at: Date.now() };
@@ -196,7 +227,6 @@ async function getClaudeLimits() {
 // from `credits` (a spend balance) even though both arrive under that word.
 // A spent grant stays in the list with a non-'available' status and an expired
 // one is dead weight, so both are filtered here rather than in the view.
-// Keep in lockstep with lib/limits.js's copy (see the fork note at the top).
 function normalizeResetCredits(rc) {
   if (!rc || typeof rc !== 'object') return null;
   const list = Array.isArray(rc.credits) ? rc.credits : [];
@@ -263,9 +293,9 @@ function normalizeCodex(payload) {
   if (s && !(p && s.key === p.key)) out.push(s);
   if (!out.length) return null;
   const data = { plan: rl.plan_type || rl.planType || 'codex', limits: out };
-  // Beside `limits`, never inside it: the SPA keys its patch-in-place path on
-  // the list of limit keys, so an entry appearing there would force a full
-  // rebuild and re-run the meter cascade on every engine.
+  // Beside `limits`, never inside it: a grant is a lever you pull once, not a
+  // usage window, and the SPA draws `limits` as meter rows. Putting it there
+  // would render it as a fourth bar with a percentage it does not have.
   const resets = normalizeResetCredits(payload.rateLimitResetCredits || payload.rate_limit_reset_credits);
   if (resets) data.resetCredits = resets;
   const spend = normalizeSpendCredits(rl.credits);
@@ -452,7 +482,7 @@ function invalidateCodexCache() {
   codexCache = null;
 }
 
-// ---- Grok (mirrors lib/limits.js getGrokLimits) ----
+// ---- Grok ----
 
 function grokAuthEntry() {
   try {
@@ -578,6 +608,39 @@ if (require.main === module) {
   const flat = normalizeClaude({ five_hour: { utilization: 10, resets_at: 'x' }, seven_day: { utilization: 90 } });
   assert.deepStrictEqual(flat.limits.map((l) => [l.label, l.percent]), [['5-hour', 10], ['Weekly', 90]]);
   assert.strictEqual(normalizeClaude({ limits: [] }), null);
+
+  // The KEY vocabulary, which is what public/js/limits-live.js folds a pushed
+  // `rate_limit_event` onto. The modern path used to key the all-model weekly
+  // 'weekly_all' while the flat path keyed the same window 'weekly'; the fold
+  // looks for 'weekly', missed, and appended a phantom second "Weekly" row.
+  assert.deepStrictEqual(modern.limits.map((l) => l.key), ['session', 'weekly'], 'the modern path keys the weekly the same as the flat one');
+  assert.deepStrictEqual(flat.limits.map((l) => l.key), ['session', 'weekly'], 'and the flat path has not moved');
+
+  // The real /api/oauth/usage payload, captured 2026-08-18 from a Max 20x account.
+  const live3 = normalizeClaude({
+    limits: [
+      { kind: 'session', group: 'session', percent: 40, severity: 'normal', resets_at: '2026-08-18T14:40:00Z', scope: null },
+      { kind: 'weekly_all', group: 'weekly', percent: 89, severity: 'warning', resets_at: '2026-08-18T14:00:00Z', scope: null },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 52, severity: 'normal', resets_at: '2026-08-18T14:00:00Z', scope: { model: { id: null, display_name: 'Fable' }, surface: null } },
+    ],
+  });
+  assert.deepStrictEqual(
+    live3.limits.map((l) => [l.key, l.label]),
+    [['session', '5-hour'], ['weekly', 'Weekly'], ['weekly_fable', 'Weekly · Fable']],
+    'three windows, three distinct keys — no two rows may share one',
+  );
+  assert.strictEqual(new Set(live3.limits.map((l) => l.key)).size, 3);
+  // Keyed by FAMILY, so a version bump in the display name does not roll the
+  // window over — and so `seven_day_opus` from the CLI lands on it.
+  const scoped = (display) => normalizeClaude({ limits: [{ kind: 'weekly_scoped', group: 'weekly', percent: 5, scope: { model: { display_name: display } } }] }).limits[0];
+  assert.strictEqual(scoped('Claude Opus 4.6').key, 'weekly_opus');
+  assert.strictEqual(scoped('Claude Opus 4.6').label, 'Weekly · Claude Opus 4.6', 'the label keeps the full name the API gave');
+  assert.strictEqual(scoped('Sonnet 5').key, 'weekly_sonnet');
+  assert.strictEqual(scoped('Fable').key, 'weekly_fable');
+  // A scoped window naming no model keeps a key of its own: folding it into
+  // 'weekly' would merge two genuinely different limits onto one row.
+  const nameless = normalizeClaude({ limits: [{ kind: 'weekly_all', group: 'weekly', percent: 7 }, { kind: 'weekly_scoped', group: 'weekly', percent: 3, scope: null }] });
+  assert.deepStrictEqual(nameless.limits.map((l) => l.key), ['weekly', 'weekly_scoped']);
   assert.strictEqual(planLabel('max'), 'claude_max');
   assert.strictEqual(planLabel('claude_pro'), 'claude_pro');
   assert.strictEqual(multFromTier('default_claude_max_5x'), 5);
@@ -614,10 +677,8 @@ if (require.main === module) {
   });
   assert.strictEqual(dupe.limits.length, 1, 'a repeated window collapses');
 
-  // The full account/rateLimits/read envelope. Must stay in lockstep with
-  // lib/limits.js's copy of these assertions — the agent is the CLOUD path, so a
-  // drift here means the reset grant shows on a self-hosted hub and vanishes on
-  // termdeck.io.
+  // The full account/rateLimits/read envelope. Reading only `.rateLimits` off it
+  // is what hid the reset grant entirely, so these assert the whole shape.
   const soonSec = Math.floor(Date.now() / 1000) + 86400;
   const envelope = normalizeCodex({
     rateLimits: { planType: 'plus', primary: { usedPercent: 4, windowDurationMins: 10080, resetsAt: soonSec }, secondary: null, credits: { hasCredits: false, unlimited: false, balance: '0' } },

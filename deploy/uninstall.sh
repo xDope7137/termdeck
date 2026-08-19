@@ -14,12 +14,23 @@ if [ "$OS" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
   rm -f "$HOME/.config/systemd/user/termdeck-agent.service"
   systemctl --user daemon-reload >/dev/null 2>&1 || true
 elif [ "$OS" = "Darwin" ]; then
-  PLIST="$HOME/Library/LaunchAgents/in.bhavikp.termdeck-agent.plist"
-  launchctl unload "$PLIST" >/dev/null 2>&1 || true
-  rm -f "$PLIST"
+  # Every launchd job pointing at this agent, whatever it is labelled — installs
+  # predate the io.termdeck.agent label. An uninstall that leaves one loaded is
+  # worse than no uninstall: it deletes the files the agent runs from and leaves
+  # launchd respawning it every ThrottleInterval against a missing agent.js.
+  for PLIST in "$HOME/Library/LaunchAgents"/*.plist; do
+    [ -f "$PLIST" ] || continue
+    grep -q '\.termdeck/agent/agent\.js' "$PLIST" 2>/dev/null || continue
+    launchctl unload "$PLIST" >/dev/null 2>&1 || true
+    rm -f "$PLIST"
+  done
+fi
+# The @reboot line the no-service-manager branch may have written.
+if command -v crontab >/dev/null 2>&1; then
+  crontab -l 2>/dev/null | grep -v '\.termdeck/agent/agent\.js' | crontab - >/dev/null 2>&1 || true
 fi
 pkill -f "$DIR/agent.js" >/dev/null 2>&1 || true
 
-rm -rf "$DIR" "$ENVFILE"
+rm -rf "$DIR" "$ENVFILE" "$HOME_DIR/persistence.json"
 echo "OK — agent stopped and removed from this machine."
 echo "Remove the machine from the Termdeck dashboard too, if you haven't already."

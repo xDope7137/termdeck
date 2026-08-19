@@ -21,7 +21,15 @@ fi
 
 HOME_DIR="${TERMDECK_HOME:-$HOME/.termdeck}"
 ENVFILE="$HOME_DIR/agent.env"
-PLIST="$HOME/Library/LaunchAgents/in.bhavikp.termdeck-agent.plist"
+# macOS keeps the token inline in the plist, so this is where repair recovers it.
+# Fall back to searching LaunchAgents by CONTENT: a machine installed under an
+# earlier label still has to be repairable, and looking only for the current name
+# would turn "repair it for me" back into "go find your token in the dashboard"
+# for exactly the machines that have been running longest. /dev/null when there is
+# nothing to find — an empty path would make the grep below read stdin and hang.
+PLIST="$HOME/Library/LaunchAgents/io.termdeck.agent.plist"
+[ -f "$PLIST" ] || PLIST=$(grep -ls 'TERMDECK_AGENT_TOKEN' "$HOME/Library/LaunchAgents"/*.plist 2>/dev/null | head -1)
+[ -n "$PLIST" ] || PLIST=/dev/null
 
 echo ""
 echo "${BOLD}${CYAN}Termdeck Agent Repair${RESET}"

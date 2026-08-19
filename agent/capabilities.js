@@ -43,8 +43,15 @@ let checkpointsLib; try { checkpointsLib = require('./checkpoints'); } catch { c
 // like the rest: an agent that pulled a new capabilities.js before this file
 // landed still boots, and the op answers AGENT_OUTDATED instead of crash-looping.
 let projectFilesLib; try { projectFilesLib = require('./project-files'); } catch { projectFilesLib = null; }
+// Background shells: which processes a parked shell host still owns, and which
+// output file each one writes to. Guarded like the rest — an agent that pulled a
+// new capabilities.js before this file landed still boots and answers
+// AGENT_OUTDATED for the two ops that need it.
+let procTreeLib; try { procTreeLib = require('./proc-tree'); } catch { procTreeLib = null; }
 let machineConfigLib; try { machineConfigLib = require('./machine-config'); } catch { machineConfigLib = null; }
 let projectDocLib; try { projectDocLib = require('./project-doc'); } catch { projectDocLib = null; }
+let commandCatalogLib; try { commandCatalogLib = require('./command-catalog'); } catch { commandCatalogLib = null; }
+let usageBehaviourLib; try { usageBehaviourLib = require('./usage-behaviour'); } catch { usageBehaviourLib = null; }
 // Account switching (cloud path) — same lib/accounts.js the hub uses, via the
 // agent/accounts.js stub. Its cache-invalidation hooks point at THIS agent's
 // own caches (claudeModelCache below, agent/limits.js's), not the hub's.
@@ -103,6 +110,43 @@ const rootOf = (rp) => REAL_ROOTS.find((r) => rp === r || rp.startsWith(r + path
 // INSIDE the whole-home CLAUDE_DIR root today) must never cross the tunnel as a plain
 // file read, however a root gets misconfigured.
 const DENYLIST_BASENAMES = new Set(['auth.json', '.credentials.json']);
+
+// Background-shell output files. These are the one READ that lands outside the
+// transcript roots AND takes a path from the master, so the rule has to be tight
+// enough to state in a sentence: a file named <backgroundTaskId>.output, in a
+// directory named `tasks`, somewhere under this user's own Claude scratchpad root
+// in the OS temp dir. Nothing else resolves, whatever the master asks for.
+//
+// The path is VALIDATED here rather than trusted, like every other argument the
+// master forwards. It reaches us because only the CLI's own tool_result names it
+// (and it embeds the ROOT session id, not the resumed one, so it cannot be
+// derived) — but "we can't compute it" is not "we'll read whatever we're told".
+const BG_SCRATCH_ROOT = (() => {
+  // Mirrors the CLI's own layout: <tmp>/claude-<uid>/<project-slug>/<sessionId>/tasks/.
+  // getuid is POSIX-only; Windows scratchpads carry no uid segment, so match the
+  // prefix rather than an exact directory name.
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  return { dir: os.tmpdir(), prefix: uid == null ? 'claude-' : `claude-${uid}` };
+})();
+const BG_LOG_RE = /^b[a-z0-9]+\.output$/i;
+
+function bgLogPathOk(p) {
+  if (typeof p !== 'string' || !p) return false;
+  let rp;
+  // realpath, not resolve: the temp dir is a symlink on macOS (/tmp → /private/tmp),
+  // so an un-resolved compare rejects every legitimate path there.
+  try { rp = fs.realpathSync(p); } catch { return false; }
+  if (!BG_LOG_RE.test(path.basename(rp))) return false;
+  if (path.basename(path.dirname(rp)) !== 'tasks') return false;
+  let tmp;
+  try { tmp = fs.realpathSync(BG_SCRATCH_ROOT.dir); } catch { tmp = path.resolve(BG_SCRATCH_ROOT.dir); }
+  if (rp !== tmp && !rp.startsWith(tmp + path.sep)) return false;
+  // The segment directly under the temp dir must be this user's scratchpad root —
+  // otherwise any world-writable `*/tasks/b*.output` under /tmp would qualify.
+  const seg = rp.slice(tmp.length + 1).split(path.sep)[0] || '';
+  if (!seg.startsWith(BG_SCRATCH_ROOT.prefix)) return false;
+  try { return fs.statSync(rp).isFile(); } catch { return false; }
+}
 
 // Cross-mount-safe move (the in-root trash dir is always same-filesystem, but keep
 // the fallback in case a root is itself a mount/symlink to another device).
@@ -187,6 +231,13 @@ async function confined(p) {
 function headIo() {
   return {
     path,
+    // Only used to confirm a directory a rollout NAMES still exists (index-head's
+    // codex worktree promotion). Deliberately not `confined` — it answers about the
+    // user's project tree, which is where their code lives, and it returns one bool
+    // about a path the transcript already contains.
+    isDir: async (p) => {
+      try { return (await fsp.stat(p)).isDirectory(); } catch { return false; }
+    },
     readFile: async (p, offset = 0, len = null) => {
       const fd = await fsp.open(p, 'r');
       try {
@@ -529,7 +580,7 @@ async function cliStatus() {
 function makeCapabilities(send) {
   const watchers = new Map(); // watchId -> chokidar watcher
   const procs = new Map();    // procId -> child process
-  const persistentProcs = new Set(); // subset of procs that outlive a turn (the codex app-server, the grok agent-stdio child) — must NOT count as "busy"
+  const persistentProcs = new Set(); // subset of procs that outlive a turn (the codex app-server, the grok agent-stdio child) — "busy" only while the master says a turn is running inside one
   // Children born on this connection get generation-scoped park keys, so a NEW
   // master's procIds (a fresh Transport counts from 1 again) can never collide
   // with a parked survivor of the old one.
@@ -869,6 +920,69 @@ function makeCapabilities(send) {
         }
         return;
       }
+      case 'commandCatalog': {
+        // What this chat can type after a slash, and what each one does. Drawn
+        // on `projectDoc`'s terms exactly: the master names a CONFINED
+        // transcript and an engine, never a cwd — the project root is resolved
+        // HERE out of that transcript's own head.
+        //
+        // Unlike projectDoc, a chat with NO cwd is not an error. The user's own
+        // commands are still a real answer, and a palette that refuses to open
+        // because a folder was renamed is worse than one missing a few rows.
+        //
+        // The grok tier reads ~/.grok/{commands,skills}, which are outside this
+        // agent's roots on purpose — see the note in lib/command-catalog.js.
+        // Nothing throws out of this case: an uncaught rejection takes the agent
+        // down and view-only-locks every live chat on the box.
+        try {
+          if (!commandCatalogLib || !indexHeadLib) return send({ t: 'commandCatalog', id: m.id, ok: false, error: 'agent is out of date (command-catalog module missing) — update the agent', code: 'AGENT_OUTDATED' });
+          const engine = m.engine === 'codex' || m.engine === 'grok' ? m.engine : 'claude';
+          let cwd = null;
+          if (typeof m.path === 'string' && m.path) {
+            if (!(await confined(m.path))) return send({ t: 'commandCatalog', id: m.id, ok: false, error: 'path not permitted' });
+            const rp = await fsp.realpath(m.path);
+            let sizeBytes = 0;
+            try { sizeBytes = (await fsp.stat(rp)).size; } catch {}
+            try {
+              const head = await indexHeadLib.readIndexHead({ path: rp, engine, zst: rp.endsWith('.zst'), sizeBytes }, headIo());
+              if (head && head.cwd) cwd = await fsp.realpath(head.cwd);
+            } catch { cwd = null; }
+          } else if (typeof m.cwd === 'string' && m.cwd) {
+            // The new-chat page: no transcript exists yet to resolve a project
+            // root from. Like the 'git' capability's cwd ops, this is NOT
+            // confined to the transcript roots — projects live wherever the
+            // user codes, and the master only ever sends back a path this SAME
+            // browser session chose through the folder picker.
+            try { cwd = await fsp.realpath(m.cwd); } catch { cwd = null; }
+          }
+          const data = await commandCatalogLib.readCatalog({
+            engine,
+            cwd,
+            claudeDir: REAL_ROOTS[0],
+            codexHome: REAL_ROOTS[1],
+            grokDir: GROK_DIR,
+          });
+          return send({ t: 'commandCatalog', id: m.id, ok: true, data });
+        } catch (e) {
+          const denied = e.code === 'EACCES' || e.code === 'EPERM';
+          send({ t: 'commandCatalog', id: m.id, ok: false, error: denied ? 'Permission denied' : (e.message || e.code), code: denied ? 'DENIED' : (e.code || 'CATALOG_FAILED') });
+        }
+        return;
+      }
+      case 'usageBehaviour': {
+        // WHY the account's limit is being spent (the `/usage` breakdown), read
+        // off this machine's own transcripts. Like `machineConfig` it takes NO
+        // argument at all: the root is this agent's own, and there is nothing
+        // here for a master to name. It reads a lot of disk and returns a few
+        // hundred bytes, which is the whole reason it runs here.
+        if (!usageBehaviourLib) return send({ t: 'usageBehaviour', id: m.id, ok: false, error: 'agent is out of date (usage-behaviour module missing) — update the agent', code: 'AGENT_OUTDATED' });
+        try {
+          send({ t: 'usageBehaviour', id: m.id, ok: true, data: await usageBehaviourLib.readUsageBehaviour(REAL_ROOTS[0]) });
+        } catch (e) {
+          send({ t: 'usageBehaviour', id: m.id, ok: false, error: e.code || e.message, code: 'USAGE_FAILED' });
+        }
+        return;
+      }
       case 'machineConfig': {
         // What the engine is CONFIGURED with (V3 §G + U2's viewer + U9's chain).
         // Everything it reads is inside a transcript ROOT, so this widens
@@ -919,16 +1033,46 @@ function makeCapabilities(send) {
           let root;
           try { root = await fsp.realpath(head.cwd); } catch { return send({ t: 'projectFiles', id: m.id, ok: false, error: `Project folder is missing: ${head.cwd}`, code: 'NO_CWD' }); }
 
-          // Policy runs on the RESOLVED segments, every one of them, so
-          // `.git/config` is refused by its first segment rather than by a rule
-          // about its last. Skipped entirely when the owner has opted in.
-          if (!m.includeHidden) {
-            const hidden = projectFilesLib.hiddenSegment(v.segments);
-            if (hidden) return send({ t: 'projectFiles', id: m.id, ok: false, error: `Hidden and sensitive files are turned off for this project (${hidden})`, code: 'HIDDEN_BLOCKED' });
-          }
+          // Policy runs on every segment, so `.git/config` is refused by its
+          // first rather than by a rule about its last. Skipped entirely when the
+          // owner has opted in — and skipped for a read that NAMES AN IMAGE.
+          //
+          // That last exemption is narrow and it is policy, not confinement:
+          // resolveTarget below is the confinement and it runs either way. The
+          // policy exists so a file tree opened on a phone cannot casually
+          // surface a private key; a picture is not one, and it cannot be made
+          // into one — readFileCapped decides the media type from a CLOSED
+          // extension list that shares no member with the secret-shaped names, so
+          // an exempted read can only ever come back as an <img>. Without it
+          // every screenshot an agent takes into a dot-directory (`.claude/…`,
+          // where this project's own worktrees live) is a file the person who
+          // asked for it is refused, and the message that links it renders a
+          // broken image.
+          //
+          // The name is only half of it: a symlink called `shot.png` is whatever
+          // it points at. So an exempted path is re-checked against the RESOLVED
+          // file below, and a hidden path that names no image is still refused
+          // before anything touches disk.
+          const refuseHidden = (seg) => send({ t: 'projectFiles', id: m.id, ok: false, error: `Hidden and sensitive files are turned off for this project (${seg})`, code: 'HIDDEN_BLOCKED' });
+          const asked = m.includeHidden ? null : projectFilesLib.hiddenSegment(v.segments);
+          if (asked && !(m.op === 'read' && projectFilesLib.imageTypeFor(m.relPath))) return refuseHidden(asked);
 
           const r = await projectFilesLib.resolveTarget(root, v.segments);
           if (r.error) return send({ t: 'projectFiles', id: m.id, ok: false, error: r.error, code: r.code });
+
+          // …and again on the file the path RESOLVED to, which is the half that
+          // holds. A name is not evidence: `shot.png` may be a symlink to `.env`,
+          // and `notes.md` may be one to `.aws/credentials` — neither has a
+          // hidden segment to refuse, so a policy that only ever reads the
+          // REQUEST is one any project can walk straight past. Containment is
+          // already settled above (resolveTarget realpaths and re-compares); this
+          // is the policy catching up to it, on the same terms readFileCapped
+          // uses to decide what the file IS.
+          if (!m.includeHidden) {
+            const real = path.relative(root, r.target).split(path.sep).filter(Boolean);
+            const hidden = projectFilesLib.hiddenSegment(real);
+            if (hidden && !(m.op === 'read' && projectFilesLib.imageTypeFor(r.target))) return refuseHidden(hidden);
+          }
 
           // Every read below uses r.target — the RESOLVED path — never the
           // request string. Same TOCTOU rule as restore/mutate.
@@ -1155,6 +1299,13 @@ function makeCapabilities(send) {
           const payload = m.payload && typeof m.payload === 'object' ? m.payload : {};
           const cwd = String(payload.cwd || '');
           if (m.op === 'diff') return send({ t: 'git', id: m.id, ok: true, data: await diffLib.collectDiff(cwd) });
+          // Two git calls, no diff — cheap enough to ask on every chat open, which
+          // is the point: the transcript's own gitBranch is the PARENT checkout's
+          // inside a worktree (see readBranch).
+          if (m.op === 'branch') return send({ t: 'git', id: m.id, ok: true, data: await diffLib.readBranch(cwd) });
+          // Every checkout of this repo, so a new chat can be started in one. Read
+          // only, and it names no path the master did not already send.
+          if (m.op === 'worktrees') return send({ t: 'git', id: m.id, ok: true, data: await diffLib.listWorktrees(cwd) });
           if (m.op === 'pr') return send({ t: 'git', id: m.id, ok: true, data: await diffLib.createPr(cwd, { title: payload.title, body: payload.body }) });
           if (m.op === 'mcpServers') {
             if (!mcpConfigLib) return send({ t: 'git', id: m.id, ok: false, error: 'agent is out of date (mcp-config module missing) — update the agent', code: 'AGENT_OUTDATED' });
@@ -1291,9 +1442,10 @@ function makeCapabilities(send) {
         catch (e) { return send({ t: 'exit', id: m.id, code: null, signal: null, error: e.message }); }
         procs.set(m.id, child);
         // The codex app-server and the grok `agent stdio` child are each spawned ONCE and
-        // reused across turns (see remote-codex-runner.js / remote-grok-runner.js). If either
-        // counted as "busy" it would block self-update forever once that engine is loaded — so
-        // track them as persistent and exclude them from busy(). Per-turn claude CLIs still count.
+        // reused across turns (see remote-codex-runner.js / remote-grok-runner.js). Counting
+        // either as "busy" outright would block self-update forever once that engine is loaded,
+        // so they are tracked as persistent and busy() reads the master's turn count for them
+        // instead (case 'turns' below). Per-turn claude CLIs always count.
         if (m.engine === 'codex' && Array.isArray(m.args) && m.args[0] === 'app-server') persistentProcs.add(m.id);
         if (m.engine === 'grok' && Array.isArray(m.args) && m.args[0] === 'agent' && m.args[1] === 'stdio') persistentProcs.add(m.id);
         // Everything stdio routes through the park registry (LIVE-DEPLOY Phase 2):
@@ -1302,6 +1454,14 @@ function makeCapabilities(send) {
         // capture the ENTRY, not the id — a parked child outlives this connection's
         // maps. m.meta is opaque master context, echoed back in the hello inventory.
         const entry = parkRegistry.track({ procId: m.id, child, engine: m.engine, meta: m.meta, persistent: persistentProcs.has(m.id), sink: send });
+        // Tell the master which pid this child got. It is the only proof of
+        // ownership that exists: the Claude CLI writes a live-registry entry for
+        // the session, and the master's composer lock and orphan reaper both
+        // decide "ours or a second writer" by comparing pids. The master used to
+        // LEARN the pid by catching a registry poll mid-turn, which misses a
+        // short turn entirely and leaves the leftover CLI locking its own chat.
+        // Sent before any stdout, so ownership is known from the first frame.
+        send({ t: 'pid', id: m.id, pid: child.pid ?? null });
         child.stdout.on('data', (d) => parkRegistry.onData(entry, 'stdout', d));
         child.stderr.on('data', (d) => parkRegistry.onData(entry, 'stderr', d));
         child.on('exit', (code, signal) => { procs.delete(m.id); persistentProcs.delete(m.id); parkRegistry.onExit(entry, { code, signal }); });
@@ -1320,6 +1480,9 @@ function makeCapabilities(send) {
           procs.set(m.id, entry.child);
           if (entry.persistent) persistentProcs.add(m.id);
           entry.child.once('exit', () => { procs.delete(m.id); persistentProcs.delete(m.id); });
+          // Re-state the pid under the NEW procId, same as a spawn: the master
+          // that picks this survivor up may never have seen it started.
+          send({ t: 'pid', id: m.id, pid: entry.child.pid ?? null });
         }
         return;
       }
@@ -1339,6 +1502,63 @@ function makeCapabilities(send) {
         try { process.kill(m.pid, m.signal || 'SIGTERM'); }
         catch (e) { if (e.code !== 'ESRCH') return send({ t: 'killPid', id: m.id, ok: false, error: e.message }); }
         send({ t: 'killPid', id: m.id, ok: true });
+        return;
+      }
+      case 'parkShellHost': {
+        // The turn is over but this CLI still owns live background shells in its
+        // process group, so the master is declining to reap it. Move it to the
+        // parked map with role 'shell-host' — no TTL, not busy, named in the
+        // inventory (agent/park.js). The reply's parkId is how every later op
+        // (bgShells, reap) refers to it.
+        const parkId = parkRegistry.parkAsShellHost(m.id, m.meta);
+        if (!parkId) return send({ t: 'parkShellHost', id: m.id, ok: false, error: 'no live child for that id', code: 'NO_CHILD' });
+        procs.delete(m.id);
+        send({ t: 'parkShellHost', id: m.id, ok: true, parkId });
+        return;
+      }
+      case 'turns': {
+        // How many turns the master is running inside a persistent child (the
+        // codex app-server, the grok stdio child). It is the ONLY way this
+        // process can know: that child is spawned once and reused, so it is
+        // alive whether or not anything is happening in it. Without the count a
+        // Codex turn was invisible to busy() and self-update killed it mid-turn.
+        parkRegistry.setTurnCount(m.id, Number(m.n) || 0);
+        return;
+      }
+      case 'bgShells': {
+        // Which processes a shell host still owns, and what each writes to. The
+        // master matches logPath against the output file the CLI named in its
+        // tool_result — an exact key, where the command string is a guess.
+        if (!procTreeLib) return send({ t: 'bgShells', id: m.id, ok: false, error: 'agent needs updating', code: 'AGENT_OUTDATED' });
+        const pid = parkRegistry.parkedPid(String(m.parkId || ''));
+        // Gone (exited on its own, or reaped) — an empty list, not an error: the
+        // master's reconcile treats it as "every shell here is finished".
+        if (pid == null) return send({ t: 'bgShells', id: m.id, ok: true, pid: null, procs: [] });
+        try { send({ t: 'bgShells', id: m.id, ok: true, pid, procs: await procTreeLib.list(pid) }); }
+        catch (e) { send({ t: 'bgShells', id: m.id, ok: false, error: e.message }); }
+        return;
+      }
+      case 'bgShellLog': {
+        // Tail one background shell's output file. NOT part of readFile: that one
+        // is confined to the transcript roots and must stay that way. This is its
+        // own confinement (bgLogPathOk) over a different tree, and it is a read of
+        // a file the CLI itself created for exactly this purpose.
+        if (!bgLogPathOk(m.path)) return send({ t: 'bgShellLog', id: m.id, ok: false, error: 'not a background shell log', code: 'DENIED' });
+        try {
+          const st = await fsp.stat(m.path);
+          // A rotated/recreated file is shorter than the cursor we hold. Restart
+          // from 0 and SAY so, rather than silently serving a torn suffix.
+          const want = Math.max(0, Math.min(Number(m.bytes) || 64 * 1024, 1024 * 1024));
+          const truncated = Number(m.offset) > st.size;
+          const from = truncated ? Math.max(0, st.size - want) : Math.max(0, Number(m.offset) || 0);
+          const fh = await fsp.open(m.path, 'r');
+          try {
+            const len = Math.min(want, Math.max(0, st.size - from));
+            const buf = Buffer.alloc(len);
+            if (len) await fh.read(buf, 0, len, from);
+            send({ t: 'bgShellLog', id: m.id, ok: true, data: buf.toString('base64'), offset: from, next: from + len, size: st.size, truncated, mtimeMs: st.mtimeMs });
+          } finally { await fh.close(); }
+        } catch (e) { send({ t: 'bgShellLog', id: m.id, ok: false, error: e.code || e.message }); }
         return;
       }
     }
@@ -1373,4 +1593,7 @@ function makeCapabilities(send) {
   return { handle, park, destroy, busy: () => parkRegistry.turnBusy() > 0, parkedInventory: () => parkRegistry.inventory() };
 }
 
-module.exports = { makeCapabilities, confined, ROOTS, ENGINES };
+// bgLogPathOk is exported for the same reason `confined` is: it is a security
+// boundary, and a boundary that can only be exercised through a live WebSocket
+// is a boundary nobody tests. See tests/bg-shell-confinement.mjs.
+module.exports = { makeCapabilities, confined, bgLogPathOk, ROOTS, ENGINES };

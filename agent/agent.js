@@ -120,6 +120,9 @@ try {
 // reporting how it was started is never worth refusing to boot over.
 let persistenceLib; try { persistenceLib = require('./persistence'); } catch { persistenceLib = null; }
 const PERSISTENCE = persistenceLib ? persistenceLib.detect() : null;
+// The two Windows launcher files the scheduled task starts this agent through.
+// Guarded for the same reason as persistence above, and no-ops off Windows.
+let winLauncher; try { winLauncher = require('./win-launcher'); } catch { winLauncher = null; }
 
 // The opening lines of every run: what is running, and what happened to the run
 // before it. "It restarted" on its own is the least useful thing a log can say.
@@ -131,6 +134,12 @@ const PERSISTENCE = persistenceLib ? persistenceLib.detect() : null;
   if (first) log.info('First start on this machine after install.');
   else if (why) log.info(`Previous run stopped on purpose: ${why}.`);
   else log.warn('Previous run ended without stopping on purpose — the machine restarted, Termdeck was closed, or the agent crashed. It has been restarted automatically.');
+  // Windows only: put run.cmd / run.vbs back if they have gone. The scheduled
+  // task starts this agent THROUGH them and retries every 2 minutes, and
+  // wscript.exe answers a missing script with a modal dialog — so losing one is
+  // not a silent failure, it is a message box on the customer's desktop 720
+  // times a day. See agent/win-launcher.js.
+  if (winLauncher) winLauncher.watch(log);
 }
 
 const TOKEN = process.env.TERMDECK_AGENT_TOKEN;
@@ -170,7 +179,7 @@ process.on('unhandledRejection', (err) => {
 // capabilities.js. Refuses while a Termdeck-owned claude/codex turn is running so a live
 // session started by Termdeck isn't cut off. A terminal-held session can keep running:
 // the master passes force=true when it knows Termdeck itself does not own an active turn.
-const AGENT_FILES = ['agent.js', 'capabilities.js', 'park.js', 'log.js', 'persistence.js', 'limits.js', 'usage.js', 'which.js', 'diff.js', 'mcp-config.js', 'accounts.js', 'codex-accounts.js', 'session-title.js', 'tail-read.js', 'checkpoints.js', 'index-head.js', 'session-settings.js', 'session-head.js', 'transcript.js', 'claude-data.js', 'pool.js', 'project-files.js', 'machine-config.js', 'project-doc.js', 'package.json'];
+const AGENT_FILES = ['agent.js', 'capabilities.js', 'park.js', 'proc-tree.js', 'log.js', 'persistence.js', 'win-launcher.js', 'limits.js', 'usage.js', 'which.js', 'diff.js', 'mcp-config.js', 'accounts.js', 'codex-accounts.js', 'session-title.js', 'tail-read.js', 'checkpoints.js', 'index-head.js', 'session-settings.js', 'session-head.js', 'transcript.js', 'claude-data.js', 'pool.js', 'project-files.js', 'machine-config.js', 'command-catalog.js', 'usage-behaviour.js', 'project-doc.js', 'package.json'];
 
 // Compile-check before anything is installed. A truncated download, an HTML error
 // page from the tunnel, a 200 with an empty body — all of them used to be written
@@ -288,14 +297,65 @@ async function fetchAll(files, deadline, load) {
 }
 // ── update-bounds:end ──
 
+// ── "It will be applied when the machine is idle" ─────────────────────────────
+//
+// That sentence was in the log and nothing kept it. The master pushes a
+// self-update on HELLO and only on hello (lib/cloud/relay.js), the agent declines
+// while a turn is running, and the next attempt is therefore the next reconnect —
+// which on a machine somebody is actually using lands mid-turn too. Measured on
+// one box: postponed at 21:27, 00:39, 00:55, 05:22, 07:32, 07:53, 08:04, stuck on
+// 0.0.85 → 0.0.88 for a day with three releases queued behind it.
+//
+// The failure is invisible in exactly the wrong way. The master ships a fix, the
+// deploy goes green, and the machines that need it most — the busy ones — are the
+// last to get it, or never do. It cost a whole release cycle here: the Codex title
+// parse runs ON the agent, so a fix that was correct, tested and deployed still
+// showed "(untitled)" because the parser on that disk was three versions old.
+//
+// So the promise gets a keeper. The declined request is remembered and retried
+// once the machine goes quiet, on a cheap timer — `busy()` is a counter read, and
+// this only ticks while an update is actually owed.
+// Lifted out and evaluated by tests/agent-update-idle.mjs, same seam and same
+// rule as the update-bounds region above: keep it free of `require`, so a
+// dependency creeping in fails there as a ReferenceError rather than quietly
+// going untested. `selfUpdate` is a forward reference on purpose — the test
+// substitutes a recorder for it.
+// ── update-idle:begin ──
+const UPDATE_IDLE_RETRY_MS = 30_000;
+let postponed = null; // { ws, caps, req } — the update this machine still owes
+
+function retryUpdateWhenIdle(ws, caps, req) {
+  // Only the newest request survives: the master converges to ONE version, and
+  // retrying a superseded one would install something already out of date.
+  postponed = { ws, caps, req: { ...req, id: null } }; // no id — the master's promise already rejected
+  if (retryUpdateWhenIdle.timer) return;
+  retryUpdateWhenIdle.timer = setInterval(() => {
+    const owed = postponed;
+    if (!owed) return;
+    if (owed.caps.busy()) return; // still working — the whole point is not to cut a turn off
+    postponed = null;
+    clearInterval(retryUpdateWhenIdle.timer);
+    retryUpdateWhenIdle.timer = null;
+    log.info('This machine is idle now — applying the update that was postponed.');
+    selfUpdate(owed.ws, owed.caps, owed.req);
+  }, UPDATE_IDLE_RETRY_MS);
+  // Never hold the process open for this: an agent whose only remaining work is a
+  // pending update should still be able to exit.
+  retryUpdateWhenIdle.timer.unref?.();
+}
+// ── update-idle:end ──
+
 async function selfUpdate(ws, caps, req) {
   const id = req && req.id;
   const force = !!(req && req.force);
   const target = (req && req.version) || null;
-  const ack = (ok, error) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: 'update', id, ok, error })); };
+  // No id means this is the idle retry firing, not the master asking: there is no
+  // pending promise on the other side to answer.
+  const ack = (ok, error) => { if (id && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: 'update', id, ok, error })); };
   log.info(`Update available from Termdeck: version ${target || 'newer'} (this machine is on ${VERSION}).`);
   if (caps.busy() && !force) {
-    log.info('Update postponed — a chat is running on this machine right now. It will be applied when the machine is idle.');
+    log.info(`Update postponed — a chat is running on this machine right now. It will be applied within ${Math.round(UPDATE_IDLE_RETRY_MS / 1000)}s of this machine going idle.`);
+    retryUpdateWhenIdle(ws, caps, req);
     return void ack(false, 'busy: a Termdeck-held session is running on this machine');
   }
   // force is the operator's override for both gates — a machine that quarantined a
