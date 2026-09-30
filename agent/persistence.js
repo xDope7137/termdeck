@@ -124,14 +124,14 @@ function describe(state) {
   switch (p.mode) {
     case 'systemd-user':
       if (p.linger === false) {
-        return 'Started by systemd (user service). It will NOT survive you logging out — run `sudo loginctl enable-linger $USER` to fix that.';
+        return 'Started by systemd (user service). It will NOT survive you logging out. Run `sudo loginctl enable-linger $USER` to fix that.';
       }
-      return `Started by systemd (user service)${p.linger === true ? ', lingering enabled — it survives logout' : ''}.`;
+      return `Started by systemd (user service)${p.linger === true ? ', lingering enabled, so it survives logout' : ''}.`;
     case 'systemd-system': return 'Started by systemd (system service).';
     case 'launchd': return 'Started by launchd at login.';
     case 'schtask': return 'Started by the Windows scheduled task.';
     case 'crontab': return 'Started by a @reboot cron entry.';
-    case 'foreground': return 'Started in the foreground — it will NOT come back after a restart. Re-run the installer to register it properly.';
+    case 'foreground': return 'Started in the foreground, so it will NOT come back after a restart. Re-run the installer to register it properly.';
     default: return 'Started by something this agent could not identify; it may not come back after a restart.';
   }
 }

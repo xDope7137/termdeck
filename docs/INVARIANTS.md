@@ -176,7 +176,7 @@ invisible, so there is nothing on screen to look at when it misbehaves);
 `tests/transcript-cache.spec.js` (browser), `tests/transcript-window.mjs` (guards the
 wiring and the preview-window coupling).
 
-## The turn's stdin stays open for the whole turn (`lib/cloud/remote-runner.js`)
+## The turn's stdin stays open for the whole turn (`agent/engine-runs.js`)
 
 The CLI is spawned in `--input-format stream-json` and its **stdin is held open until
 the turn really ends**, so more user frames can be written while the turn runs. Two
@@ -210,7 +210,9 @@ in-flight work discarded. Nothing required that. Which engines may steer is deci
 in ONE place server-side (the per-engine branches of `MachineHost.steerTurn`) and
 mirrored by the `steer` flags in `public/js/engines.js`; `tests/steer-capability.mjs`
 fails if they drift, because a mismatch either offers a steer that always throws or
-hides one that works. Grok stays out — it has no `turn/steer` analog in the ACP
+hides one that works. A steer is also refused while a sub-agent is running (`STEER_BUSY`):
+`priority:'now'` would abort the sub-agents and throw their work away, so the master queues
+the message for the next turn instead. Grok stays out: it has no `turn/steer` analog in the ACP
 surface. Covered by `tests/steer-claude.mjs` + `tests/steer-capability.mjs`.
 
 ## Preview windows are shared (`previewWindow` in `lib/transcript.js`)
@@ -662,12 +664,12 @@ entry rather than splicing two transcripts; never promotes into the memory LRU (
 pinned chats must not evict the 12 in use). Covered by `tests/pinned-live.mjs` + a browser
 test that pins mid-run.
 
-## Activity fold (`transcript-view.js`)
+## Activity card (`transcript-view.js`)
 
 Consecutive non-prose blocks (`OPENS_ACTIVITY`: tool calls, thinking, checklists, local
 command output; `JOINS_ACTIVITY`: results and task notifications, which only ever join a
-fold already open) mount into a single collapsed `<details class="activity-fold">` with a
-per-tool summary. The blocks themselves render **unchanged** — only where they are mounted
+fold already open) mount into a single `<details class="activity-card">` with a counted or summarised
+label; one tool call is one row, mutated in place by its `tool_use` id. The blocks themselves render **unchanged**; only where they are mounted
 moves, which is what keeps the tool_use → `toolSlots` → tool_result pairing working (a
 closed `<details>` keeps its children in the DOM).
 
@@ -689,7 +691,7 @@ restatement of the tool-call theme — unscoped it loses to `.workspace-app .tra
 details.fold[open]` regardless of how many classes it stacks, and the open fold computes to
 a bordered `rgb(23,23,23)` container nested inside the tool rows' own boxes. The spec
 asserts the **computed** style for exactly that reason. Covered by
-`tests/activity-fold.spec.js`.
+`tests/activity-cards.spec.js`.
 
 ## Loading ring (`setLoading` in `transcript-view.js`)
 
@@ -1022,12 +1024,12 @@ nothing can rebuild it from the jsonl, and it rides `run.summaries` on the `subs
 snapshot exactly like `run.tasks`. It follows that summaries **die with the turn**: once
 the run is gone the fold goes back to counting. That is the correct ending, not a gap —
 a label outliving the snapshot would be a cache of something that was never on disk, which
-is the one thing these signals may not become. Both runners fold through the same registry
-so the frame is byte-identical on either transport; `remote-runner.js` passes the whole
+is the one thing these signals may not become. Every runner folds through the same registry
+so the frame is byte-identical on any path; `lib/claude-events.js` passes the whole
 frame as `ev.message` (not `ev.summary` — the frame has a `summary` field of its own, and
 naming the envelope after one of its fields is how a caller ends up passing the string).
 Covered by `tests/tool-summaries.mjs`, `tests/tool-summary-wiring.mjs` and
-`tests/activity-fold.spec.js`.
+`tests/activity-cards.spec.js`.
 
 ## A retry is transient; a refusal is on disk (`lib/engine-notice.js`)
 
@@ -1059,7 +1061,7 @@ contained; measured across **all 8** retracted uuids on this box, not one surviv
 record — the CLI never persists a retracted message, so a disk-rendered refusal has nothing
 to evict. Retraction remains a live-stream concern only. The parser reads both camelCase
 (disk) and snake_case (stream) spellings, since neither is contractual. Covered by
-`tests/engine-notice.mjs` and `tests/activity-fold.spec.js`.
+`tests/engine-notice.mjs` and `tests/activity-cards.spec.js`.
 
 ## A periodic feed needs a THROTTLE, not a debounce (`public/js/util.js`)
 
@@ -1381,7 +1383,7 @@ disable themselves with the reason in the tooltip rather than failing on click.
 so hanging it off a per-row control would silently delete every other runtime-registered
 server. Actions never paint a status from their own ack; the engine reconnects
 asynchronously, so the browser re-reads. On the cloud path the ack is carried separately
-from the payload (`controlRaw` in `remote-runner.js`) because these succeed **empty** —
+from the payload (the driver's `control_request` answers, keyed by request id, in `lib/claude-events.js`) because these succeed **empty**:
 collapsing both into "resolved with null" would make a CLI too old to know the subtype
 indistinguishable from one that carried the request out. Read state rides the existing
 `/api/mcp-servers` response rather than a new frame; only the write is a WS message.
@@ -1447,14 +1449,14 @@ No answer at all is a sentence, never silence.
 and every skill; pushing it per turn would spend real bytes — on cloud, the customer's own
 uplink — on a panel nobody has opened. `main.js` asks only when the `.ctx-fold` opens.
 
-**The cloud path writes its first `control_request`.** `remote-runner.js` has always *read*
+**The cloud path writes its first `control_request`.** The Claude driver has always *read*
 `control_request` frames (`can_use_tool`) and answered them; this is the first one it
 *issues*, so it keeps a `pendingControl` map keyed by `request_id` — the CLI answers out of
 order, and a second request must not steal the first one's answer. Every pending entry is
 settled to `null` on a timeout (an older CLI without the subtype never answers at all) and
-when the turn finishes, or a panel promise hangs forever. It needed **no new agent reply
-type**: it rides the CLI's existing stdin/stdout on the already-spawned process, so
-`lib/cloud/transport.js`'s `onFrame` switch and `agent/` are untouched.
+when the turn finishes, or a panel promise hangs forever. It needed **no new protocol**: it
+rides the CLI's existing stdin/stdout on the already-spawned process, which since
+2026-09-27 is spawned and read by the agent itself (`agent/engine-runs.js`).
 
 Normalising is mostly about **size**, and both ways of getting it wrong are silent:
 `gridRows` is dropped *entirely* (the CLI's TUI square grid — hundreds of cells of pure
@@ -1465,9 +1467,9 @@ plausible on screen. Each capped list reports its own tail (`more`/`moreTokens`)
 panel can say "+18 more" instead of implying it showed everything. Covered by
 `tests/context-usage.mjs` and `scripts/context-usage-check.js`.
 
-## Raw-CLI facts (spike-verified — header of `lib/cloud/remote-runner.js` documents all of them)
+## Raw-CLI facts (spike-verified; `agent/engine-runs.js` and `lib/claude-events.js` carry them)
 
-The cloud path drives the `claude` CLI directly in `--input-format stream-json`; the
+The agent drives the `claude` CLI directly in `--input-format stream-json`; the
 Claude Agent SDK is NOT a dependency any more (it went with the self-hosted hub on
 2026-08-01) and must not be reintroduced. What the spikes established:
 

@@ -11,8 +11,8 @@ Claude Code, OpenAI Codex CLI and Grok: one fleet board, every device, tool appr
 
 <br />
 
-[![Commits](https://img.shields.io/badge/commits-1%2C753-e2611b?style=flat-square)](https://termdeck.io?ref=github)
-[![Deploys](https://img.shields.io/badge/production%20deploys-609-e2611b?style=flat-square)](https://termdeck.io?ref=github)
+[![Commits](https://img.shields.io/badge/commits-2%2C580-e2611b?style=flat-square)](https://termdeck.io?ref=github)
+[![Deploys](https://img.shields.io/badge/production%20deploys-906-e2611b?style=flat-square)](https://termdeck.io?ref=github)
 [![Invariants](https://img.shields.io/badge/documented%20invariants-53-3f9142?style=flat-square)](docs/INVARIANTS.md)
 [![Engines](https://img.shields.io/badge/engines-Claude%20%C2%B7%20Codex%20%C2%B7%20Grok-1f2937?style=flat-square)](#three-engines-one-ui)
 [![Agent license](https://img.shields.io/badge/agent-MIT-1f2937?style=flat-square)](LICENSE)
@@ -49,8 +49,8 @@ conversations. It renders **the CLI's own session files, on your machine**:
 
 Three things fall out of that, for free:
 
-- **Every session shows up.** Not just the ones you started through Termdeck. Open the dashboard on a
-  fresh machine and a year of terminal history is already there, searchable.
+- **Every session shows up.** Not just the ones you started through Termdeck. Add a project folder
+  and its whole terminal history is already there, months of it, searchable.
 - **Round-trip parity is 100%.** A session you unblocked from your phone on the train still opens with
   `claude --resume <id>` at your desk. Native storage, real cwd, no export step.
 - **A terminal-attached session streams live**, in view-only, with a **Take over** button that closes
@@ -65,7 +65,7 @@ Three things fall out of that, for free:
 | Render every past session | ● | ● | ● |
 | Drive turns from the browser | ● | ● | ● |
 | Inline tool approvals | ● | ● | ● |
-| Steer a running turn mid-flight | ● | ● | ● |
+| Steer a running turn mid-flight | ● | ● | ○ |
 | Model + reasoning effort per turn | ● | ● | ● |
 | Native plan mode | ● | ● | ○ |
 | Resumable in its own CLI afterwards | ● | ● | ● |
@@ -80,14 +80,18 @@ card, so there is nothing new to learn when you switch.
 |  | |
 |---|---|
 | **One fleet board** | Every machine you connect: laptop, desktop, VM, the box under the desk. Sessions sorted by who needs you, not by which terminal they live in. |
-| **Approve from your phone** | Web Push fires with no browser open and deep-links straight into the session. Allow once / always / deny. |
+| **Approve from your phone** | Web Push fires with no browser open. Allow or Deny on the notification itself, or tap through to the session. |
+| **One approvals inbox** | Every request waiting on you, across chats and machines, in one list you can answer in bulk. |
 | **Answer the agent inline** | `AskUserQuestion` renders as real options. No switching to a terminal to type `2`. |
 | **Take over a terminal session** | The view-only lock, released. Close the idle CLI client and drive from the web. |
 | **Switch model and effort mid-run** | Per turn. Drop to a cheap model for the mechanical part, jump to the big one for the hard part. |
-| **Docked diff review** | Changed files with +/− counts, next to the transcript. Not log archaeology. |
+| **Docked diff review** | Changed files with +/− counts, next to the transcript, and a pull request opened from the same dock. |
+| **Terminals canvas** | Every chat as a live pane on one grid, across machines. |
+| **Background shells** | A dev server a chat started keeps running after the reply, and the chat picks up when a shell finishes. |
 | **Fleet-wide search** | Every session on every machine, by prompt, project or host. |
-| **Cost and pace meters** | API-equivalent cost per project, token totals, cache-read rate, and 5-hour / weekly / daily limit pacing before you hit the wall. |
-| **Install to your home screen** | PWA. Offline shell, 0-RTT paint, push subscription per device. |
+| **Cost and pace meters** | API-equivalent cost per project, token totals, cache-read rate, and rolling and weekly limit pacing before you hit the wall. |
+| **Switch accounts** | Saved engine logins per machine, each with its own usage meter. |
+| **Install to your home screen** | PWA with a push subscription per device. The device you are looking at keeps the others quiet. |
 
 <br />
 
@@ -95,9 +99,11 @@ card, so there is nothing new to learn when you switch.
 
 Two minutes, and no inbound port on your machine.
 
-**1.** Sign in at [termdeck.io/cloud](https://termdeck.io/cloud?ref=github) with GitHub, or email and password.
+**1.** Sign up at [termdeck.io/signup](https://termdeck.io/signup?ref=github) with GitHub, or email and password,
+and start the 14-day trial.
 
-**2.** Add a machine. You get a one-liner carrying that machine's token:
+**2.** Add a machine (Settings, then Machines and accounts). You get a one-liner carrying that
+machine's token:
 
 ```bash
 curl -fsSL https://termdeck.io/install.sh | TERMDECK_AGENT_TOKEN=agt_… sh
@@ -107,35 +113,40 @@ curl -fsSL https://termdeck.io/install.sh | TERMDECK_AGENT_TOKEN=agt_… sh
 $env:TERMDECK_AGENT_TOKEN="agt_…"; iwr https://termdeck.io/install.ps1 | iex
 ```
 
-**3.** Open the dashboard. Your sessions are already there.
+**3.** Add a project folder. Its sessions are already there.
 
 macOS, Linux and Windows. The agent installs as a user service (`launchd` / `systemd --user` /
-`schtasks`) and keeps itself updated. Full unit templates in [deploy/AGENT-SETUP.md](deploy/AGENT-SETUP.md).
+`schtasks`, with a `@reboot` cron fallback) and keeps itself updated. Full unit templates in [deploy/AGENT-SETUP.md](deploy/AGENT-SETUP.md).
 
 <br />
 
 ## How it works
 
 The agent **dials out** over a reverse WebSocket. There is no inbound port, no firewall rule and no
-tunnel on your side.
+tunnel on your side. Turns run on your machine: the agent spawns the CLI, reads its stream and keeps
+a numbered log, so a dropped link or a restart of the master is a viewer going away, not a lost run.
 
 ```
 your machine                          termdeck.io
 ┌────────────────────────┐            ┌──────────────────────────┐
 │ ~/.claude  ~/.codex    │            │  master                  │
-│      ▲                 │            │   ├─ session index       │
+│      ▲                 │            │   ├─ session list cache  │
 │      │ watch + read    │            │   ├─ browser WebSocket   │
 │ ┌────┴─────┐           │            │   └─ Web Push            │
 │ │  agent   │ ──── reverse WS ────▶  │                          │
+│ │  index,  │           │            │                          │
+│ │  runs    │           │            │                          │
 │ └────┬─────┘   (dial-out, TLS)      └───────────┬──────────────┘
 │      │ spawn                                    │
 │  claude / codex / grok                      your browser
 └────────────────────────┘                    (phone, laptop, tablet)
 ```
 
-**The agent is in this repo.** Read it before you run it. That is why it is here. It is confined to
-the transcript roots, redacts its own token out of its logs, never logs anything it serves, and
-stages every self-update behind a compile check with a `.rollback/` snapshot and two watchdogs.
+**The agent is in this repo.** Read it before you run it. That is why it is here. It is a fixed list
+of typed capabilities, not a remote shell: reads confined to the transcript roots and the open
+chat's project folder, a few narrow named writes, processes it started itself. It redacts its own
+token out of its logs, never logs anything it serves, and stages every self-update behind a compile
+check with a `.rollback/` snapshot and two watchdogs.
 
 Start at [`agent/agent.js`](agent/agent.js) and [`agent/capabilities.js`](agent/capabilities.js).
 The second one is the whole list of what a machine will answer.
@@ -156,8 +167,8 @@ The second one is the whole list of what a machine will answer.
 
 <div align="center">
 
-**1,753** commits · **609** production deploys · **48** days
-**123k** lines · **306** test files · **53** invariants · **0** build steps
+**2,580** commits · **906** production deploys · **90** days
+**169k** lines · **611** test files · **53** invariants · **0** build steps
 
 </div>
 
@@ -165,19 +176,20 @@ The second one is the whole list of what a machine will answer.
 
 ## Compared to
 
-| | Termdeck | Happy | claudecodeui | Claude Remote Control |
-|---|:---:|:---:|:---:|:---:|
-| Claude Code | ● | ● | ● | ● |
-| OpenAI Codex CLI | ● | ○ | ○ | ○ |
-| Grok | ● | ○ | ○ | ○ |
-| Sees sessions it didn't start | ● | ○ | ● | ○ |
-| Multi-machine fleet board | ● | ○ | ○ | ○ |
-| Push approval to phone | ● | ● | ○ | ● |
-| Take over a terminal session | ● | ○ | ○ | ○ |
-| Resumable in the CLI afterwards | ● | ○ | ● | ● |
+| | Termdeck | Happy | Claude Remote Control |
+|---|:---:|:---:|:---:|
+| Claude Code | ● | ● | ● |
+| OpenAI Codex CLI | ● | ● | ○ |
+| Grok | ● | ○ | ○ |
+| Sees sessions it didn't start | ● | ○ | ○ |
+| Push approval to phone | ● | ● | ● |
+| Take over a terminal session | ● | ○ | ○ |
+| No extra subscription | ○ | ● | ● |
 
-Anthropic's Remote Control is good and it is free with Pro, if you run one machine, one engine, and
-only the sessions you opted in. Termdeck is for the case after that.
+Anthropic's Remote Control is good and it comes with your Claude plan, if you run one engine and
+only the sessions you switch it on for. Happy is free, open source and end-to-end encrypted, for
+sessions you start through its wrapper. Termdeck is for every session, on every machine, in all
+three engines. Longer write-ups: [termdeck.io/vs](https://termdeck.io/vs?ref=github).
 
 <br />
 
@@ -186,8 +198,8 @@ only the sessions you opted in. Termdeck is for the case after that.
 #### Can I approve Claude Code permissions from my phone?
 
 Yes. That is the feature the product exists for. When a turn blocks on a tool approval, Web Push
-fires with no browser open, deep-links into the session, and you tap Allow once, Always, or Deny. The
-run continues from your pocket.
+fires with no browser open. Tap Allow or Deny on the notification, or open the session for the full
+card. The run continues from your pocket.
 
 #### Is there a self-hosted version?
 
@@ -203,20 +215,27 @@ it is tested.
 
 #### Does it work with Codex CLI?
 
-Yes. Full turn driving over a long-lived `codex app-server` JSON-RPC child, including native plan
-mode. Termdeck is the only web UI that drives both Claude Code and Codex.
+Yes. Full turn driving over one shared `codex app-server` per machine, including native plan mode,
+with Claude Code and Grok in the same sidebar.
 
 #### What can the agent actually touch?
 
-The transcript roots, and nothing else. Capability frames are confined there, and paths are never
-sent from the server: the master names a session id and the agent resolves it against its own disk.
-The one write outside those roots is checkpoint restore, and it works the same way: ids in, never
-paths. The code is in [`agent/capabilities.js`](agent/capabilities.js).
+A fixed list of typed capabilities, not a shell. Reads are confined to the transcript roots and the
+open chat's project folder (read only). Paths are never sent from the server: the master names a
+session id and the agent resolves it against its own disk. The writes are narrow and named: a file
+you attach (into `~/.termdeck/uploads`, never your project), the project instruction file, checkpoint
+restore, and the engine account switching you ask for. Processes it may signal are ones it started,
+plus a terminal client you asked to take over. The code is in
+[`agent/capabilities.js`](agent/capabilities.js); [termdeck.io/docs/security](https://termdeck.io/docs/security?ref=github) is the long version.
+
+The coding agent it drives is another matter: in full access mode it can do anything you can. That
+is what the permission rules are for.
 
 #### What does it cost?
 
-Free while you connect one machine. Paid plans add machines and concurrent sessions. You bring your
-own Claude / Codex / Grok subscription; Termdeck never resells inference.
+Starter is $9.99 a month for 2 machines, Pro is $29.99 for 10, both with unlimited sessions and the
+same features. Every account starts with a 14-day trial; a card is needed and the first charge is
+on day 15. You bring your own Claude / Codex / Grok subscription; Termdeck never resells inference.
 
 <br />
 
@@ -258,9 +277,11 @@ which fetches a complete agent. What is fully present in this repo is the agent'
 
 | File | Lines | What it is |
 |---|---:|---|
-| [`agent/capabilities.js`](agent/capabilities.js) | 1,599 | the entire capability surface, the trust boundary |
-| [`agent/limits.js`](agent/limits.js) | 710 | rate-limit and usage reading |
-| [`agent/agent.js`](agent/agent.js) | 646 | dial-out, reconnect, self-update with rollback |
+| [`agent/capabilities.js`](agent/capabilities.js) | 2,622 | the entire capability surface, the trust boundary |
+| [`agent/engine-runs.js`](agent/engine-runs.js) | 1,283 | runs each engine's turns on the machine, with a numbered event log |
+| [`agent/limits.js`](agent/limits.js) | 951 | rate-limit and usage reading |
+| [`agent/agent.js`](agent/agent.js) | 949 | dial-out, reconnect, self-update with rollback |
+| [`agent/agent-protocol.js`](agent/agent-protocol.js) | 487 | the frame table between the master and the agent |
 | [`agent/log.js`](agent/log.js) | 105 | bounded, rotated, token-redacted logging |
 
 If you are auditing what a Termdeck machine will do, `capabilities.js` is the file. Nothing

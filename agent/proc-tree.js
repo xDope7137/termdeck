@@ -157,4 +157,71 @@ async function list(rootPid) {
   return Promise.all(kids.map(async (k) => ({ ...k, logPath: await stdoutTarget(k.pid) })));
 }
 
-module.exports = { list, descendants, snapshot, stdoutTarget };
+// ------------------------------------------------------------- reap a command
+
+// Codex and Grok are SHARED servers: one child serves every chat on the machine,
+// so Stop cannot kill it the way it kills Claude's per-turn CLI. It asks the
+// server to end the turn instead, and the server ends the turn while the command
+// it was running keeps going (a 30 s loop ran its full 30 s after Stop). What the
+// engine does tell us is the command line of every exec in flight, so Stop finds
+// the server's descendants running exactly those and kills their trees. Nothing
+// else under the server is touched: MCP servers and other chats' commands live
+// there too.
+//
+// The engine reports the command shell-quoted (`/bin/bash -lc 'cat x'`) while
+// the process list shows argv joined by spaces (`/bin/bash -lc cat x`), so both
+// sides drop every quote character and collapse whitespace before comparing. A
+// containment match covers an engine that names only the inner command, and it
+// needs 12 characters on the short side so `ls` can never match half the tree.
+function normCommand(s) {
+  return String(s || '').replace(/["'`]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function commandMatches(procCommand, wanted) {
+  const a = normCommand(procCommand);
+  const b = normCommand(wanted);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const [short, long] = a.length < b.length ? [a, b] : [b, a];
+  return short.length >= 12 && long.includes(short);
+}
+
+// POSIX: the whole group first (a PTY-backed exec is a session leader, and its
+// children may already be reparented), then every pid we saw, TERM now and KILL
+// after a grace for anything that trapped it. Windows: taskkill /T walks the tree.
+function killPids(leader, pids, graceMs) {
+  if (process.platform === 'win32') {
+    try { require('child_process').spawn('taskkill', ['/PID', String(leader), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }).on('error', () => {}); } catch {}
+    return;
+  }
+  const hit = (sig) => {
+    try { process.kill(-leader, sig); } catch {}
+    for (const pid of pids) { try { process.kill(pid, sig); } catch {} }
+  };
+  hit('SIGTERM');
+  const t = setTimeout(() => hit('SIGKILL'), graceMs);
+  if (t.unref) t.unref();
+}
+
+// Kill every descendant of rootPid whose command line is one of `commands`, with
+// its own subtree. Returns the pids matched (the top of each killed tree).
+async function reapCommands(rootPid, commands, { rows = null, graceMs = 1500, kill = killPids } = {}) {
+  const wanted = (commands || []).map((c) => (Array.isArray(c) ? c.join(' ') : String(c || ''))).filter((c) => c.trim());
+  if (!wanted.length || typeof rootPid !== 'number' || !Number.isFinite(rootPid)) return [];
+  const all = rows || await snapshot();
+  const covered = new Set();
+  const matched = [];
+  // descendants() is breadth-first, so a matching shell is seen before the
+  // processes it started and takes them with it.
+  for (const k of descendants(all, rootPid)) {
+    if (covered.has(k.pid)) continue;
+    if (!wanted.some((w) => commandMatches(k.command, w))) continue;
+    const tree = [k.pid, ...descendants(all, k.pid).map((d) => d.pid)];
+    for (const pid of tree) covered.add(pid);
+    matched.push(k.pid);
+    kill(k.pid, tree, graceMs);
+  }
+  return matched;
+}
+
+module.exports = { list, descendants, snapshot, stdoutTarget, reapCommands, commandMatches };

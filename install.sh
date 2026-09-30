@@ -34,11 +34,23 @@ command -v curl >/dev/null 2>&1 || { echo "${RED}curl is required.${RESET}" >&2;
 # the 404, partway through, which is how the removed worktrees.js/context-doc.js would have
 # broken every fallback install. tests/agent-manifest.mjs pins this list to AGENT_FILES.
 FILES=$(curl -fsSL "$MASTER/download/agent/manifest.json" 2>/dev/null | tr -d '[]"[:space:]' | tr ',' ' ')
-[ -n "$FILES" ] || FILES="agent.js capabilities.js park.js proc-tree.js log.js persistence.js win-launcher.js limits.js usage.js which.js diff.js mcp-config.js accounts.js codex-accounts.js session-title.js tail-read.js checkpoints.js index-head.js session-settings.js session-head.js transcript.js claude-data.js pool.js project-files.js machine-config.js command-catalog.js usage-behaviour.js project-doc.js package.json"
+[ -n "$FILES" ] || FILES="agent.js capabilities.js agent-protocol.js proc-tree.js log.js persistence.js win-launcher.js limits.js usage.js which.js diff.js mcp-config.js accounts.js codex-accounts.js session-title.js tail-read.js checkpoints.js index-head.js session-index.js session-settings.js session-head.js transcript.js claude-data.js pool.js project-files.js machine-config.js command-catalog.js usage-behaviour.js codex-attachment.js project-doc.js upload-types.js engine-events.js claude-events.js codex-events.js grok-events.js engine-runs.js package.json"
 
 # heal.sh drives this unattended (TERMDECK_NO_PROMPT=1) — a repair that stops to ask
 # a question is a repair nobody finishes.
-if [ -n "$TERMDECK_NO_PROMPT" ]; then
+# Ask only where there is somebody to ask. `read < /dev/tty` on a box with no
+# controlling terminal (cron, CI, a piped ssh) fails in the SHELL's redirection
+# rather than in `read`, so the 2>/dev/null on the read never caught it and the
+# very first line of a scripted install was
+#   sh: 45: cannot open /dev/tty: No such device or address
+# which reads as a broken install and is not one.
+#
+# A SUBSHELL, not a `{ ...; }` group: a redirection error in a group is fatal to
+# the shell running it, so the obvious spelling exited 2 right after the banner
+# and installed nothing. The subshell takes the failure with it and hands back an
+# exit status, which is all the `if` wants. `-c /dev/tty` is not a substitute:
+# the device node exists on exactly the boxes where it cannot be opened.
+if [ -n "$TERMDECK_NO_PROMPT" ] || ! (exec 3</dev/tty) 2>/dev/null; then
   READ_CODE="n"
 else
   printf "Read the agent source before installing? [y/N] "

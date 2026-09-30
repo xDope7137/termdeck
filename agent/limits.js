@@ -27,12 +27,77 @@ const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const GROK_HOME = process.env.GROK_HOME || path.join(os.homedir(), '.grok');
 const GROK_BILLING_URL = 'https://cli-chat-proxy.grok.com/v1/billing?format=credits';
 
-const CACHE_MS = 30 * 1000; // usage windows move slowly; the SPA polls every 60s
+// Usage windows move slowly, and a turn's own `rate_limit_event` is folded onto
+// the widget live (public/js/limits-live.js), so the poll is only the backstop.
+// It was 30s, under the SPA's 60s poll, which meant every visible tab on every
+// device reached Anthropic on its own clock; /api/oauth/usage answers that with
+// 429 within minutes, and then the widget went blank.
+const CACHE_MS = 2 * 60 * 1000;
 let cache = null; // { data, at } — Claude
 let codexCache = null; // { data, at }
 let grokCache = null; // { data, at }
-let profileCache = null; // { profile: { account, plan, planMult }, at }
+// Keyed by BEARER, not global. It used to be one slot, which was fine while the
+// only caller was the active login. Reading a saved account's usage without
+// switching (accountUsage below) asks for several profiles in a row, and an
+// unkeyed slot hands the second account the first account's email, plan and
+// multiplier: the exact mislabelling invalidateClaudeCache exists to prevent,
+// arriving through a different door.
+const profileCache = new Map(); // bearer -> { profile: { account, plan, planMult }, at }
 const PROFILE_TTL = 60 * 60 * 1000;
+
+// Anthropic's oauth endpoints rate-limit hard, and a refused read used to be a
+// plain miss: nothing cached, so the very next poll asked again and kept the
+// bearer in the penalty box indefinitely. A 429 (or a 5xx) now parks that bearer
+// until Retry-After, or on a doubling backoff when upstream names no time, and
+// every read in the meantime serves the last good reading without a request.
+// Keyed by bearer like profileCache, so one saved account's 429 never silences
+// another's, and deliberately NOT cleared by invalidateClaudeCache: a login
+// switch changes the bearer, and a re-login of the same one is still limited.
+const BACKOFF_MIN_MS = 60 * 1000;
+const BACKOFF_MAX_MS = 15 * 60 * 1000;
+const backoff = new Map(); // bearer -> { until, step }
+
+function retryAfterMs(r) {
+  const h = r.headers && r.headers.get && r.headers.get('retry-after');
+  if (!h) return null;
+  const secs = Number(h);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const at = Date.parse(h);
+  return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
+}
+
+function parked(bearer) {
+  const b = backoff.get(bearer);
+  return !!(b && Date.now() < b.until);
+}
+
+// Returns true when the response parked the bearer, so the caller treats it as
+// a miss. Any other answer, good or bad, clears the backoff: a 401 is a fact
+// about the token and hammering is not what it invites.
+function noteStatus(bearer, r) {
+  if (r.status === 429 || r.status >= 500) {
+    const prev = backoff.get(bearer);
+    const step = prev ? prev.step + 1 : 0;
+    const guess = Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS * 2 ** step);
+    const wait = Math.min(BACKOFF_MAX_MS, Math.max(BACKOFF_MIN_MS, retryAfterMs(r) ?? guess));
+    backoff.set(bearer, { until: Date.now() + wait, step });
+    return true;
+  }
+  backoff.delete(bearer);
+  return false;
+}
+
+// Concurrent callers of one read share its promise: the SPA's boot fires the
+// limits frame and the accounts panel together, and two tabs landing in the same
+// second used to be two requests.
+const inflight = new Map(); // key -> Promise
+function once(key, fn) {
+  const hit = inflight.get(key);
+  if (hit) return hit;
+  const p = Promise.resolve().then(fn).finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
 
 function parseNum(value) {
   const n = Number(value);
@@ -144,7 +209,41 @@ function normalizeClaude(body) {
     if (body.five_hour) out.push({ key: 'session', label: '5-hour', percent: body.five_hour.utilization ?? null, resetsAt: body.five_hour.resets_at || null, severity: 'normal' });
     if (body.seven_day) out.push({ key: 'weekly', label: 'Weekly', percent: body.seven_day.utilization ?? null, resetsAt: body.seven_day.resets_at || null, severity: 'normal' });
   }
-  return out.length ? { limits: out } : null;
+  if (!out.length) return null;
+  const data = { limits: out };
+  const resets = normalizeClaudeResets(body.cedar_ember);
+  if (resets) data.resetCredits = resets;
+  return data;
+}
+
+// The `cedar_ember` block: { eligible, grants: [{ id, label, resets_left,
+// starts_at, ends_at, paused, usable_now, ... }], next_grant_id }. Same shape out
+// as Codex's normalizeResetCredits so the SPA draws one pill for both, plus
+// `usable`: Anthropic says per grant whether it can be spent right now (some only
+// work once a limit is hit), so that verdict is carried instead of guessed from
+// the percentages. A spent, paused or expired grant is not offered.
+function normalizeClaudeResets(ce) {
+  if (!ce || typeof ce !== 'object' || ce.eligible !== true) return null;
+  const now = Date.now();
+  const live = (Array.isArray(ce.grants) ? ce.grants : []).filter((g) => {
+    if (!g || typeof g !== 'object' || g.paused === true) return false;
+    if (!(parseNum(g.resets_left) > 0)) return false;
+    const starts = parseTimestamp(g.starts_at);
+    const ends = parseTimestamp(g.ends_at);
+    return !(starts && starts > now) && !(ends && ends < now);
+  });
+  if (!live.length) return null;
+  const next = live.find((g) => g.id === ce.next_grant_id) || live[0];
+  const expiresAt = parseTimestamp(next.ends_at);
+  return {
+    count: live.reduce((n, g) => n + parseNum(g.resets_left), 0),
+    id: next.id ? String(next.id) : null,
+    title: next.label ? String(next.label) : 'Usage limit reset',
+    description: null,
+    expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+    usable: live.some((g) => g.usable_now === true),
+    spendWith: '/limit-reset',
+  };
 }
 
 // subscriptionType is 'max'/'pro'/… ; the SPA's prettyPlan keys on 'claude_max'
@@ -165,7 +264,13 @@ function planLabel(sub) {
 // panel shows this, so the mismatch was on screen. The credentials file stays
 // as the fallback for when the profile call fails.
 async function getClaudeProfile(cred) {
-  if (profileCache && Date.now() - profileCache.at < PROFILE_TTL) return profileCache.profile;
+  const memo = profileCache.get(cred.value);
+  if (memo && Date.now() - memo.at < PROFILE_TTL) return memo.profile;
+  if (parked(cred.value)) return memo ? memo.profile : null;
+  return once(`profile:${cred.value}`, () => fetchClaudeProfile(cred, memo));
+}
+
+async function fetchClaudeProfile(cred, memo) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 5000);
   try {
@@ -173,17 +278,61 @@ async function getClaudeProfile(cred) {
       headers: { 'anthropic-version': '2023-06-01', 'anthropic-beta': 'oauth-2025-04-20', authorization: cred.value },
       signal: ctrl.signal,
     });
-    if (!r.ok) return profileCache ? profileCache.profile : null;
+    if (noteStatus(cred.value, r) || !r.ok) return memo ? memo.profile : null;
     const body = await r.json();
     const acct = body.account || {};
     const org = body.organization || {};
     const account = acct.uuid ? { id: acct.uuid, email: acct.email || null, name: acct.display_name || acct.full_name || null } : null;
     const plan = org.organization_type || (acct.has_claude_max ? 'claude_max' : acct.has_claude_pro ? 'claude_pro' : null);
     const profile = { account, plan: plan || null, planMult: multFromTier(org.rate_limit_tier) };
-    profileCache = { profile, at: Date.now() };
+    profileCache.set(cred.value, { profile, at: Date.now() });
     return profile;
   } catch {
-    return profileCache ? profileCache.profile : null;
+    return memo ? memo.profile : null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Usage windows for ONE bearer, whoever it belongs to. No cache of its own: the
+// active login's reading is cached by getClaudeLimits and a saved account's by
+// accountUsage, and each of those knows its own key. A cache in here would have
+// to guess one.
+async function claudeUsageForToken(cred) {
+  if (!cred || typeof fetch !== 'function') return null; // no token / Node <18
+  if (parked(cred.value)) return null;
+  return once(`usage:${cred.value}`, () => fetchClaudeUsage(cred));
+}
+
+// `cedar_ember=1` asks the same endpoint to add the account's limit-reset grants
+// (what the CLI's own /limit-reset spends). Anthropic only answers that block for
+// the Claude Code surface, which it reads off the User-Agent: without it the block
+// comes back `ineligible_reason: "surface"` with no grants. Pinned to a version
+// that was checked against the live endpoint, since this file has no way to ask
+// the installed CLI without spawning it.
+const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1';
+const CLAUDE_CLI_UA = 'claude-cli/2.1.284 (external, cli)';
+
+async function fetchClaudeUsage(cred) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const r = await fetch(CLAUDE_USAGE_URL, {
+      headers: { 'anthropic-version': '2023-06-01', 'anthropic-beta': 'oauth-2025-04-20', authorization: cred.value, 'user-agent': CLAUDE_CLI_UA },
+      signal: ctrl.signal,
+    });
+    if (noteStatus(cred.value, r) || !r.ok) return null;
+    const data = normalizeClaude(await r.json());
+    if (!data) return null;
+    // Live profile first, login-time credentials file only as the fallback.
+    // See getClaudeProfile.
+    const profile = await getClaudeProfile(cred);
+    data.plan = (profile && profile.plan) || planLabel(cred.sub);
+    data.planMult = (profile && profile.planMult != null) ? profile.planMult : multFromTier(cred.tier);
+    data.account = profile ? profile.account : null;
+    return data;
+  } catch {
+    return null; // network/abort: the caller decides what a miss means
   } finally {
     clearTimeout(timer);
   }
@@ -192,31 +341,67 @@ async function getClaudeProfile(cred) {
 async function getClaudeLimits() {
   if (cache && Date.now() - cache.at < CACHE_MS) return cache.data;
   const cred = claudeCred();
-  if (!cred || typeof fetch !== 'function') return cache ? cache.data : null; // no token / Node <18
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 5000);
-  try {
-    const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
-      headers: { 'anthropic-version': '2023-06-01', 'anthropic-beta': 'oauth-2025-04-20', authorization: cred.value },
-      signal: ctrl.signal,
-    });
-    if (!r.ok) return cache ? cache.data : null;
-    const data = normalizeClaude(await r.json());
-    if (data) {
-      // Live profile first, login-time credentials file only as the fallback —
-      // see getClaudeProfile.
-      const profile = await getClaudeProfile(cred);
-      data.plan = (profile && profile.plan) || planLabel(cred.sub);
-      data.planMult = (profile && profile.planMult != null) ? profile.planMult : multFromTier(cred.tier);
-      data.account = profile ? profile.account : null;
-      cache = { data, at: Date.now() };
-    }
-    return data;
-  } catch {
-    return cache ? cache.data : null; // network/abort — keep the last good reading
-  } finally {
-    clearTimeout(timer);
+  if (!cred) return cache ? cache.data : null;
+  const data = await claudeUsageForToken(cred);
+  if (data) cache = { data, at: Date.now() };
+  return data || (cache ? cache.data : null); // keep the last good reading
+}
+
+// ---- Per-account usage, for the account meters in Settings ----
+//
+// Same windows the sidebar shows, but for every SAVED account on this box rather
+// than only the one signed in. The bearer comes from accounts.js's accessTokenFor,
+// which mints it from that account's own snapshot; nothing here switches the live
+// login and nothing here can.
+//
+// Cached per account because the panel that asks is a toggle someone can flap, and
+// each miss costs an outbound call and possibly a token rotation. Dropped wholesale
+// on a switch, along with the active-login cache, for the usual reason: percentages
+// read under one account must never be served under another's name.
+const ACCOUNT_CACHE_MS = 5 * 60 * 1000;
+const accountCache = new Map(); // orgId -> { at, value }
+
+// One account's windows, or the honest reason there are none. `state` is
+// accessTokenFor's three-state carried through, so 'dead' means Anthropic
+// rejected the login and 'unknown' means we could not ask.
+async function accountUsage(accountsLib, orgId) {
+  const memo = accountCache.get(orgId);
+  if (memo && Date.now() - memo.at < ACCOUNT_CACHE_MS) return memo.value;
+
+  const tok = await accountsLib.accessTokenFor(orgId);
+  if (tok.state !== 'ok') {
+    const value = { state: tok.state, detail: tok.detail || null, limits: [], checkedAt: Date.now() };
+    // A 'dead' verdict is a fact about the snapshot and worth holding; an
+    // 'unknown' is a fact about the network and must not stick.
+    if (tok.state === 'dead') accountCache.set(orgId, { at: Date.now(), value });
+    return value;
   }
+
+  const data = await claudeUsageForToken({ value: tok.token, sub: null, tier: null });
+  // Rate-limited: the last good reading beats a blank row, however old.
+  if (!data && memo && memo.value.state === 'ok') return memo.value;
+  if (!data) return { state: 'unknown', detail: 'Anthropic did not answer with usage for this account.', limits: [], checkedAt: Date.now() };
+  // `account` is who Anthropic says the bearer belongs to, which is not always
+  // who the snapshot's stored email says it is. Carried so a mislabelled snapshot
+  // is at least visible in the payload rather than only in the numbers.
+  const value = { state: 'ok', detail: null, plan: data.plan || null, planMult: data.planMult ?? null, account: data.account || null, limits: data.limits, checkedAt: Date.now() };
+  accountCache.set(orgId, { at: Date.now(), value });
+  return value;
+}
+
+// Every saved Claude account on this box, in parallel. One frame answers for the
+// whole machine because the panel opens once and wants every row at once; serially
+// this would be N round trips to Anthropic stacked end to end.
+async function accountsUsage(accountsLib) {
+  const saved = accountsLib.savedAccounts().filter((a) => a.orgId);
+  const entries = await Promise.all(saved.map(async (a) => {
+    try {
+      return [a.orgId, await accountUsage(accountsLib, a.orgId)];
+    } catch (e) {
+      return [a.orgId, { state: 'unknown', detail: e.message, limits: [], checkedAt: Date.now() }];
+    }
+  }));
+  return { usage: Object.fromEntries(entries) };
 }
 
 // ---- Codex ----
@@ -338,7 +523,7 @@ function codexAccount() {
 // under one account was labelled with whichever account is active now, and the
 // freshest reading on disk can be days stale (measured: disk 88%, live 33%).
 //
-// Short-lived child on purpose. The hub goes through codex-runner's long-lived
+// Short-lived child on purpose. The master goes through the machine's long-lived
 // app-server, but the agent has none of its own — on the cloud path that child
 // belongs to the master. Spawned, asked, killed, then cached for CACHE_MS so a
 // 60s poll costs one process a minute.
@@ -482,6 +667,42 @@ function invalidateCodexCache() {
   codexCache = null;
 }
 
+// ---- Per-account usage, ChatGPT side ----
+//
+// Deliberately shorter than Claude's, and the difference is not an oversight.
+// Claude's windows come from an HTTPS endpoint that answers for whatever bearer
+// it is handed, so a saved snapshot can speak for its own account while another
+// stays signed in. ChatGPT's come from the `codex app-server` RPC, which only
+// ever speaks for the auth.json on disk right now, and the one app-server on this
+// box belongs to the master's turn runner. Spawning a second to interrogate a
+// different account would have the two of them refreshing the same auth.json
+// against each other.
+//
+// So a saved-but-inactive ChatGPT account reports 'unsupported' and says why.
+// That is the honest answer; a blank row reads as "no usage" and an invented one
+// is worse than both.
+async function codexAccountsUsage(codexAccountsLib) {
+  const { accounts, active } = await codexAccountsLib.listAccounts();
+  const activeOrgId = (active && active.orgId) || null;
+  const live = activeOrgId ? await getCodexLimits() : null;
+  const usage = {};
+
+  const forActive = () => (live && live.limits && live.limits.length
+    ? { state: 'ok', detail: null, plan: live.plan || null, planMult: null, limits: live.limits, checkedAt: Date.now() }
+    : { state: 'unknown', detail: 'Codex did not report any usage windows just now.', limits: [], checkedAt: Date.now() });
+
+  for (const a of accounts) {
+    if (!a.orgId) continue;
+    usage[a.orgId] = a.orgId === activeOrgId
+      ? forActive()
+      : { state: 'unsupported', detail: 'ChatGPT reports its usage windows only for the account signed in on this machine.', limits: [], checkedAt: Date.now() };
+  }
+  // The active login is not always a saved one, and the panel renders it as a row
+  // either way (see the unsaved-active row in settings/fleet/accounts.js).
+  if (activeOrgId && !usage[activeOrgId]) usage[activeOrgId] = forActive();
+  return { usage };
+}
+
 // ---- Grok ----
 
 function grokAuthEntry() {
@@ -595,10 +816,11 @@ async function getLimits() {
 // reflects the new account instead of a stale cached one.
 function invalidateClaudeCache() {
   cache = null;
-  profileCache = null;
+  profileCache.clear();
+  accountCache.clear();
 }
 
-module.exports = { getLimits, normalizeClaude, planLabel, normalizeCodex, normalizeGrok, consumeResetCredit, invalidateClaudeCache, invalidateCodexCache, setCodexExe };
+module.exports = { getLimits, claudeUsageForToken, accountsUsage, codexAccountsUsage, normalizeClaude, planLabel, normalizeCodex, normalizeGrok, consumeResetCredit, invalidateClaudeCache, invalidateCodexCache, setCodexExe };
 
 // ponytail self-check: node agent/limits.js — asserts the parser without network.
 if (require.main === module) {
@@ -630,6 +852,25 @@ if (require.main === module) {
     'three windows, three distinct keys — no two rows may share one',
   );
   assert.strictEqual(new Set(live3.limits.map((l) => l.key)).size, 3);
+  assert.ok(!('resetCredits' in live3), 'no cedar_ember block, no reset pill');
+
+  // Limit-reset grants (`?cedar_ember=1`), shape captured 2026-09-29 from a Max 20x account.
+  const soonIso = new Date(Date.now() + 86400_000).toISOString();
+  const pastIso = new Date(Date.now() - 86400_000).toISOString();
+  const grant = (over) => ({ id: 'opus55-launch', label: 'One usage-limit reset', resets_total: 1, resets_left: 1, starts_at: pastIso, ends_at: soonIso, paused: false, usable_now: true, use_requires_limit: false, ...over });
+  const withGrants = (ce) => normalizeClaude({ limits: live3Limits, cedar_ember: { eligible: true, grants: [], next_grant_id: null, ...ce } });
+  const live3Limits = [{ kind: 'session', group: 'session', percent: 14 }];
+  const rc = withGrants({ grants: [grant()], next_grant_id: 'opus55-launch' }).resetCredits;
+  assert.deepStrictEqual(
+    { count: rc.count, id: rc.id, title: rc.title, usable: rc.usable, spendWith: rc.spendWith },
+    { count: 1, id: 'opus55-launch', title: 'One usage-limit reset', usable: true, spendWith: '/limit-reset' },
+  );
+  assert.strictEqual(withGrants({ grants: [grant({ usable_now: false, use_requires_limit: true })] }).resetCredits.usable, false, 'held until a limit is hit: shown, not usable');
+  assert.ok(!withGrants({ grants: [grant({ resets_left: 0, usable_now: false })] }).resetCredits, 'a used grant is not offered');
+  assert.ok(!withGrants({ grants: [grant({ ends_at: pastIso })] }).resetCredits, 'an expired grant is not offered');
+  assert.ok(!withGrants({ grants: [grant({ paused: true })] }).resetCredits, 'a paused grant is not offered');
+  assert.ok(!withGrants({ eligible: false, ineligible_reason: 'surface', grants: [grant()] }).resetCredits, 'ineligible means nothing to show');
+  assert.strictEqual(withGrants({ grants: [grant(), grant({ id: 'b', resets_left: 2 })] }).resetCredits.count, 3, 'count sums resets_left across grants');
   // Keyed by FAMILY, so a version bump in the display name does not roll the
   // window over — and so `seven_day_opus` from the CLI lands on it.
   const scoped = (display) => normalizeClaude({ limits: [{ kind: 'weekly_scoped', group: 'weekly', percent: 5, scope: { model: { display_name: display } } }] }).limits[0];

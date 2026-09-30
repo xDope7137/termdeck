@@ -85,4 +85,11 @@ Remove-Item -Force (Join-Path $env:USERPROFILE ".termdeck\agent.env.cmd") -Error
 Remove-Item -Force (Join-Path $env:USERPROFILE ".termdeck\persistence.json") -ErrorAction SilentlyContinue
 
 Write-Host "OK — agent stopped and removed from this machine." -ForegroundColor Green
-Write-Host "Remove the machine from the Termdeck dashboard too, if you haven't already."
+Write-Host ""
+Write-Host "One step is left, and it is NOT on this machine:"
+Write-Host "  Remove the machine from https://termdeck.io/settings/machines"
+Write-Host "  (signed in as its owner). Deleting the files here does not do that."
+Write-Host "  Left listed, it shows as a machine that is always offline and holds a"
+Write-Host "  slot on the owner's plan until Termdeck removes it after 30 quiet days."
+Write-Host ""
+Write-Host "Full uninstall reference: https://termdeck.io/docs/install#uninstall"

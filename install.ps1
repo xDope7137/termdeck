@@ -27,7 +27,7 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
 # install partway, which is how the removed worktrees.js/context-doc.js would have broken
 # every fallback install. tests/agent-manifest.mjs pins this list to AGENT_FILES.
 try { $Files = (Invoke-WebRequest -UseBasicParsing "$Master/download/agent/manifest.json").Content | ConvertFrom-Json } catch { $Files = $null }
-if (-not $Files) { $Files = @("agent.js","capabilities.js","park.js","proc-tree.js","log.js","persistence.js","win-launcher.js","limits.js","usage.js","which.js","diff.js","mcp-config.js","accounts.js","codex-accounts.js","session-title.js","tail-read.js","checkpoints.js","index-head.js","session-settings.js","session-head.js","transcript.js","claude-data.js","pool.js","project-files.js","machine-config.js","command-catalog.js","usage-behaviour.js","project-doc.js","package.json") }
+if (-not $Files) { $Files = @("agent.js","capabilities.js","agent-protocol.js","proc-tree.js","log.js","persistence.js","win-launcher.js","limits.js","usage.js","which.js","diff.js","mcp-config.js","accounts.js","codex-accounts.js","session-title.js","tail-read.js","checkpoints.js","index-head.js","session-index.js","session-settings.js","session-head.js","transcript.js","claude-data.js","pool.js","project-files.js","machine-config.js","command-catalog.js","usage-behaviour.js","codex-attachment.js","project-doc.js","upload-types.js","engine-events.js","claude-events.js","codex-events.js","grok-events.js","engine-runs.js","package.json") }
 
 # heal.ps1 drives this unattended — a repair that stops to ask is one nobody finishes.
 $readCode = if ($env:TERMDECK_NO_PROMPT) { "n" } else { Read-Host "Read the agent source before installing? [y/N]" }

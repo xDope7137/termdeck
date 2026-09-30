@@ -33,4 +33,11 @@ pkill -f "$DIR/agent.js" >/dev/null 2>&1 || true
 
 rm -rf "$DIR" "$ENVFILE" "$HOME_DIR/persistence.json"
 echo "OK — agent stopped and removed from this machine."
-echo "Remove the machine from the Termdeck dashboard too, if you haven't already."
+echo ""
+echo "One step is left, and it is NOT on this machine:"
+echo "  Remove the machine from https://termdeck.io/settings/machines"
+echo "  (signed in as its owner). Deleting the files here does not do that."
+echo "  Left listed, it shows as a machine that is always offline and holds a"
+echo "  slot on the owner's plan until Termdeck removes it after 30 quiet days."
+echo ""
+echo "Full uninstall reference: https://termdeck.io/docs/install#uninstall"
