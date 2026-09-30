@@ -825,6 +825,9 @@ async function cliStatus() {
 // own frame; the master then debounced most of them away on arrival. Anything
 // this window hides, the master's own 500ms delta flush hides anyway.
 const WATCH_BATCH_MS = 100;
+// A registry record older than this is a crashed CLI's leftover, and its pid may
+// belong to something else by now (mirrors LIVE_STALE_MS in lib/claude-data.js).
+const LIVE_REGISTRY_STALE_MS = 48 * 3600 * 1000;
 // The widest frame one flush may send - a mass change (a checkout restored
 // whole) becomes several frames rather than one oversized one.
 const WATCH_BATCH_MAX = 500;
@@ -1863,19 +1866,57 @@ function makeCapabilities(send, opts = {}) {
     return { ...snapshot, at };
   });
 
-  // Direct signal to an arbitrary system pid (not one we spawned) — used by "take
-  // over" to end an idle terminal `claude` holding the same session. The master
-  // already verified this pid via the live registry + pidAliveMany before asking.
+  // Signal a pid. Used by "take over" to end an idle terminal `claude` holding the
+  // same session, by background-shell stop, and by the leaked-runner reaper. The
+  // master checks the pid first, but the agent does not take its word for it.
+  // A pid the master may have signalled is one this agent can vouch for itself:
+  // a process under its own tree (a CLI it spawned, that CLI's shells), or a
+  // Claude CLI that registered itself in <claudeDir>/sessions/<pid>.json (the
+  // terminal client "take over" ends) and anything under that one. A master
+  // naming any other pid on the box is refused, so a compromised master cannot
+  // turn this into "signal whatever runs as this user".
+  const registeredClaudePids = async () => {
+    const out = new Set();
+    const dir = path.join(CLAUDE_DIR, 'sessions');
+    let names = [];
+    try { names = await fsp.readdir(dir); } catch { return out; }
+    await Promise.all(names.filter((n) => /^\d+\.json$/.test(n)).map(async (n) => {
+      try {
+        const rec = JSON.parse(await fsp.readFile(path.join(dir, n), 'utf8'));
+        const fresh = Date.now() - (rec.updatedAt || rec.startedAt || 0) <= LIVE_REGISTRY_STALE_MS;
+        if (rec && rec.pid === Number(n.slice(0, -5)) && rec.sessionId && fresh) out.add(rec.pid);
+      } catch {}
+    }));
+    return out;
+  };
+  const mayKill = async (pid, rows) => {
+    if (pid <= 1 || pid === process.pid) return false;
+    const registered = await registeredClaudePids();
+    if (registered.has(pid)) return true;
+    if (!rows) return false; // no process table: only the registry can vouch
+    for (const owner of [process.pid, ...registered]) {
+      if (procTree.descendants(rows, owner).some((r) => r.pid === pid)) return true;
+    }
+    return false;
+  };
+
   defineOp('killPid', async (m) => {
-    if (typeof m.pid !== 'number') throw fail('bad pid');
+    if (typeof m.pid !== 'number' || !Number.isInteger(m.pid)) throw fail('bad pid');
     const signal = m.signal || 'SIGTERM';
+    let rows = null;
+    if (procTree && typeof procTree.snapshot === 'function') {
+      try { rows = await procTree.snapshot(); } catch { rows = null; }
+    }
+    // An already-gone pid needs no vouching: there is nothing left to signal.
+    try { process.kill(m.pid, 0); } catch (e) { if (e.code === 'ESRCH') return {}; }
+    if (!(await mayKill(m.pid, rows))) throw fail('not a process this agent started or a registered engine session', 'PID_NOT_OURS');
     // `tree`: everything under the pid as well. A background shell's loop runs its
     // commands as children, and a shell stopped alone leaves the one it was
     // running behind (bugs.md B14). Listed BEFORE the kill, while they are still
     // its descendants rather than orphans reparented to init.
     let kids = [];
-    if (m.tree && procTree && typeof procTree.snapshot === 'function') {
-      try { kids = procTree.descendants(await procTree.snapshot(), m.pid); } catch { kids = []; }
+    if (m.tree && rows) {
+      try { kids = procTree.descendants(rows, m.pid); } catch { kids = []; }
     }
     // ESRCH is success: the pid we were asked to end is already gone, which is the
     // state the caller wanted. Anything else is a real failure and says so.

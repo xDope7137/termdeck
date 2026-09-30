@@ -277,7 +277,7 @@ which fetches a complete agent. What is fully present in this repo is the agent'
 
 | File | Lines | What it is |
 |---|---:|---|
-| [`agent/capabilities.js`](agent/capabilities.js) | 2,622 | the entire capability surface, the trust boundary |
+| [`agent/capabilities.js`](agent/capabilities.js) | 2,663 | the entire capability surface, the trust boundary |
 | [`agent/engine-runs.js`](agent/engine-runs.js) | 1,283 | runs each engine's turns on the machine, with a numbered event log |
 | [`agent/limits.js`](agent/limits.js) | 951 | rate-limit and usage reading |
 | [`agent/agent.js`](agent/agent.js) | 949 | dial-out, reconnect, self-update with rollback |

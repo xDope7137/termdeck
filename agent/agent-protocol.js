@@ -285,7 +285,7 @@ const TABLE = [
   },
   { name: 'engineEvents', family: 'stream', reply: 'engineEvent', note: "one run's engine events from a seq on: the missed ones, then live, deltas batched" },
   { name: 'engineUnsubscribe', family: 'none', correlate: 'existing', note: "cancels an engineEvents stream by the id it minted" },
-  { name: 'killPid', note: 'signal an arbitrary system pid we did NOT spawn (taking a session over)' },
+  { name: 'killPid', codes: ['PID_NOT_OURS'], note: 'signal a pid under this agent, or a registered Claude CLI and its tree (taking a session over); any other pid is refused' },
 
   // -- background shells ----------------------------------------------------
   { name: 'bgShells', codes: ['AGENT_OUTDATED'], note: 'what a shell host still owns: pid, ppid, command, logPath' },

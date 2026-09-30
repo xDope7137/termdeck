@@ -12,7 +12,7 @@ are auditing what a connected machine will do, you only have to read one file.
 
 | File | Lines | What it does |
 |---|---:|---|
-| [`capabilities.js`](capabilities.js) | 2,622 | the whole capability surface: what a machine will answer, and the confinement around it |
+| [`capabilities.js`](capabilities.js) | 2,663 | the whole capability surface: what a machine will answer, and the confinement around it |
 | [`engine-runs.js`](engine-runs.js) | 1,283 | runs Claude, Codex and Grok turns on the machine, with a numbered event log the master resubscribes to after any gap |
 | [`limits.js`](limits.js) | 951 | reads rate-limit and usage state off the engines |
 | [`agent.js`](agent.js) | 949 | dials out, reconnects, and self-updates with a rollback |
