@@ -1,8 +1,46 @@
 # Changelog
 
-Termdeck ships continuously: 906 production deploys in the first 90 days. This is the
+Termdeck ships continuously: 1,013 production deploys in the first 112 days. This is the
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
+
+## 0.1.137x · 2026-10-12/22
+
+- **`npx termdeck-agent`.** Install, check, repair or remove the agent with npm, the same way on
+  macOS, Linux and Windows. It runs the same installer as the one-liners.
+- **Checkout moves to Stripe**, with Termdeck LLC as the merchant. Existing subscriptions carry on
+  unchanged.
+- **Live command output on Claude Code** *(agent)*: a running command's output shows under its row
+  while it runs, now on Windows too.
+- **New chats open at once**, and live turns and setting changes send fewer requests.
+
+## 0.1.131x to 0.1.136x · 2026-10-08/11
+
+- **Extensions in Settings** *(agent)*: list, health-check and switch MCP servers, plugins and
+  skills on each machine, for Claude Code, Codex and Grok.
+- **Hooks show in the chat**, each as one row saying what the hook said.
+- **Codex sub-agents ask in their own chat and show live**, like Claude's. Running sub-agents and
+  background shells sit in the composer tray.
+- **A chat's runaway child can no longer take the agent down** *(agent)*: an OOM kill stops the
+  child, not every running chat.
+- **A Mac stays awake while a chat runs on it** *(agent)*.
+- **Projects, pins, renames and archives reach every open tab live**, and every chat in an added
+  folder is reachable however long the list gets.
+- **Grok installs and detects xAI's own Grok CLI.**
+- **Terminals open on the last few messages** and page back as you scroll; reads, searches and
+  shell calls fold to one line.
+- **Clear all** in the notifications panel.
+
+## 0.1.116x to 0.1.130x · 2026-10-01/07
+
+- **Install a missing Claude Code, Codex or Grok CLI from the machine card** *(agent)*.
+- **A running command's output streams under its row** *(agent)*, and a pane's tray lists the
+  chat's background shells with a stop on each.
+- **Codex: approve commands like this one for the rest of the turn**, and `/compact` runs the
+  app-server's own compaction with a live bar.
+- **Code blocks name their language and are coloured in it**; an `@path` in a prompt is a chip
+  that opens the file.
+- **A plan remembers the mode it was approved into** *(agent)*.
 
 ## 0.1.115x · 2026-09-29/30
 

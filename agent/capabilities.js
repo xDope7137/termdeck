@@ -12,7 +12,8 @@ const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
 const { randomUUID } = require('crypto');
-const { registry: DEFAULT_RUNS } = require('./engine-runs');
+const { registry: DEFAULT_RUNS, checkClaudeArgs, checkFullAccess, fullAccessAllowed, cmdShimSpawn } = require('./engine-runs');
+let engineInstallLib; try { engineInstallLib = require('./engine-install'); } catch { engineInstallLib = null; }
 // The wire protocol, written down: every frame this file answers has a row there
 // naming its reply type, its legal ops and the master's timeout for it. The switch
 // below and that table are pinned to each other by tests/agent-protocol.mjs, so a
@@ -68,6 +69,10 @@ let projectFilesLib; try { projectFilesLib = require('./project-files'); } catch
 // AGENT_OUTDATED for the two ops that need it.
 let procTreeLib; try { procTreeLib = require('./proc-tree'); } catch { procTreeLib = null; }
 let machineConfigLib; try { machineConfigLib = require('./machine-config'); } catch { machineConfigLib = null; }
+// MCP servers, plugins and skills, with a switch for each (features/01-extensions).
+// Guarded like the rest: an agent that pulled a new capabilities.js before these
+// files landed still boots, and `extensions` answers AGENT_OUTDATED.
+let extensionsLib; try { extensionsLib = require('./extensions'); } catch { extensionsLib = null; }
 let projectDocLib; try { projectDocLib = require('./project-doc'); } catch { projectDocLib = null; }
 let commandCatalogLib; try { commandCatalogLib = require('./command-catalog'); } catch { commandCatalogLib = null; }
 let usageBehaviourLib; try { usageBehaviourLib = require('./usage-behaviour'); } catch { usageBehaviourLib = null; }
@@ -132,7 +137,25 @@ const DEFAULT_ROOTS = {
 // (grok's OIDC token) and .credentials.json (Claude's OAuth token, which already sits
 // INSIDE the whole-home CLAUDE_DIR root today) must never cross the tunnel as a plain
 // file read, however a root gets misconfigured.
-const DENYLIST_BASENAMES = new Set(['auth.json', '.credentials.json']);
+//
+// The config files are here too, and that is not defense in depth: they sit inside the
+// whole-home roots TODAY and hold plaintext secrets. settings.json's `env` block is where
+// ANTHROPIC_API_KEY lives, config.toml and .claude.json carry MCP server env values and
+// bearer tokens. The machineConfig and mcpServers capabilities read them HERE and send a
+// redacted view; a raw readFile used to send the unredacted file and make that redaction
+// decorative. Nothing on the master reads them raw.
+const DENYLIST_BASENAMES = new Set([
+  'auth.json', '.credentials.json', 'settings.json', 'settings.local.json', 'config.toml', '.claude.json', '.env',
+]);
+// Account switching writes these through temp names (lib/accounts.js), briefly outside
+// an exact-name list, and so do the Extensions switches (lib/machine-config.js
+// rewriteFile: `settings.json.termdeck-<hex>.tmp`), whose leftovers after a crash
+// hold the same secrets as the file.
+const DENYLIST_PREFIXES = ['auth.json.', '.credentials.json.', '.claude.json.', '.env.', 'settings.json.', 'settings.local.json.', 'config.toml.'];
+const deniedName = (rp) => {
+  const b = path.basename(rp);
+  return DENYLIST_BASENAMES.has(b) || DENYLIST_PREFIXES.some((p) => b.startsWith(p));
+};
 
 // One confinement: the three roots, resolved through their own symlinks once, and
 // every question this file asks about a path. A guard anywhere below goes through
@@ -154,26 +177,37 @@ function makeConfinement(roots = {}) {
   const confined = async (p) => {
     try {
       const rp = await fsp.realpath(p);
-      if (DENYLIST_BASENAMES.has(path.basename(rp))) return false;
+      if (deniedName(rp)) return false;
       return within(rp);
     } catch {
       try {
         const parent = await fsp.realpath(path.dirname(path.resolve(p)));
         const candidate = path.join(parent, path.basename(p));
-        if (DENYLIST_BASENAMES.has(path.basename(candidate))) return false;
+        if (deniedName(candidate)) return false;
         return within(candidate);
       } catch { return false; }
     }
   };
 
-  return { dirs, ROOTS, REAL_ROOTS, within, rootOf, confined };
+  // Where a WRITE may land: the session subtrees, never the rest of a root. The roots
+  // also hold CLAUDE.md, agents/*.md, settings.json and config.toml, and a title append
+  // or a trash aimed at one of those is a lasting prompt injection or a deleted deny rule.
+  const SESSION_TREES = [
+    path.join(dirs.claudeDir, 'projects'),
+    path.join(dirs.codexHome, 'sessions'),
+    path.join(dirs.codexHome, 'archived_sessions'),
+    path.join(dirs.grokDir, 'sessions'),
+  ].map((r) => { try { return fs.realpathSync(r); } catch { return path.resolve(r); } });
+  const inSessionTree = (rp) => SESSION_TREES.some((r) => rp.startsWith(r + path.sep));
+
+  return { dirs, ROOTS, REAL_ROOTS, within, rootOf, confined, inSessionTree };
 }
 
 // The one built from the environment. The module's exports are its members, so
 // agent.js's hello frame and tests/bg-shell-confinement.mjs keep reading exactly
 // what they always read.
 const DEFAULT_CONFINEMENT = makeConfinement();
-const { ROOTS, REAL_ROOTS, rootOf, confined } = DEFAULT_CONFINEMENT;
+const { ROOTS, REAL_ROOTS, rootOf, confined, inSessionTree } = DEFAULT_CONFINEMENT;
 const CLAUDE_DIR = DEFAULT_CONFINEMENT.dirs.claudeDir;
 const CODEX_HOME = DEFAULT_CONFINEMENT.dirs.codexHome;
 const GROK_DIR = DEFAULT_CONFINEMENT.dirs.grokDir;
@@ -347,6 +381,19 @@ function rewriteDuplicateTranscript(content, oldSessionId, newId, newCwd, upTo) 
 }
 
 
+const WORKTREES_TTL_MS = 5000;
+const worktreesMemo = new Map(); // base cwd -> { at, promise }
+function worktreesOf(base) {
+  const hit = worktreesMemo.get(base);
+  if (hit && Date.now() - hit.at < WORKTREES_TTL_MS) return hit.promise;
+  const promise = diffLib.listWorktrees(base)
+    .then((r) => (r.worktrees || []).filter((w) => !w.main && !w.bare && w.path).map((w) => w.path))
+    .catch(() => null);
+  worktreesMemo.set(base, { at: Date.now(), promise });
+  if (worktreesMemo.size > 200) worktreesMemo.delete(worktreesMemo.keys().next().value);
+  return promise;
+}
+
 // The injected reader lib/index-head.js's parse runs against — local fs, since
 // this is the box that holds the disk. Two callers now (`indexHeads` batches it
 // across the session list, `projectFiles` runs it on ONE transcript to learn
@@ -363,6 +410,11 @@ function headIo() {
     isDir: async (p) => {
       try { return (await fsp.stat(p)).isDirectory(); } catch { return false; }
     },
+    // The repo's linked checkouts, so a Codex chat working in `../hotfix` can be
+    // followed there (session-head.js codexTailWorktree). Same reach as isDir: a
+    // folder the rollout already names. Cached briefly, since a live chat's head is
+    // read on every append and each answer is two git spawns.
+    worktreesOf,
     readFile: async (p, offset = 0, len = null) => {
       const fd = await fsp.open(p, 'r');
       try {
@@ -417,23 +469,46 @@ function resolveEngine(kind, envVar, extraDirs = []) {
   return names[0]; // not found on disk — let spawn try PATH; the availability flag reads false
 }
 
-const ENGINES = {
-  claude: resolveEngine('claude', 'TERMDECK_CLAUDE_EXE'),
-  codex: resolveEngine('codex', 'TERMDECK_CODEX_EXE', [path.join(CODEX_HOME, 'packages', 'standalone', 'current', 'bin')]),
+// Live, not resolved once. This used to be a plain object filled at module load,
+// so a CLI installed AFTER the agent started (exactly what onboarding asks for:
+// connect the machine, then `npm install -g`, then press Recheck) stayed "Not
+// installed" until the agent restarted. Each read now re-stats the remembered
+// path and walks the candidates again only when it is gone or never existed, so
+// the common case stays one stat and a fresh install or a relocated upgrade is
+// picked up on the next cliStatus or spawn. The env override still wins outright.
+const ENGINE_CANDIDATES = {
+  claude: ['TERMDECK_CLAUDE_EXE', () => []],
+  codex: ['TERMDECK_CODEX_EXE', () => [path.join(CODEX_HOME, 'packages', 'standalone', 'current', 'bin')]],
   // Candidate order: env override, ~/.local/bin, ~/.grok/bin, PATH.
-  grok: resolveEngine('grok', 'TERMDECK_GROK_EXE', [path.join(GROK_DIR, 'bin')]),
+  grok: ['TERMDECK_GROK_EXE', () => [path.join(GROK_DIR, 'bin')]],
 };
+const engineMemo = {};
+function isExeFile(p) {
+  try { return fs.statSync(p).isFile(); } catch { return false; }
+}
+function engineExe(kind) {
+  const [envVar, extra] = ENGINE_CANDIDATES[kind];
+  if (process.env[envVar]) return process.env[envVar];
+  const prev = engineMemo[kind];
+  if (prev && isExeFile(prev)) return prev;
+  return (engineMemo[kind] = resolveEngine(kind, envVar, extra()));
+}
+const ENGINES = {};
+for (const kind of Object.keys(ENGINE_CANDIDATES)) {
+  Object.defineProperty(ENGINES, kind, { enumerable: true, get: () => engineExe(kind) });
+}
 // limits.js spawns a short-lived `codex app-server` to read live usage; hand it
-// the binary resolved here so there is one answer to "which codex" on this box.
-try { require('./limits').setCodexExe(ENGINES.codex); } catch {}
-try { require('./codex-accounts').setCodexExe(ENGINES.codex); } catch {}
+// the resolver used here so there is one answer to "which codex" on this box.
+// A function, not a path, so a CLI installed later reaches these modules too.
+try { require('./limits').setCodexExe(() => ENGINES.codex); } catch {}
+try { require('./codex-accounts').setCodexExe(() => ENGINES.codex); } catch {}
 // Same for claude, and for the same reason — with the same cost when it lapses.
 // accounts.js resolves independently (which.js, PATHEXT order) and on a box with
 // BOTH an npm global and a WinGet install those two orders pick DIFFERENT
 // binaries: turns ran on one, `auth login` was driven on the other, and the
 // sign-in hung with every payload internally consistent. The binary that runs
 // the turns is the one whose login matters, so it wins.
-try { require('./accounts').setClaudeExe(ENGINES.claude); } catch {}
+try { require('./accounts').setClaudeExe(() => ENGINES.claude); } catch {}
 
 const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;
 // The Models API is the authority on effort names. Keep a presentation order
@@ -800,6 +875,15 @@ async function cliStatus() {
           : Promise.resolve(null),
       ]);
       const row = { engine, installed: present, path: present ? exe : null, version, ...auth };
+      // xAI's CLI answers `grok 1.0.50 (c58f321264ba)`; the community
+      // @vibe-kit/grok-cli that an earlier Termdeck installed answers a bare
+      // `1.0.1` and has no `agent stdio`, so no Grok chat can start on it. It
+      // reads as not installed, with the reason, so the fix offered is the
+      // install that replaces it.
+      if (engine === 'grok' && present && version && !/^grok\s+v?\d/i.test(version)) {
+        row.installed = false;
+        row.otherCli = '@vibe-kit/grok-cli';
+      }
       // Can this machine be signed in FROM the dashboard, or only at its own
       // keyboard? Only this box can answer — it owns the CLI and the shape it
       // was installed in (lib/accounts.js signInSupport). Sent even when already
@@ -946,6 +1030,45 @@ async function totalsFor(engine, filePath, size, mtimeMs) {
   return remember({ size, mtimeMs, probe: await fileProbe(filePath, size), totals, codex: committed });
 }
 
+// What a Claude chat's subagents spent, per model: every agent-*.jsonl under
+// <session>/subagents/, each kept as a tally fed only the lines appended since
+// the last ask. A file that shrank or was replaced (same probe rule as the
+// totals above) is tallied whole again. Null when the chat has no subagents.
+const SUBAGENT_TALLY_MAX = 2000;
+const subagentTallies = new Map(); // path -> { offset, probe, tally }
+async function subagentUsageFor(sessionPath) {
+  if (!transcriptLib || !transcriptLib.createSubagentUsageTally) return null;
+  const dir = path.join(sessionPath.replace(/\.jsonl$/, ''), 'subagents');
+  let names;
+  try { names = await fsp.readdir(dir); } catch { return null; }
+  let sum = null;
+  for (const name of names) {
+    if (!/^agent-.+\.jsonl$/.test(name)) continue;
+    const fp = path.join(dir, name);
+    let size;
+    try { size = (await fsp.stat(fp)).size; } catch { continue; }
+    let hit = subagentTallies.get(fp);
+    try {
+      if (hit && (size < hit.offset || (await fileProbe(fp, hit.offset)) !== hit.probe)) hit = null;
+      if (!hit) hit = { offset: 0, probe: null, tally: transcriptLib.createSubagentUsageTally() };
+      if (size > hit.offset) {
+        const buf = await readRange(fp, hit.offset, size);
+        const nl = buf.lastIndexOf(0x0a);
+        if (nl >= 0) {
+          hit.tally.feed(buf.subarray(0, nl + 1));
+          hit.offset += nl + 1;
+          hit.probe = await fileProbe(fp, hit.offset);
+        }
+      }
+    } catch { continue; }
+    subagentTallies.delete(fp);
+    subagentTallies.set(fp, hit);
+    while (subagentTallies.size > SUBAGENT_TALLY_MAX) subagentTallies.delete(subagentTallies.keys().next().value);
+    sum = transcriptLib.addSubagentUsage(sum, hit.tally.totals());
+  }
+  return sum;
+}
+
 // The background shells a transcript recorded, kept per file and fed only the
 // lines appended since the last ask (features/04 phase 9). Same probe rule as
 // the totals above: a file that did not simply grow is scanned whole.
@@ -1013,7 +1136,7 @@ function makeCapabilities(send, opts = {}) {
   // the module-level bindings on purpose: every guard in this file already names
   // `confined`, `REAL_ROOTS`, `rootOf` and `CLAUDE_DIR`, so injecting is one
   // declaration here rather than an argument threaded through forty case bodies.
-  const { REAL_ROOTS, rootOf, confined, dirs, ROOTS } = opts.roots ? makeConfinement(opts.roots) : DEFAULT_CONFINEMENT;
+  const { REAL_ROOTS, rootOf, confined, dirs, ROOTS, inSessionTree } = opts.roots ? makeConfinement(opts.roots) : DEFAULT_CONFINEMENT;
   const CLAUDE_DIR = dirs.claudeDir;
   const GROK_DIR = dirs.grokDir;
 
@@ -1069,12 +1192,14 @@ function makeCapabilities(send, opts = {}) {
   const cliStatusFn = opts.cliStatus || cliStatus;
 
   // The engine allowlist this instance will start, injected last and on `||` terms:
-  // `ENGINES` is resolved once at module load off three env vars and the disk, so a
+  // `ENGINES` is resolved off three env vars and the disk, so a
   // process had exactly one answer to "which claude" and a test could not spawn
   // anything it was willing to be responsible for. This is the whole of what makes
   // an engine run narrow, and until it was injectable the only way to exercise it
   // was to run a real coding CLI, which the suite rules forbid outside the live tier.
   const engineExes = opts.engines || ENGINES;
+  // The owner's ceiling on permission modes (engine-runs.js checkFullAccess).
+  const fullAccess = opts.fullAccess != null ? !!opts.fullAccess : fullAccessAllowed();
 
   // The session index: the process's own for the real roots, a memory-only one
   // per instance for a test's fixture roots (their confinement is not the
@@ -1240,6 +1365,23 @@ function makeCapabilities(send, opts = {}) {
     }
     return null;
   };
+  // The rungs past the cap a stripped tail may climb on disk: a chat of
+  // pictures needs megabytes of file for fifteen messages, and none of those
+  // megabytes cross the tunnel.
+  const STRIP_WINDOWS = [16 * 1024 * 1024, 32 * 1024 * 1024];
+  // stripImages: the master takes pictures by URL (lib/cloud/transcript-images.js),
+  // so their base64 stays here and only a stub and its place cross the tunnel
+  // (tail-read.js stripImagePayloads). The window then widens on disk past the
+  // cap until the bytes that will be SENT reach it.
+  const stripperFor = (m) => {
+    const min = m.stripImages && tailReadLib && tailReadLib.stripImagePayloads ? Math.max(4096, Math.floor(Number(m.stripImages)) || 0) : 0;
+    return min ? (t) => {
+      const s = tailReadLib.stripImagePayloads(t.buf, min);
+      return s.strips.length ? { ...t, buf: s.buf, strips: s.strips } : t;
+    } : null;
+  };
+  // Offsets in the FILE, so the master can fetch a picture with a plain readFile.
+  const stripsOut = (t) => (t.strips ? t.strips.map((x) => ({ ...x, offset: (t.cutOffset || 0) + x.offset })) : null);
   defineOp('readTail', async (m) => {
     if (!(await confined(m.path))) throw fail('path not permitted');
     if (!tailReadLib) throw fail('agent outdated: tail-read.js missing', 'AGENT_OUTDATED');
@@ -1250,6 +1392,7 @@ function makeCapabilities(send, opts = {}) {
     const headBytes = Math.max(0, Math.min(256 * 1024, m.headBytes || 0));
     const engine = tailEngineOf(m);
     const fill = m.fillTo && typeof m.fillTo === 'object' && transcriptLib ? m.fillTo : null;
+    const strip = stripperFor(m);
     let tail;
     if (fill) {
       const preview = Math.max(0, Math.min(100, Math.floor(fill.preview) || 0));
@@ -1257,11 +1400,13 @@ function makeCapabilities(send, opts = {}) {
       // The ladder starts under the master's budget on purpose: 64 KiB fills
       // most chats, and the budget it named is the rung an older agent would
       // have read in one go.
-      const windows = [Math.min(tailReadLib.FILL_WINDOWS[0], maxBytes), maxBytes, ...tailReadLib.FILL_WINDOWS];
+      const windows = [Math.min(tailReadLib.FILL_WINDOWS[0], maxBytes), maxBytes, ...tailReadLib.FILL_WINDOWS, ...(strip ? STRIP_WINDOWS : [])];
       tail = await tailReadLib.readTailFilled(m.path, {
         windows,
         cap,
         headBytes,
+        transform: strip,
+        rawCap: STRIP_WINDOWS[STRIP_WINDOWS.length - 1],
         filled: (t) => {
           if (!(preview > 0)) return true;
           let count = 0;
@@ -1271,6 +1416,7 @@ function makeCapabilities(send, opts = {}) {
       });
     } else {
       tail = await tailReadLib.readTail(m.path, maxBytes, { headBytes });
+      if (strip) tail = strip(tail);
     }
     const out = {
       data: tail.buf,
@@ -1281,6 +1427,7 @@ function makeCapabilities(send, opts = {}) {
       size: tail.size,
       mtimeMs: tail.mtimeMs,
     };
+    if (tail.strips) out.strips = stripsOut(tail);
     if (m.totals && transcriptLib) out.totals = await totalsFor(engine, m.path, tail.size, tail.mtimeMs);
     if (m.turnHint && transcriptLib && engine !== 'claude') {
       out.lastTurnId = tail.whole ? null : await lastTurnIdBefore(engine, m.path, out.cutOffset);
@@ -1304,24 +1451,32 @@ function makeCapabilities(send, opts = {}) {
     const maxBytes = Math.max(4096, Math.min(lineMax, m.maxBytes || tailReadLib.TAIL_BYTES));
     const engine = tailEngineOf(m);
     const fill = m.fillTo && typeof m.fillTo === 'object' && transcriptLib ? m.fillTo : null;
+    const strip = stripperFor(m);
     let page;
     if (fill) {
       const preview = Math.max(0, Math.min(200, Math.floor(fill.preview) || 0));
       const cap = Math.max(maxBytes, Math.min(lineMax, fill.cap || tailReadLib.TAIL_BYTES_MAX));
-      const windows = [Math.min(tailReadLib.FILL_WINDOWS[0], maxBytes), maxBytes, ...tailReadLib.FILL_WINDOWS];
+      const windows = [Math.min(tailReadLib.FILL_WINDOWS[0], maxBytes), maxBytes, ...tailReadLib.FILL_WINDOWS, ...(strip ? STRIP_WINDOWS : [])];
       page = await tailReadLib.readBeforeFilled(m.path, endOffset, {
         windows,
         cap,
         lineMax,
+        transform: strip,
+        rawCap: STRIP_WINDOWS[STRIP_WINDOWS.length - 1],
         filled: (p) => {
           if (!(preview > 0)) return true;
-          let count = 0;
-          try { count = parseTailText(engine, p.buf.toString('utf8')).messages.length; } catch { return true; }
+          let msgs;
+          try { msgs = parseTailText(engine, p.buf.toString('utf8')).messages; } catch { return true; }
+          // A stripped page counts what it will SHOW: a Codex turn is one
+          // message of many tool calls, and a page cut inside one would never
+          // reach `preview` messages and climb to the cap every time.
+          const count = strip ? msgs.reduce((n, x) => n + Math.max(1, (x.blocks || []).length), 0) : msgs.length;
           return count >= preview;
         },
       });
     } else {
       page = await tailReadLib.readBefore(m.path, endOffset, maxBytes, { lineMax });
+      if (strip) page = strip(page);
     }
     const out = {
       data: page.buf,
@@ -1332,6 +1487,7 @@ function makeCapabilities(send, opts = {}) {
       mtimeMs: page.mtimeMs,
       skippedBytes: page.skippedBytes || 0,
     };
+    if (page.strips) out.strips = stripsOut(page);
     if (m.turnHint && transcriptLib && engine !== 'claude') {
       out.lastTurnId = page.whole ? null : await lastTurnIdBefore(engine, m.path, out.cutOffset);
     }
@@ -1356,6 +1512,14 @@ function makeCapabilities(send, opts = {}) {
     if (!transcriptLib || !transcriptLib.scanBackgroundShells) throw fail('agent outdated: transcript.js missing', 'AGENT_OUTDATED');
     if (!transcriptLib.createShellScanner) return { shells: transcriptLib.scanBackgroundShells(await fsp.readFile(m.path, 'utf8')) };
     return shellsFor(m.path);
+  });
+
+  // What one Claude chat's subagents spent, per model, tallied where their
+  // transcripts live. The chat's own cumulativeUsage cannot see them.
+  defineOp('subagentUsage', async (m) => {
+    if (!(await confined(m.path))) throw fail('path not permitted');
+    if (!transcriptLib || !transcriptLib.createSubagentUsageTally) throw fail('agent outdated: transcript.js missing', 'AGENT_OUTDATED');
+    return { usage: await subagentUsageFor(m.path) };
   });
 
   // ---- family 2: the folder picker -------------------------------------------
@@ -1513,8 +1677,31 @@ function makeCapabilities(send, opts = {}) {
   // same root (never ~/.termdeck, never anywhere else), so a master compromise still
   // cannot write outside .claude/.codex. tests/agent-capability-mutate.mjs is the
   // first thing that has ever checked that, rather than reading it.
+  // A folder that can be a project root: not a filesystem root and not home's
+  // parent or above. Home itself stays allowed (people do run a CLI in ~), and the
+  // file browser refuses credential stores under it (lib/project-files.js).
+  const cwdIsProjectShaped = (dir) => {
+    let real;
+    try { real = fs.realpathSync(dir); } catch { return false; }
+    if (path.parse(real).root === real) return false;
+    let home;
+    try { home = fs.realpathSync(os.homedir()); } catch { home = path.resolve(os.homedir()); }
+    const ci = process.platform === 'win32';
+    const a = ci ? real.toLowerCase() : real;
+    const h = ci ? home.toLowerCase() : home;
+    return !(h !== a && h.startsWith(a.endsWith(path.sep) ? a : a + path.sep));
+  };
+
   defineOp('mutate', async (m) => {
     if (!(await confined(m.path))) throw fail('path not permitted');
+    // Only a session's own files may be written, whatever the op. See inSessionTree.
+    {
+      // A missing file stays an ENOENT: deleteProject skips those, and confinement
+      // above already settled that the path is inside a root.
+      const real = await fsp.realpath(m.path);
+      if (!inSessionTree(real)) throw fail('path not permitted');
+      if (m.op !== 'trash' && !/\.jsonl$/i.test(real)) throw fail('path not permitted');
+    }
 
     if (m.op === 'trash') {
       const rp = await fsp.realpath(m.path);
@@ -1541,6 +1728,9 @@ function makeCapabilities(send, opts = {}) {
         let isDir = false;
         try { isDir = fs.statSync(newCwd).isDirectory(); } catch {}
         if (!isDir) throw fail('bad cwd');
+        // A clone's cwd is the root its file browser and project doc open on, so a
+        // filesystem root or an ancestor of home would hand those the whole disk.
+        if (!cwdIsProjectShaped(newCwd)) throw fail('bad cwd');
         const destDir = path.join(CLAUDE_DIR, 'projects', newCwd.replace(/[^A-Za-z0-9]/g, '-'));
         if (!(await confined(destDir))) throw fail('dst not permitted');
         await fsp.mkdir(destDir, { recursive: true });
@@ -1643,6 +1833,9 @@ function makeCapabilities(send, opts = {}) {
     if (!cwd) throw fail('This chat has no project folder on disk yet', 'NO_CWD');
     let root;
     try { root = await fsp.realpath(cwd); } catch { throw fail(`Project folder is missing: ${cwd}`, 'NO_CWD'); }
+    // Never an engine's own home: a transcript whose cwd is ~/.claude would make this
+    // write ~/.claude/CLAUDE.md, the instructions EVERY session on the box reads.
+    if (!cwdIsProjectShaped(root) || rootOf(root)) throw fail('path not permitted', 'OUT_OF_ROOT');
 
     if (m.op === 'write') {
       const content = typeof m.content === 'string' ? m.content : '';
@@ -1679,6 +1872,7 @@ function makeCapabilities(send, opts = {}) {
       // roots. Projects live wherever the user codes, and the master only ever sends
       // back a path this SAME browser session chose through the folder picker.
       try { cwd = await fsp.realpath(m.cwd); } catch { cwd = null; }
+      if (cwd && !cwdIsProjectShaped(cwd)) cwd = null;
     }
     return {
       data: await commandCatalogLib.readCatalog({
@@ -1710,6 +1904,9 @@ function makeCapabilities(send, opts = {}) {
     if (!cwd) throw fail('This chat has no project folder on disk yet', 'NO_CWD');
     let root;
     try { root = await fsp.realpath(cwd); } catch { throw fail(`Project folder is missing: ${cwd}`, 'NO_CWD'); }
+    // A transcript can name any cwd (a forged or rewritten one included), so the root
+    // it names must still look like a project, never `/` or a parent of home.
+    if (!cwdIsProjectShaped(root)) throw fail('path not permitted', 'OUT_OF_ROOT');
 
     // Policy runs on every segment, so `.git/config` is refused by its first rather
     // than by a rule about its last. Skipped entirely when the owner has opted in,
@@ -1780,6 +1977,13 @@ function makeCapabilities(send, opts = {}) {
       if (!sessionSettingsLib.writeRunOptions) throw fail('agent is out of date (run options unsupported). Update the agent', 'AGENT_OUTDATED');
       return { runOptions: await sessionSettingsLib.writeRunOptions(root, m.sessionId, m.runOptions ?? null) };
     }
+    if (m.op === 'setPlanMode') {
+      // The mode a plan was approved into (features/02 3.6b): a tool_use id and
+      // one of four mode names, both checked by the shared module. A malformed
+      // pair is refused rather than stored.
+      if (!sessionSettingsLib.writePlanMode) throw fail('agent is out of date (plan modes unsupported). Update the agent', 'AGENT_OUTDATED');
+      return { planMode: await sessionSettingsLib.writePlanMode(root, m.sessionId, m.toolUseId, m.mode) };
+    }
     // `get`, the row's defaultOp, so this is also what an op-less frame means.
     return { settings: await sessionSettingsLib.readSettings(root) };
   });
@@ -1849,7 +2053,13 @@ function makeCapabilities(send, opts = {}) {
       try { process.kill(pid, 0); } catch (e) { return e.code === 'EPERM'; }
       return !zombie(pid);
     });
-    return { alive };
+    // Which of them are CLIs this agent spawned and still holds. The master can only
+    // remember pids it was told about, and a restart, a re-attach gap or a turn too
+    // short for any poll leaves it holding nothing, so our own idle CLI read as
+    // "another program is writing" with no way back. The agent never forgets its
+    // own children while they live, so it vouches for them on every poll.
+    const mine = new Set(runs.list().filter((r) => !r.exited && Number.isFinite(r.pid)).map((r) => r.pid));
+    return { alive, ours: alive.filter((pid) => mine.has(pid)) };
   });
 
   // A rollout lifecycle says whether a turn is generating. This answers the
@@ -2037,6 +2247,81 @@ function makeCapabilities(send, opts = {}) {
     return { claude: await machineConfigLib.readClaudeConfig(REAL_ROOTS[0]) };
   }, { onError: (e) => ({ error: e && (e.code || e.message), code: 'CONFIG_FAILED' }) });
 
+  // Every MCP server, plugin and skill an engine is configured with on this box,
+  // their health, and one switch per item (features/01-extensions). The reads and
+  // writes are lib/extensions*.js; what is HERE is the boundary:
+  //   * the projects come from the master, and each one must be a real folder that
+  //     is project-shaped, outside the engine homes and not a credential store, or
+  //     it is dropped before the module sees it
+  //   * the engine CLIs run from the allowlist this instance was built with, with
+  //     a timeout, never through a shell except the Windows .cmd shim
+  //   * TERMDECK_CONFIG_READONLY (the owner's switch, read at construction like
+  //     TERMDECK_FULL_ACCESS) refuses every write
+  // The two config files the denylist keeps from a raw readFile are read here and
+  // only a redacted view leaves, the same posture as machineConfig.
+  const extensionsReadonly = opts.configReadonly != null ? !!opts.configReadonly : (extensionsLib ? extensionsLib.readonlyFrom() : false);
+  const extensionsRun = opts.extensionsRun || ((exe, args, o = {}) => new Promise((resolve) => {
+    const win = process.platform === 'win32' && /\.(cmd|bat)$/i.test(exe);
+    execFile(win ? `"${exe}"` : exe, args, {
+      timeout: o.timeout || 20_000, cwd: o.cwd, maxBuffer: 16 * 1024 * 1024, windowsHide: true,
+      env: engineEnv(String(o.engine || 'claude')), ...(win ? { shell: true } : {}),
+    }, (err, stdout, stderr) => {
+      const timedOut = !!(err && (err.killed || err.signal === 'SIGTERM'));
+      const code = err ? (typeof err.code === 'number' ? err.code : -1) : 0;
+      resolve({ code, stdout: String(stdout || ''), stderr: String(stderr || '').slice(-4000), timedOut, error: err && typeof err.code === 'string' ? err.code : null });
+    });
+  }));
+  // Not the home folder itself (its .claude is the user's, not a project's), and
+  // nothing inside an engine home: the whole of ~/.claude, ~/.codex and ~/.grok,
+  // not only the transcript roots inside them. Windows paths compare without case.
+  const extensionsProjectOk = (p) => {
+    let real;
+    try { real = fs.realpathSync(p); } catch { return false; }
+    try { if (!fs.statSync(real).isDirectory()) return false; } catch { return false; }
+    if (!path.isAbsolute(p) || !cwdIsProjectShaped(real) || rootOf(real)) return false;
+    if (projectFilesLib && projectFilesLib.isCredentialStore && projectFilesLib.isCredentialStore(real)) return false;
+    const norm = (x) => (process.platform === 'win32' ? x.toLowerCase() : x);
+    const resolved = (x) => { try { return fs.realpathSync(x); } catch { return path.resolve(x); } };
+    const r = norm(real);
+    const home = opts.home || os.homedir();
+    for (const h of new Set([home, os.homedir()].map(resolved))) if (r === norm(h)) return false;
+    const engineHomes = [
+      opts.roots && opts.roots.claudeDir ? opts.roots.claudeDir : CLAUDE_DIR,
+      opts.roots && opts.roots.codexHome ? opts.roots.codexHome : CODEX_HOME,
+      opts.roots && opts.roots.grokDir ? opts.roots.grokDir : GROK_DIR,
+      ...[home, os.homedir()].flatMap((h) => ['.claude', '.codex', '.grok'].map((d) => path.join(h, d))),
+    ];
+    for (const e of engineHomes) {
+      const n = norm(resolved(e));
+      if (r === n || r.startsWith(n.endsWith(path.sep) ? n : n + path.sep)) return false;
+    }
+    return true;
+  };
+  defineOp('extensions', async (m) => {
+    if (!extensionsLib) throw fail('agent is out of date (extensions module missing). Update the agent', 'AGENT_OUTDATED');
+    const payload = m.payload && typeof m.payload === 'object' ? m.payload : {};
+    const engine = payload.engine === 'codex' || payload.engine === 'grok' ? payload.engine : 'claude';
+    const ctx = {
+      claudeDir: opts.roots && opts.roots.claudeDir ? opts.roots.claudeDir : CLAUDE_DIR,
+      claudeJson: opts.claudeJson || claudeConfigJsonPath(),
+      codexHome: opts.roots && opts.roots.codexHome ? opts.roots.codexHome : CODEX_HOME,
+      grokDir: opts.roots && opts.roots.grokDir ? opts.roots.grokDir : GROK_DIR,
+      home: opts.home || os.homedir(),
+      managedMcpPath: opts.managedMcpPath,
+      exes: { claude: engineExes.claude || null, codex: engineExes.codex || null, grok: engineExes.grok || null },
+      run: (exe, args, o = {}) => extensionsRun(exe, args, { ...o, engine }),
+      codexRpc: opts.extensionsCodexRpc || (engineExes.codex && runs && runs.rpc
+        ? async (method, params, timeoutMs) => (await runs.rpc({ engine: 'codex', exe: engineExes.codex, env: engineEnv('codex'), home: os.homedir(), method, params, timeoutMs })).result
+        : null),
+      readonly: extensionsReadonly,
+      projectOk: opts.extensionsProjectOk || extensionsProjectOk,
+    };
+    if (m.op === 'health') return { data: await extensionsLib.handle('health', payload, ctx) };
+    if (m.op === 'toggle') return { data: await extensionsLib.handle('toggle', payload, ctx) };
+    if (m.op === 'list' || !m.op) return { data: await extensionsLib.handle('list', payload, ctx) };
+    throw noBranch('extensions', m.op);
+  }, { onError: (e) => ({ error: e && e.message, code: (e && e.code && typeof e.code === 'string') ? e.code : 'CLI_FAILED' }) });
+
   // ---- family 7: the watch, and the background shells ------------------------
   // The first two frames in this conversion that are not one-ask-one-answer, which
   // is the whole reason they were left this long. `watch` is family 'stream' and
@@ -2196,6 +2481,23 @@ function makeCapabilities(send, opts = {}) {
   // parameterise and nothing to get wrong.
   defineOp('cliStatus', async () => ({ data: await cliStatusFn() }), justMessage);
 
+  // Install a missing engine's CLI (agent/engine-install.js). The master names
+  // the engine; the package is the agent's own table, never the caller's.
+  const installer = opts.engineInstaller || (engineInstallLib && engineInstallLib.createInstaller({
+    shim: cmdShimSpawn,
+    onInstalled: () => { claudeModelCache = null; try { require('./limits').invalidateClaudeCache(); } catch {} },
+  }));
+  defineOp('engineInstall', async (m) => {
+    if (!installer) throw fail('agent is out of date (engine-install module missing). Update the agent', 'AGENT_OUTDATED');
+    const payload = m.payload && typeof m.payload === 'object' ? m.payload : {};
+    if (m.op === 'start') {
+      try { return { data: installer.start(String(payload.engine || '')) }; }
+      catch (e) { throw fail(e.message, e.code || null); }
+    }
+    if (m.op === 'status') return { data: installer.status() };
+    throw noBranch('engineInstall', m.op);
+  }, { onError: (e) => ({ error: e && e.message, code: (e && e.code) || null }) });
+
   // Token spend for #/usage, computed on THIS box (the transcripts never leave it,
   // only the aggregated tokens go up to the master). Args are MASTER-FORWARDED and
   // validated HERE, not trusted: this is the one capability whose args come from
@@ -2282,6 +2584,15 @@ function makeCapabilities(send, opts = {}) {
   defineOp('git', async (m) => {
     const payload = m.payload && typeof m.payload === 'object' ? m.payload : {};
     const cwd = String(payload.cwd || '');
+    // Not confined to the roots (projects live anywhere), but never a filesystem root or
+    // a parent of home, and never a credential store: a diff ships untracked files'
+    // contents, so a cwd is a read of everything git can see under it.
+    // A cwd that does not resolve is left to git to refuse, as before.
+    let realCwd = null;
+    try { realCwd = cwd ? fs.realpathSync(cwd) : null; } catch { realCwd = null; }
+    if (realCwd && (!cwdIsProjectShaped(realCwd) || (projectFilesLib && projectFilesLib.isCredentialStore && projectFilesLib.isCredentialStore(realCwd)))) {
+      throw fail('path not permitted', 'OUT_OF_ROOT');
+    }
     if (m.op === 'diff') {
       // light: summary only, no patches. file/from: one file's patch. An agent
       // older than this reads neither and answers the whole diff, which the
@@ -2415,9 +2726,24 @@ function makeCapabilities(send, opts = {}) {
   // Since 2.1.268 the CLI offers TodoWrite/TaskCreate only on older models, so a
   // chat on any current model wrote no checklist at all; this env var is the
   // documented opt-in. Only a default: a box that sets it either way keeps its own.
+  //
+  // CLAUDE_CODE_ENABLE_CFC carries the user's /chrome "Enabled by default" into the
+  // chat. The CLI ignores claudeInChromeDefaultEnabled in any non-interactive session
+  // (ours is stream-json) and connects Chrome only for --chrome or this env var, so a
+  // terminal had the browser tools and the same chat in Termdeck did not. Also only a
+  // default: a box that sets it either way keeps its own.
+  function chromeEnv() {
+    try {
+      if (JSON.parse(fs.readFileSync(claudeConfigJsonPath(), 'utf8')).claudeInChromeDefaultEnabled === true) return { CLAUDE_CODE_ENABLE_CFC: '1' };
+    } catch {}
+    return {};
+  }
   function engineEnv(engine) {
+    // agent.js deletes the machine token from process.env at boot; this is the backstop
+    // for any path that put it back (it must never reach an engine, a tool or an MCP server).
+    delete process.env.TERMDECK_AGENT_TOKEN;
     // EMIT_SESSION_STATE_EVENTS: the CLI's own idle is what ends a turn (lib/claude-events.js).
-    if (engine === 'claude') return { CLAUDE_CODE_ENABLE_TODO_TOOLS: '1', ...process.env, CLAUDE_CODE_STREAM_CLOSE_TIMEOUT: '300000', CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING: 'true', CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' };
+    if (engine === 'claude') return { CLAUDE_CODE_ENABLE_TODO_TOOLS: '1', ...chromeEnv(), ...process.env, CLAUDE_CODE_STREAM_CLOSE_TIMEOUT: '300000', CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING: 'true', CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' };
     if (engine === 'grok') {
       const env = { ...process.env };
       delete env.XAI_API_KEY;
@@ -2441,6 +2767,9 @@ function makeCapabilities(send, opts = {}) {
         const exe = engineExes[m.engine];
         if (!exe) throw fail(`engine not permitted: ${m.engine}`, 'BAD_ENGINE');
         const cwd = m.cwd && typeof m.cwd === 'string' ? checkCwd(m.cwd, 'BAD_CWD') : null;
+        if (!fullAccess) {
+          try { checkFullAccess(m.engine, m); } catch (e) { throw fail(e.message, e.code); }
+        }
         // Codex: a turn on a thread of the machine's one app-server. The master sends
         // the turn's input items and settings; the argv is the agent's own.
         if (m.engine === 'codex') {
@@ -2482,7 +2811,12 @@ function makeCapabilities(send, opts = {}) {
           runId: typeof m.runId === 'string' ? m.runId : undefined,
           engine: m.engine,
           exe,
-          args: Array.isArray(m.args) ? m.args.map(String) : [],
+          // The master relays a turn; it does not choose how the CLI runs. See
+          // checkClaudeArgs: unknown flags are refused rather than passed through.
+          args: (() => {
+            const args = Array.isArray(m.args) ? m.args.map(String) : [];
+            try { return checkClaudeArgs(args); } catch (e) { throw fail(e.message, e.code || 'BAD_ARGS'); }
+          })(),
           cwd,
           env: engineEnv(m.engine),
           content: m.content,
@@ -2498,6 +2832,15 @@ function makeCapabilities(send, opts = {}) {
       if (m.op === 'submit') return runs.submit(String(m.runId), m.content, m.thinking || null);
       if (m.op === 'hold') return { held: runs.hold(String(m.runId)) };
       if (m.op === 'interrupt') { runs.interrupt(String(m.runId)); return { ok: true }; }
+      if (m.op === 'control' && !fullAccess) {
+        try { checkFullAccess('claude', { request: m.request }); } catch (e) { throw fail(e.message, e.code); }
+      }
+      // A chat's MCP switch (`mcp_toggle`) is the CLI writing ~/.claude.json, the
+      // same write the Extensions page makes, so the owner's read-only switch
+      // refuses it here too. Reconnect writes nothing and stays allowed.
+      if (m.op === 'control' && extensionsReadonly && m.request && m.request.subtype === 'mcp_toggle') {
+        throw fail('This machine is read-only (TERMDECK_CONFIG_READONLY)', 'CONFIG_READONLY');
+      }
       if (m.op === 'control') return await runs.control(String(m.runId), m.request, Number(m.timeoutMs) || undefined);
       if (m.op === 'stop') return { stopped: runs.stop(String(m.runId)) };
       if (m.op === 'list') return { runs: runs.list(), servers: runs.servers() };
@@ -2660,4 +3003,4 @@ function makeCapabilities(send, opts = {}) {
 // bgLogPathOk is exported for the same reason `confined` is: it is a security
 // boundary, and a boundary that can only be exercised through a live WebSocket
 // is a boundary nobody tests. See tests/bg-shell-confinement.mjs.
-module.exports = { makeCapabilities, confined, bgLogPathOk, claudeEffortLevels, ROOTS, ENGINES };
+module.exports = { makeCapabilities, confined, bgLogPathOk, claudeEffortLevels, ROOTS, ENGINES, resolveEngine };

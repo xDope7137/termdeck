@@ -48,6 +48,8 @@ const { createGrokTranslator } = require('./grok-events');
 // Guarded like capabilities.js guards it: an agent that pulled this file before
 // proc-tree.js landed still runs turns, it only cannot reap a stopped exec.
 let procTree; try { procTree = require('./proc-tree'); } catch { procTree = null; }
+// Same guard: without it a run only loses its live command output (bugs.md B7).
+let liveOutputLib; try { liveOutputLib = require('./live-output'); } catch { liveOutputLib = null; }
 
 let AGENT_VERSION = '0.0.0';
 try { AGENT_VERSION = require('./package.json').version; } catch {}
@@ -84,6 +86,7 @@ const DEFAULTS = {
   // rollout (a 124 MB one was measured) and so gets a work budget, not a call one.
   codexRpcMs: 30_000,
   codexResumeMs: 5 * 60 * 1000,
+  codexInjectMs: 3000, // a stopped turn's partial reply (codexKeepPartial)
   // turn/start's ack timed out: how long turn/started still has to show up before
   // the run is declared dead. A late ack says nothing about whether the turn runs.
   codexStartGraceMs: 30_000,
@@ -99,12 +102,143 @@ const DEFAULTS = {
 
 // What the master may ask the shared Codex child outside a turn. Everything else
 // goes through a run, where it is sequenced and logged.
-const CODEX_RPC = new Set(['model/list', 'config/read', 'account/rateLimits/read', 'account/rateLimitResetCredit/consume']);
+const CODEX_RPC = new Set(['model/list', 'config/read', 'account/rateLimits/read', 'account/rateLimitResetCredit/consume', 'mcpServerStatus/list', 'skills/list']);
 // default_mode_request_user_input is gated off by default; without it the model's
 // request_user_input tool errors instead of asking.
 const CODEX_ARGS = ['app-server', '-c', 'features.default_mode_request_user_input=true'];
 const GROK_ARGS = ['agent', 'stdio'];
-const isActiveWriterRefusal = (err) => /active writer/i.test(String((err && (err.message || err)) || ''));
+// An npm install on Windows puts a .cmd shim on PATH, and a .cmd only runs through
+// cmd.exe. `shell: true` joined the argv with spaces and no quoting, so an allowed-tool
+// rule such as `Bash(x & calc.exe)` ran calc, and an ordinary `Bash(npm run test:*)` or a
+// folder with a space in it broke the command line. This is cross-spawn's escaping:
+// CommandLineToArgvW quoting for the argument, then every cmd metacharacter caret-escaped,
+// twice, because a .cmd shim re-parses its %* once more.
+const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
+function cmdEscapeArg(arg) {
+  let a = String(arg);
+  a = a.replace(/(?=(\\+?)?)\1"/g, '$1$1\\"');
+  a = a.replace(/(?=(\\+?)?)\1$/, '$1$1');
+  a = `"${a}"`;
+  return a.replace(CMD_META, '^$1').replace(CMD_META, '^$1');
+}
+// Best of all is no cmd.exe at all. npm's shims (cmd-shim) name their real target as
+// "%dp0%\<relative path>": a .js runs under node (this agent's own, which is what
+// npm would pick on a box that has only one), a native .exe runs as itself. Anything
+// unrecognised falls back to the escaped cmd.exe line below.
+function shimTarget(exe) {
+  let text;
+  try { text = require('fs').readFileSync(exe, 'utf8'); } catch { return null; }
+  if (text.length > 64 * 1024) return null;
+  const pw = require('path').win32;
+  // The shim names node.exe too (the interpreter it prefers), so the target is the
+  // last quoted %dp0% path that is not node itself.
+  const hits = [...text.matchAll(/"%(?:~)?dp0%\\?([^"%]+?\.(?:js|cjs|mjs|exe))"/gi)]
+    .map((m) => m[1]).filter((rel) => !/(^|\\)node\.exe$/i.test(rel));
+  if (!hits.length) return null;
+  const target = pw.join(pw.dirname(exe), hits[hits.length - 1]);
+  try { if (!require('fs').statSync(target).isFile()) return null; } catch { return null; }
+  return target;
+}
+function cmdShimSpawn(exe, args, { resolveShim = shimTarget } = {}) {
+  const target = resolveShim(exe);
+  if (target && /\.exe$/i.test(target)) return { file: target, args: [...args], verbatim: false };
+  if (target) return { file: process.execPath, args: [target, ...args], verbatim: false };
+  const command = [require('path').win32.normalize(exe).replace(CMD_META, '^$1'), ...args.map(cmdEscapeArg)].join(' ');
+  return { file: process.env.comspec || 'cmd.exe', args: ['/d', '/s', '/c', `"${command}"`], verbatim: true };
+}
+
+// The Claude argv the master may ask for, checked here because this is the side that
+// spawns it. lib/cloud/claude-turn-args.js builds exactly these; anything else would be
+// the master choosing how the CLI runs rather than relaying a turn, and several flags do
+// that with no prompt at all: --settings can carry a SessionStart hook (a command that
+// runs before any model output), --mcp-config starts an arbitrary process, and
+// --dangerously-skip-permissions or another --permission-prompt-tool remove the approval
+// this product exists to show. tests/claude-args-policy.mjs holds the builder to this list.
+const CLAUDE_FLAG_VALUES = {
+  '--output-format': (v) => v === 'stream-json',
+  '--input-format': (v) => v === 'stream-json',
+  '--permission-prompt-tool': (v) => v === 'stdio',
+  '--permission-mode': (v) => ['plan', 'default', 'acceptEdits', 'auto', 'bypassPermissions'].includes(v),
+  '--prompt-suggestions': (v) => v === 'true' || v === 'false',
+  '--resume': (v) => /^[0-9a-f-]{8,64}$/i.test(v),
+  // A new chat's id, chosen by the master so the chat opens before the CLI's
+  // init frame (which waits on every SessionStart and UserPromptSubmit hook).
+  '--session-id': (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v),
+  '--model': (v) => !v.startsWith('-') && /^[\w.:\[\]/@-]{1,120}$/.test(v),
+  '--fallback-model': (v) => !v.startsWith('-') && /^[\w.:\[\]/@-]{1,120}$/.test(v),
+  '--effort': (v) => /^[a-z]{1,16}$/.test(v),
+  '--max-budget-usd': (v) => /^\d+(\.\d+)?$/.test(v),
+  '--autocompact': (v) => v === 'true' || v === 'false',
+  '--add-dir': (v) => !!v && !v.startsWith('-'),
+};
+const CLAUDE_FLAG_BARE = new Set(['--verbose', '--include-partial-messages', '--include-hook-events']);
+const CLAUDE_FLAG_LISTS = new Set(['--allowedTools', '--disallowedTools']);
+function checkClaudeArgs(args) {
+  const bad = (why) => { throw refuse(`claude argument refused: ${why}`, 'BAD_ARGS'); };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (CLAUDE_FLAG_BARE.has(a)) continue;
+    if (Object.prototype.hasOwnProperty.call(CLAUDE_FLAG_VALUES, a)) {
+      const v = args[i + 1];
+      if (typeof v !== 'string' || !CLAUDE_FLAG_VALUES[a](v)) bad(`${a} ${v === undefined ? '(missing)' : JSON.stringify(v).slice(0, 80)}`);
+      i += 1;
+      continue;
+    }
+    if (CLAUDE_FLAG_LISTS.has(a)) {
+      let n = 0;
+      while (i + 1 < args.length && !String(args[i + 1]).startsWith('--')) { i += 1; n += 1; }
+      if (!n) bad(`${a} with no tools`);
+      continue;
+    }
+    if (a === '--worktree') {
+      const v = args[i + 1];
+      if (typeof v === 'string' && !v.startsWith('-')) {
+        if (!/^[\w./-]{1,200}$/.test(v)) bad(`--worktree ${JSON.stringify(v).slice(0, 80)}`);
+        i += 1;
+      }
+      continue;
+    }
+    bad(JSON.stringify(String(a)).slice(0, 80));
+  }
+  return args;
+}
+
+// TERMDECK_FULL_ACCESS=off in the agent's env: the machine owner's ceiling, which the
+// master cannot raise. Every mode that lets an engine act without asking is refused
+// at the agent: Claude bypassPermissions (argv or a mid-run switch), Codex approval
+// 'never' or an unsandboxed policy, Grok's bypassPermissions mode. Each action then
+// waits for an answer instead of running unasked.
+const FULL_ACCESS_OFF = 'full access is turned off on this machine (TERMDECK_FULL_ACCESS=off)';
+function fullAccessAllowed(env = process.env) {
+  return String(env.TERMDECK_FULL_ACCESS || '').trim().toLowerCase() !== 'off';
+}
+function checkFullAccess(engine, spec) {
+  const s = spec || {};
+  const deny = () => { throw refuse(FULL_ACCESS_OFF, 'FULL_ACCESS_OFF'); };
+  if (engine === 'claude') {
+    const args = Array.isArray(s.args) ? s.args : [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '--dangerously-skip-permissions') deny();
+      if (args[i] === '--permission-mode' && args[i + 1] === 'bypassPermissions') deny();
+    }
+    if (s.permissionMode === 'bypassPermissions') deny();
+    const r = s.request;
+    if (r && r.subtype === 'set_permission_mode' && r.mode === 'bypassPermissions') deny();
+  } else if (engine === 'codex') {
+    const th = s.thread || {};
+    const turn = s.turn || {};
+    if (th.approvalPolicy === 'never' || turn.approvalPolicy === 'never') deny();
+    if (th.sandbox === 'danger-full-access') deny();
+    const sp = turn.sandboxPolicy;
+    if (sp && typeof sp === 'object' && (sp.type === 'dangerFullAccess' || sp.type === 'externalSandbox')) deny();
+    if (s.permissionMode === 'full-access') deny();
+  } else if (engine === 'grok') {
+    if (s.modeId === 'bypassPermissions' || s.permissionMode === 'full-access') deny();
+  }
+  return spec;
+}
+
+const isActiveWriterRefusal =(err) => /active writer/i.test(String((err && (err.message || err)) || ''));
 
 const ADAPTERS = {
   claude: { translator: (opts) => createClaudeTranslator(opts), turnStarting },
@@ -132,7 +266,18 @@ function killTree(child, signal) {
 // appended to <tapeDir>/<engine>-<runId>.jsonl. The translators are pure, so replaying
 // those calls into a fresh translator must give the same events; that is what lets a
 // recorded session stand in for the CLI. scripts/record-tapes.js is the only caller.
-const TAPE_QUERIES = new Set(['liveShells', 'pendingApprovals']);
+const TAPE_QUERIES = new Set(['liveShells', 'pendingApprovals', 'unfinishedText']);
+
+// The app-server's server requests a person answers (lib/codex-events.js has the
+// same list). A worker's that names no known parent is looked up before refusal.
+const APPROVAL_REQUESTS = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/tool/requestUserInput',
+  'item/permissions/requestApproval',
+]);
+// Sub-agent threads remembered per app-server, oldest forgotten first.
+const CODEX_PARENTS_MAX = 2000;
 function taped(tr, dir, engine, runId, opts) {
   if (!dir) return tr;
   const file = require('path').join(dir, `${engine}-${runId}.jsonl`);
@@ -162,6 +307,21 @@ function createRunRegistry(opts = {}) {
   const reapCommands = cfg.reapCommands || (procTree && procTree.reapCommands) || null;
   const now = cfg.now || Date.now;
   const runs = new Map(); // runId -> run
+  // A running command's output, tailed off the CLI's own task file (Claude) or paced
+  // from the engine's deltas (Codex), into the run's log as `tool.output`.
+  const liveOut = liveOutputLib && cfg.liveOutput !== false
+    ? liveOutputLib.createLiveOutput({ ...(cfg.liveOutput || {}), emit: (run, ev) => push(run, ev) })
+    : null;
+  const liveCtx = (run) => ({
+    engine: run.codex ? 'codex' : run.shared ? 'shared' : run.proc.engine,
+    sessionId: () => run.log.sessionId,
+    cwd: run.proc && run.proc.cwd,
+    env: run.proc && run.proc.env,
+  });
+  // Every engine event goes into the log through here.
+  const emitAll = (run, events) => {
+    for (const e of events) if (!liveOut || !liveOut.intercept(run, e, liveCtx(run))) push(run, e);
+  };
 
   function timer(fn, ms) {
     const t = setTimeout(fn, ms);
@@ -189,7 +349,10 @@ function createRunRegistry(opts = {}) {
 
     let child;
     try {
-      child = spawnFn(exe, args, { cwd: cwd || undefined, env, shell: /\.(cmd|bat)$/i.test(exe), detached: process.platform !== 'win32' });
+      const viaCmd = /\.(cmd|bat)$/i.test(exe) ? cmdShimSpawn(exe, args) : null;
+      child = viaCmd
+        ? spawnFn(viaCmd.file, viaCmd.args, { cwd: cwd || undefined, env, windowsVerbatimArguments: viaCmd.verbatim, detached: false })
+        : spawnFn(exe, args, { cwd: cwd || undefined, env, detached: process.platform !== 'win32' });
     } catch (e) {
       throw refuse(e.message, 'SPAWN_FAILED');
     }
@@ -199,6 +362,7 @@ function createRunRegistry(opts = {}) {
       child,
       pid: child.pid ?? null,
       cwd,
+      env,
       model,
       permissionMode,
       current: null,       // the run this process is serving, or last served
@@ -246,8 +410,10 @@ function createRunRegistry(opts = {}) {
     return { runId, pid: proc.pid };
   }
 
-  function newRun(proc, { runId = randomUUID(), sessionId = null, resumed = true, shells = [], selfStarted = false } = {}) {
+  function newRun(proc, { runId = randomUUID(), sessionId = null, resumed = true, shells = [], selfStarted = false, priorCostUsd } = {}) {
     const trOpts = { sessionId, resumed, permissionMode: proc.permissionMode, shells, selfStarted };
+    // Claude's result reports the process's total cost; the next turn subtracts it.
+    if (typeof priorCostUsd === 'number' && priorCostUsd > 0) trOpts.priorCostUsd = priorCostUsd;
     const run = {
       runId,
       proc,
@@ -277,7 +443,7 @@ function createRunRegistry(opts = {}) {
     const prev = proc.current;
     clearTimeout(prev.timers.suggestion);
     clearTimeout(proc.timers.undecided);
-    const run = newRun(proc, { sessionId: prev.log.sessionId, shells: prev.tr.liveShells(), selfStarted });
+    const run = newRun(proc, { sessionId: prev.log.sessionId, shells: prev.tr.liveShells(), selfStarted, priorCostUsd: prev.tr.processCostUsd });
     prev.nextRunId = run.runId;
     push(prev, { type: 'run.continued', nextRunId: run.runId });
     scheduleRetain(prev);
@@ -287,6 +453,10 @@ function createRunRegistry(opts = {}) {
   function route(proc, m) {
     let run = proc.current;
     if (run.finishedAt && proc.adapter.turnStarting(m)) run = continueOn(proc, true); // the CLI began this one itself
+    // The steer backstop is for a CLI gone quiet, not a turn still working: armed
+    // once at the steer, it ended every steered turn that ran on past steerMaxMs
+    // as "Claude exited (code null)" and killed the CLI mid-answer.
+    if (run.timers.steer && !run.finishedAt) armSteer(run);
     apply(run, run.tr.frame(m));
   }
 
@@ -336,7 +506,7 @@ function createRunRegistry(opts = {}) {
 
   function apply(run, r) {
     for (const f of r.writes) write(run.proc, f);
-    for (const e of r.events) push(run, e);
+    emitAll(run, r.events);
     if (r.control) settleControl(run.proc, r.control.requestId, { ok: r.control.ok, response: r.control.response });
     if (r.holding) {
       clearTimeout(run.timers.async);
@@ -448,6 +618,7 @@ function createRunRegistry(opts = {}) {
       init: null,
       serverInfo: null,
       threads: new Map(),   // threadId -> the run serving that thread's current turn
+      parents: new Map(),   // sub-agent threadId -> the thread that spawned it (codexOwner)
       collab: new Set(),    // threads left in the `plan` collaboration mode (sticky on the thread)
       stderr: [],
     };
@@ -540,20 +711,37 @@ function createRunRegistry(opts = {}) {
     }
     const params = m.params || {};
     const threadId = params.threadId || params.thread_id || null;
-    const run = threadId ? server.threads.get(threadId) : null;
+    const own = threadId ? server.threads.get(threadId) : null;
+    // A sub-agent's thread has no run of its own: it works for the turn that
+    // spawned it, and that turn's chat is where its questions and progress go.
+    const owner = !own && threadId ? codexOwner(server, threadId) : null;
+    if (owner) return codexRouteChild(server, owner, threadId, m);
+    const run = own;
     if (m.method && m.id !== undefined) {
+      if (!run && threadId && !m.retried && APPROVAL_REQUESTS.has(m.method)) {
+        // A worker whose spawn this agent never saw (it started before a restart
+        // of the agent): ask the server whose it is before refusing it.
+        codexAdopt(server, threadId).then(() => codexRoute(server, { ...m, retried: true }));
+        return;
+      }
       if (!run || run.finishedAt) {
         codexWrite(server, { jsonrpc: '2.0', id: m.id, error: { code: -32000, message: 'No active Termdeck run for this thread' } });
         return;
       }
-      if (m.method === 'item/commandExecution/requestApproval' && params.itemId && params.command) run.execs.set(params.itemId, params.command);
+      if (m.method === 'item/commandExecution/requestApproval' && params.itemId) noteExec(run, params.itemId, params.command);
       codexApply(run, run.tr.request(m.method, params, m.id));
       return;
     }
     if (!m.method || !run || run.finishedAt) return;
+    if (m.method === 'turn/completed' && !run.partialKept && codexKeepPartial(server, run, m)) return;
     const item = params.item;
+    if (item && item.type === 'subAgentActivity' && typeof item.agentThreadId === 'string' && item.agentThreadId) {
+      codexLink(server, item.agentThreadId, threadId, run);
+    }
     if (item && item.type === 'commandExecution' && item.id) {
-      if (m.method === 'item/started' && item.command) run.execs.set(item.id, item.command);
+      // A unified exec (the code-mode `tools.exec_command`) keeps its item open until
+      // the process exits, past the call that started it, so this tracks the process.
+      if (m.method === 'item/started') noteExec(run, item.id, item.command);
       else if (m.method === 'item/completed') run.execs.delete(item.id);
     }
     codexApply(run, run.tr.notification(m.method, params));
@@ -564,9 +752,103 @@ function createRunRegistry(opts = {}) {
     }
   }
 
+  // Sub-agents (Codex's spawn_agent). Each worker is a thread of its own on this
+  // server, and the server says whose only on the parent's side: a
+  // subAgentActivity item naming the worker's thread, which arrives before the
+  // worker asks anything. A worker can spawn workers, so the owner is found by
+  // walking up to the thread a Termdeck run is serving.
+  // `run`, when given, is the turn that will hear about this worker: the first
+  // time it is linked its thread is read once for the name the chat knows it by.
+  function codexLink(server, child, parent, run = null) {
+    if (!child || !parent || child === parent) return;
+    const known = server.parents.has(child);
+    server.parents.delete(child);
+    server.parents.set(child, parent);
+    while (server.parents.size > CODEX_PARENTS_MAX) server.parents.delete(server.parents.keys().next().value);
+    if (!known && run) {
+      codexRequest(server, 'thread/read', { threadId: child }, cfg.codexRpcMs)
+        .then((res) => {
+          const t = (res && res.thread) || {};
+          if (run.finishedAt) return;
+          codexApply(run, run.tr.subagentMeta(child, { nickname: t.agentNickname || null, role: t.agentRole || null }));
+        })
+        .catch(() => {});
+    }
+  }
+
+  function codexOwner(server, threadId) {
+    let id = threadId;
+    for (let depth = 0; depth < 16; depth++) {
+      id = server.parents.get(id);
+      if (!id) return null;
+      const run = server.threads.get(id);
+      if (run) return run.finishedAt ? null : run;
+    }
+    return null;
+  }
+
+  // The worker's own record names its parent; read it once, when a worker this
+  // agent never saw spawn asks for something.
+  function codexAdopt(server, threadId) {
+    return codexRequest(server, 'thread/read', { threadId }, cfg.codexRpcMs)
+      .then((res) => {
+        const t = (res && res.thread) || {};
+        const spawn = t.source && t.source.subAgent && t.source.subAgent.thread_spawn;
+        const parent = t.parentThreadId || (spawn && spawn.parent_thread_id) || null;
+        codexLink(server, threadId, parent);
+        const run = codexOwner(server, threadId);
+        if (run) codexApply(run, run.tr.subagentMeta(threadId, { nickname: t.agentNickname || null, role: t.agentRole || null, agentPath: (spawn && spawn.agent_path) || null }));
+      })
+      .catch(() => {});
+  }
+
+  // One line from a worker's thread, for the run its owner is serving. Its
+  // approvals are the run's to answer; the rest is telemetry about the worker.
+  // Its commands are the run's to reap on Stop, and its turn the run's to stop.
+  function codexRouteChild(server, run, threadId, m) {
+    const params = m.params || {};
+    if (m.id !== undefined) {
+      if (m.method === 'item/commandExecution/requestApproval' && params.itemId) noteExec(run, params.itemId, params.command);
+      codexApply(run, run.tr.subagentRequest(threadId, m.method, params, m.id));
+      return;
+    }
+    const item = params.item;
+    if (item && item.type === 'subAgentActivity' && typeof item.agentThreadId === 'string' && item.agentThreadId) {
+      codexLink(server, item.agentThreadId, threadId, run);
+    }
+    if (item && item.type === 'commandExecution' && item.id) {
+      if (m.method === 'item/started') noteExec(run, item.id, item.command);
+      else if (m.method === 'item/completed') run.execs.delete(item.id);
+    }
+    if (!run.children) run.children = new Map();
+    if (m.method === 'turn/started' && params.turn && params.turn.id) run.children.set(threadId, params.turn.id);
+    if (m.method === 'turn/completed') run.children.delete(threadId);
+    codexApply(run, run.tr.subagentNotification(threadId, m.method, params));
+  }
+
+  // A stopped turn's half-written reply. Codex writes an agentMessage to the
+  // rollout only when the item completes, and an interrupted one never does, so
+  // the words the user watched arrive vanished on the next disk read and never
+  // came back (QA 2026-10-08, 5.1). thread/inject_items appends them to the
+  // thread's history the way Codex writes everything else, so the rollout stays
+  // the one source and the model sees what it had said. The turn's end waits
+  // for the answer, briefly, so the next turn cannot start in between.
+  function codexKeepPartial(server, run, m) {
+    run.partialKept = true;
+    const turn = (m.params && m.params.turn) || {};
+    if (!(run.abortRequested || turn.status === 'interrupted') || !run.threadId) return false;
+    const text = run.tr.unfinishedText ? run.tr.unfinishedText() : '';
+    if (!text) return false;
+    codexRequest(server, 'thread/inject_items', {
+      threadId: run.threadId,
+      items: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }],
+    }, cfg.codexInjectMs).catch(() => {}).then(() => codexRoute(server, m));
+    return true;
+  }
+
   function codexApply(run, r) {
     for (const w of r.writes) codexWrite(run.proc, w);
-    for (const e of r.events) push(run, e);
+    emitAll(run, r.events);
     if (r.ended) codexFinished(run);
   }
 
@@ -593,6 +875,10 @@ function createRunRegistry(opts = {}) {
     if (!turnId) return; // turn/started fires it (codexRoute), or prepare sees the flag first
     reapExecs(run);
     codexRequest(run.proc, 'turn/interrupt', { threadId: run.threadId, turnId }).catch(() => {});
+    // Its sub-agents are part of what Stop stops.
+    for (const [threadId, childTurn] of run.children || []) {
+      codexRequest(run.proc, 'turn/interrupt', { threadId, turnId: childTurn }).catch(() => {});
+    }
   }
 
   // Stop on a shared server ends the TURN, and the server lets the command it was
@@ -600,13 +886,30 @@ function createRunRegistry(opts = {}) {
   // by the command lines the engine reported, and nothing else under the server.
   // Taken before the interrupt goes out: the server's own item/completed for the
   // exec would otherwise empty the list first. See proc-tree.js reapCommands.
+  // Other turns on the same server pass what they have in flight as `others`, so
+  // the same script running in two chats is left alone rather than killed in both.
   function reapExecs(run) {
     if (!reapCommands || !run.execs || !run.execs.size) return;
     const pid = run.proc && run.proc.pid;
     if (!Number.isFinite(pid)) return;
-    const commands = [...run.execs.values()];
+    const commands = [...run.execs.values()].flat();
     run.execs.clear();
-    Promise.resolve().then(() => reapCommands(pid, commands)).catch(() => {});
+    const others = [];
+    for (const r of runs.values()) {
+      if (r !== run && r.proc === run.proc && !r.finishedAt && r.execs) others.push(...[...r.execs.values()].flat());
+    }
+    Promise.resolve().then(() => reapCommands(pid, commands, { others })).catch(() => {});
+  }
+
+  // One item can carry more than one command line: its approval and its start, or
+  // the several approvals of a zsh-exec-bridge item. Keep every one of them.
+  function noteExec(run, id, command) {
+    if (!id || !command || !run.execs) return;
+    const line = Array.isArray(command) ? command.join(' ') : String(command);
+    const seen = run.execs.get(id);
+    const list = Array.isArray(seen) ? seen : seen ? [seen] : [];
+    if (!list.includes(line)) list.push(line);
+    run.execs.set(id, list);
   }
 
   // spec: { runId?, exe, env, sessionId (a thread id, or null for a new chat), cwd,
@@ -630,7 +933,7 @@ function createRunRegistry(opts = {}) {
       shared: true,
       codex: true,
       threadId: sessionId,
-      execs: new Map(), // itemId -> command line of an exec in flight (reapExecs)
+      execs: new Map(), // itemId -> command lines of an exec in flight (noteExec, reapExecs)
       tr: taped(createCodexTranslator({ threadId: sessionId }), cfg.tapeDir, 'codex', runId, { threadId: sessionId }),
       log: createEventLog({ runId, sessionId, limit: cfg.logLimit, now }),
       subs: new Set(),
@@ -685,6 +988,28 @@ function createRunRegistry(opts = {}) {
       server.threads.set(threadId, run);
     }
     if (run.abortRequested) return codexFail(run, 'Stopped before the turn began');
+
+    // `/compact` (features/02 4.6c): the app-server's own compaction, not a
+    // prompt. It runs as a turn of its own (turn/started, a contextCompaction
+    // item, turn/completed), so the translator follows it like any other. A new
+    // chat has nothing to compact; the master only asks this of a resumed one.
+    if (spec.compact && spec.sessionId && threadId === spec.sessionId) {
+      codexApply(run, run.tr.bound(threadId, { cwd, transcriptPath }));
+      try {
+        await codexRequest(server, 'thread/compact/start', { threadId });
+      } catch (e) {
+        if (run.finishedAt) return undefined;
+        if (e && e.code === 'CODEX_RPC_TIMEOUT' && !run.tr.turnId) {
+          run.timers.startAck = timer(() => { if (!run.tr.turnId) codexFail(run, e.message); }, cfg.codexStartGraceMs);
+          return undefined;
+        }
+        if (!run.tr.turnId) {
+          const why = (e && e.message) || 'thread/compact/start failed';
+          return codexFail(run, /method not found|unknown (?:variant|method)/i.test(why) ? `This codex build cannot compact on request (${why}); update codex` : why);
+        }
+      }
+      return undefined;
+    }
 
     const params = { threadId, input: content };
     for (const k of ['approvalPolicy', 'sandboxPolicy', 'model', 'effort', 'summary']) {
@@ -754,7 +1079,25 @@ function createRunRegistry(opts = {}) {
     if (!spec.exe) throw refuse('codex is not installed on this machine', 'BAD_ENGINE');
     const server = codexServer(spec);
     await server.init;
-    const result = await codexRequest(server, method, params, Number(timeoutMs) || cfg.codexRpcMs);
+    let result = await codexRequest(server, method, params, Number(timeoutMs) || cfg.codexRpcMs);
+    // config/read is the whole of ~/.codex/config.toml, MCP server env values and
+    // bearer tokens included. The master asks it for one field (lib/codex-settings.js
+    // configuredEffort), so that field is all that leaves this machine.
+    if (method === 'config/read') {
+      const c = result && result.config;
+      result = { config: c && c.model_reasoning_effort != null ? { model_reasoning_effort: c.model_reasoning_effort } : {} };
+    }
+    // The Extensions section's health read (features/01-extensions). Each server
+    // row carries every tool's full schema, and the section wants a status and a
+    // count, so that is all that leaves the child.
+    if (method === 'mcpServerStatus/list') {
+      const data = result && Array.isArray(result.data) ? result.data : [];
+      result = { data: data.map((r) => ({
+        name: r && r.name, runtimeStatus: r && r.runtimeStatus != null ? r.runtimeStatus : null, pluginId: (r && r.pluginId) || null,
+        authStatus: (r && r.authStatus) || null, toolsError: r && r.toolsError ? String(r.toolsError.message || r.toolsError).slice(0, 400) : null,
+        tools: Object.fromEntries(Object.keys((r && r.tools) || {}).slice(0, 500).map((k) => [k, true])),
+      })) };
+    }
     return { result: result === undefined ? null : result, pid: server.pid };
   }
 
@@ -912,7 +1255,7 @@ function createRunRegistry(opts = {}) {
 
   function grokApply(run, r) {
     for (const w of r.writes) grokWrite(run.proc, w);
-    for (const e of r.events) push(run, e);
+    emitAll(run, r.events);
     if (r.ended) grokFinished(run);
   }
 
@@ -1147,6 +1490,11 @@ function createRunRegistry(opts = {}) {
     apply(run, run.tr.answer(requestId, decision));
   }
 
+  function armSteer(run) {
+    clearTimeout(run.timers.steer);
+    run.timers.steer = timer(() => apply(run, run.tr.expire()), cfg.steerMaxMs);
+  }
+
   function steer(runId, content) {
     const run = need(runId);
     if (run.codex) return codexSteer(run, content);
@@ -1157,8 +1505,7 @@ function createRunRegistry(opts = {}) {
     // (lib/claude-events.js agentCalls). The master queues on this code instead.
     if (run.tr.agentCallsInFlight) throw refuse('a sub-agent is running; the message waits for the turn', 'STEER_BUSY');
     run.tr.steer();
-    clearTimeout(run.timers.steer);
-    run.timers.steer = timer(() => apply(run, run.tr.expire()), cfg.steerMaxMs);
+    armSteer(run);
     write(run.proc, { type: 'user', priority: 'now', message: { role: 'user', content } });
   }
 
@@ -1193,6 +1540,18 @@ function createRunRegistry(opts = {}) {
     const run = need(runId);
     if (run.shared) return sharedInterrupt(run);
     run.tr.abort();
+    // A steer the CLI has not taken up yet is a queued turn, and an interrupt only
+    // closes the running one: the CLI then starts the queued message, which the
+    // browser has already put back in the composer, and the stop waited out the
+    // master's 10s fallback while it ran (bugs.md B13). There is no way to take a
+    // queued message back out of the CLI, so the CLI goes, as a stop would take
+    // it. The run finishes 'aborted' on its exit, and the next message resumes
+    // the session on a fresh CLI.
+    if (!run.finishedAt && run.proc.current === run && run.tr.steerPending) {
+      run.proc.held = false;
+      reap(run.proc);
+      return;
+    }
     write(run.proc, { type: 'control_request', request_id: rid(), request: { subtype: 'interrupt' } });
   }
 
@@ -1280,4 +1639,4 @@ function createRunRegistry(opts = {}) {
 
 const registry = createRunRegistry();
 
-module.exports = { createRunRegistry, registry, DEFAULTS, killTree };
+module.exports = { createRunRegistry, registry, DEFAULTS, killTree, cmdShimSpawn, checkClaudeArgs, checkFullAccess, fullAccessAllowed };

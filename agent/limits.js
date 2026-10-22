@@ -530,9 +530,15 @@ function codexAccount() {
 //
 // Params must be ABSENT, not {}: the method takes unit and a map is rejected
 // with "invalid type: map, expected unit" (measured, codex-cli 0.145.0).
-let codexExe = null; // injected by capabilities.js so the binary is resolved once
+// Injected by capabilities.js so there is one answer to "which codex". A path,
+// or a function returning one: the function form is how a Codex installed after
+// the agent started is seen here without a restart.
+let codexExeSource = null;
 function setCodexExe(exe) {
-  codexExe = exe || null;
+  codexExeSource = exe || null;
+}
+function currentCodexExe() {
+  return (typeof codexExeSource === 'function' ? codexExeSource() : codexExeSource) || null;
 }
 
 const RPC_TIMEOUT_MS = 20_000;
@@ -568,6 +574,7 @@ function accessTokenLiveFor() {
 // must be able to tell "it said no" from "we never reached it", because one of
 // those is safe to retry and the other spends a one-time grant.
 function codexRpc(method, params) {
+  const codexExe = currentCodexExe();
   if (!codexExe) return Promise.resolve({ ok: false, error: 'codex executable not found' });
   return new Promise((resolve) => {
     let child;

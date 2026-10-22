@@ -11,8 +11,8 @@ Claude Code, OpenAI Codex CLI and Grok: one fleet board, every device, tool appr
 
 <br />
 
-[![Commits](https://img.shields.io/badge/commits-2%2C580-e2611b?style=flat-square)](https://termdeck.io?ref=github)
-[![Deploys](https://img.shields.io/badge/production%20deploys-906-e2611b?style=flat-square)](https://termdeck.io?ref=github)
+[![Commits](https://img.shields.io/badge/commits-3%2C056-e2611b?style=flat-square)](https://termdeck.io?ref=github)
+[![Deploys](https://img.shields.io/badge/production%20deploys-1%2C013-e2611b?style=flat-square)](https://termdeck.io?ref=github)
 [![Invariants](https://img.shields.io/badge/documented%20invariants-53-3f9142?style=flat-square)](docs/INVARIANTS.md)
 [![Engines](https://img.shields.io/badge/engines-Claude%20%C2%B7%20Codex%20%C2%B7%20Grok-1f2937?style=flat-square)](#three-engines-one-ui)
 [![Agent license](https://img.shields.io/badge/agent-MIT-1f2937?style=flat-square)](LICENSE)
@@ -113,6 +113,14 @@ curl -fsSL https://termdeck.io/install.sh | TERMDECK_AGENT_TOKEN=agt_… sh
 $env:TERMDECK_AGENT_TOKEN="agt_…"; iwr https://termdeck.io/install.ps1 | iex
 ```
 
+Or with npm, the same install on any platform ([termdeck-agent](https://www.npmjs.com/package/termdeck-agent)):
+
+```bash
+npx termdeck-agent install --token agt_…
+```
+
+`npx termdeck-agent status`, `logs`, `repair` and `uninstall` cover the rest of the agent's life.
+
 **3.** Add a project folder. Its sessions are already there.
 
 macOS, Linux and Windows. The agent installs as a user service (`launchd` / `systemd --user` /
@@ -167,8 +175,8 @@ The second one is the whole list of what a machine will answer.
 
 <div align="center">
 
-**2,580** commits · **906** production deploys · **90** days
-**169k** lines · **611** test files · **53** invariants · **0** build steps
+**3,056** commits · **1,013** production deploys · **112** days
+**738** test files · **53** invariants · **0** build steps
 
 </div>
 
@@ -233,9 +241,10 @@ is what the permission rules are for.
 
 #### What does it cost?
 
-Starter is $9.99 a month for 2 machines, Pro is $29.99 for 10, both with unlimited sessions and the
-same features. Every account starts with a 14-day trial; a card is needed and the first charge is
-on day 15. You bring your own Claude / Codex / Grok subscription; Termdeck never resells inference.
+Starter is $9.99 a month for 1 machine, Pro is $19.99 for 10 machines with unlimited projects and
+saved logins, your whole usage history and a bigger terminal grid. Every account starts with a
+14-day trial of either; a card is needed and the first charge is on day 15. Details:
+[termdeck.io/docs/plans](https://termdeck.io/docs/plans?ref=github). You bring your own Claude / Codex / Grok subscription; Termdeck never resells inference.
 
 <br />
 
@@ -247,45 +256,22 @@ billing) is not open source.
 
 ```
 agent/                 the thin agent: root-confined capabilities, self-update, log redaction
-install.sh / .ps1      the one-liners the dashboard hands you
+install.sh / .ps1      the one-liners the dashboard hands you, as termdeck.io serves them
 deploy/                systemd / launchd / schtasks units, heal + uninstall scripts
 docs/ARCHITECTURE.md   how the pieces fit
 docs/INVARIANTS.md     53 load-bearing rules and the failure behind each one
 ```
 
-### Why some `agent/` files are one line
+### `agent/` is the installed agent
 
-Several modules in `agent/` are stubs that read:
+`agent/` holds exactly the files termdeck.io serves to an installing machine, laid out flat the way
+they land in `~/.termdeck/agent/`. Some of them (the transcript parsers, the session index, the
+disk primitives) are shared with the master, which runs the same modules: one copy of the rules,
+because two copies of a transcript parser drift and a drifted parser renders a chat differently
+depending on which side read it.
 
-```js
-module.exports = require('../lib/transcript');
-```
-
-They are placeholders, not the implementation. The transcript parsers and disk primitives
-are **shared between the master and the agent**, and the master distributes them to each
-machine at install and update time (an `AGENT_FILES` manifest), so an installed agent under
-`~/.termdeck/agent/` has the full modules sitting flat beside `agent.js`.
-
-There is one copy of those rules, on purpose. Two copies of a transcript parser drift, and
-a drifted parser is how you get a chat that renders differently depending on which side read
-it. The stub is what keeps a repo-run agent pointing at the same file rather than a fork of
-it.
-
-The practical consequence: **cloning this repo and running `node agent/agent.js` will not
-work**. Those requires have nothing to resolve to here. Install via the one-liner above,
-which fetches a complete agent. What is fully present in this repo is the agent's own code:
-
-| File | Lines | What it is |
-|---|---:|---|
-| [`agent/capabilities.js`](agent/capabilities.js) | 2,663 | the entire capability surface, the trust boundary |
-| [`agent/engine-runs.js`](agent/engine-runs.js) | 1,283 | runs each engine's turns on the machine, with a numbered event log |
-| [`agent/limits.js`](agent/limits.js) | 951 | rate-limit and usage reading |
-| [`agent/agent.js`](agent/agent.js) | 949 | dial-out, reconnect, self-update with rollback |
-| [`agent/agent-protocol.js`](agent/agent-protocol.js) | 487 | the frame table between the master and the agent |
-| [`agent/log.js`](agent/log.js) | 105 | bounded, rotated, token-redacted logging |
-
-If you are auditing what a Termdeck machine will do, `capabilities.js` is the file. Nothing
-outside it is reachable over the tunnel.
+Every release is signed offline ([`agent/update-signature.js`](agent/update-signature.js)), and an
+installed agent takes an update only when the signature and every file hash check out.
 
 <br />
 

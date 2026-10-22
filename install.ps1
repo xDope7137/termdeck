@@ -1,9 +1,9 @@
 # Termdeck agent installer — Windows (PowerShell). Downloads the thin agent, installs
 # its two deps, saves the token, and registers a logon task so it stays online.
 # Served by the master with the real origin baked in; run it as:
-#   $env:TERMDECK_AGENT_TOKEN="agt_..."; iwr __MASTER_URL__/install.ps1 | iex
+#   $env:TERMDECK_AGENT_TOKEN="agt_..."; iwr https://termdeck.io/install.ps1 | iex
 $ErrorActionPreference = "Stop"
-$Master = "__MASTER_URL__"
+$Master = "https://termdeck.io"
 
 Write-Host ""
 Write-Host "  Termdeck Agent Installer" -ForegroundColor Cyan
@@ -27,7 +27,7 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
 # install partway, which is how the removed worktrees.js/context-doc.js would have broken
 # every fallback install. tests/agent-manifest.mjs pins this list to AGENT_FILES.
 try { $Files = (Invoke-WebRequest -UseBasicParsing "$Master/download/agent/manifest.json").Content | ConvertFrom-Json } catch { $Files = $null }
-if (-not $Files) { $Files = @("agent.js","capabilities.js","agent-protocol.js","proc-tree.js","log.js","persistence.js","win-launcher.js","limits.js","usage.js","which.js","diff.js","mcp-config.js","accounts.js","codex-accounts.js","session-title.js","tail-read.js","checkpoints.js","index-head.js","session-index.js","session-settings.js","session-head.js","transcript.js","claude-data.js","pool.js","project-files.js","machine-config.js","command-catalog.js","usage-behaviour.js","codex-attachment.js","project-doc.js","upload-types.js","engine-events.js","claude-events.js","codex-events.js","grok-events.js","engine-runs.js","package.json") }
+if (-not $Files) { $Files = @("agent.js","capabilities.js","agent-protocol.js","proc-tree.js","log.js","persistence.js","win-launcher.js","limits.js","usage.js","which.js","diff.js","mcp-config.js","accounts.js","codex-accounts.js","session-title.js","tail-read.js","checkpoints.js","index-head.js","session-index.js","session-settings.js","session-head.js","transcript.js","claude-data.js","pool.js","project-files.js","machine-config.js","command-catalog.js","usage-behaviour.js","codex-attachment.js","project-doc.js","upload-types.js","engine-events.js","claude-events.js","codex-events.js","grok-events.js","engine-runs.js","live-output.js","instance-lock.js","update-signature.js","engine-install.js","extensions.js","extensions-claude.js","extensions-codex.js","extensions-grok.js","extensions-redact.js","toml-edit.js","json-edit.js","package.json") }
 
 # heal.ps1 drives this unattended — a repair that stops to ask is one nobody finishes.
 $readCode = if ($env:TERMDECK_NO_PROMPT) { "n" } else { Read-Host "Read the agent source before installing? [y/N]" }
@@ -71,6 +71,36 @@ foreach ($f in $Files) {
 Write-Host "==> Installing dependencies (ws, chokidar) ..." -ForegroundColor Cyan
 Push-Location $Dir
 try { & npm install --omit=dev --no-audit --no-fund --silent } finally { Pop-Location }
+
+# Stop the agent this install replaces, restart loop included. Register -Force
+# leaves a running task instance alone and IgnoreNew then ignores the Start, so a
+# re-install kept the OLD agent running; where the scheduler was unavailable the
+# fallback below started a second loop beside it, and two agents on one token take
+# turns being the connected one. The new agent would only stand by behind the old
+# one (agent/instance-lock.js), so the installer clears the way: the task, every
+# run.vbs / run.cmd loop for this folder with its node child, and the process the
+# lock file names, if it is a node running agent.js.
+try { Stop-ScheduledTask -TaskName "TermdeckAgent" -ErrorAction Stop } catch {}
+$stopped = @()
+try {
+  $procs = Get-CimInstance Win32_Process -ErrorAction Stop
+  $loops = $procs | Where-Object { $_.CommandLine -and $_.CommandLine -like "*$Dir\run.*" }
+  foreach ($p in $loops) { & taskkill /PID $p.ProcessId /T /F *>$null; $stopped += $p.ProcessId }
+  $LockFile = Join-Path $env:USERPROFILE ".termdeck\agent.lock"
+  if (Test-Path $LockFile) {
+    $lockPid = 0
+    try { $lockPid = [int](Get-Content -Raw $LockFile | ConvertFrom-Json).pid } catch {}
+    $holder = $procs | Where-Object { $_.ProcessId -eq $lockPid -and $_.Name -eq "node.exe" -and $_.CommandLine -like "*agent.js*" }
+    if ($holder) { & taskkill /PID $lockPid /T /F *>$null; $stopped += $lockPid }
+    Remove-Item -Force $LockFile -ErrorAction SilentlyContinue
+  }
+} catch {}
+if ($stopped.Count -gt 0) {
+  $LogDir = Join-Path $env:USERPROFILE ".termdeck\logs"
+  New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+  "stopped by the installer to start the new install" | Set-Content -Encoding ASCII -NoNewline (Join-Path $LogDir "last-exit")
+  Write-Host "==> Stopped the agent that was already running ..." -ForegroundColor Cyan
+}
 
 # A wrapper that sources the token env then runs the agent in a restart loop.
 $EnvCmd = Join-Path $env:USERPROFILE ".termdeck\agent.env.cmd"

@@ -21,6 +21,8 @@ EnvironmentFile=%h/.termdeck/agent.env
 ExecStart=/usr/bin/env node %h/Work/Ai/projects/termdeck/agent/agent.js
 Restart=always
 RestartSec=3
+# A chat's OOM-killed child must not stop the agent (deploy/install.sh says why).
+OOMPolicy=continue
 
 [Install]
 WantedBy=default.target
