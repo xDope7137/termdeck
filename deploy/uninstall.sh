@@ -2,7 +2,7 @@
 # Termdeck agent uninstaller — macOS + Linux. Reverses install.sh: stops whichever
 # service was registered, then deletes the agent files + token.
 # Served by the master with the real origin baked in; run it as:
-#   curl -fsSL __MASTER_URL__/uninstall.sh | sh
+#   curl -fsSL https://termdeck.io/uninstall.sh | sh
 set -e
 HOME_DIR="${TERMDECK_HOME:-$HOME/.termdeck}"
 DIR="$HOME_DIR/agent"

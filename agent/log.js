@@ -102,4 +102,4 @@ function tail(bytes = 64 * 1024) {
   return text;
 }
 
-module.exports = { info, warn, error, tail, noteExit, takeExitReason, isFirstRun, redact, LOG_FILE, LOG_DIR };
+module.exports = { info, warn, error, tail, noteExit, takeExitReason, isFirstRun, redact, LOG_FILE };

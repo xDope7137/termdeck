@@ -2,9 +2,9 @@
 # Termdeck agent installer — macOS + Linux. Downloads the thin agent, installs its
 # two deps, saves the token, and registers it to stay online across reboots.
 # Served by the master with the real origin baked in; run it as:
-#   curl -fsSL __MASTER_URL__/install.sh | TERMDECK_AGENT_TOKEN=agt_... sh
+#   curl -fsSL https://termdeck.io/install.sh | TERMDECK_AGENT_TOKEN=agt_... sh
 set -e
-MASTER="__MASTER_URL__"
+MASTER="https://termdeck.io"
 
 if [ -t 1 ]; then
   BOLD=$(printf '\033[1m'); CYAN=$(printf '\033[36m'); YELLOW=$(printf '\033[33m')
@@ -34,7 +34,7 @@ command -v curl >/dev/null 2>&1 || { echo "${RED}curl is required.${RESET}" >&2;
 # the 404, partway through, which is how the removed worktrees.js/context-doc.js would have
 # broken every fallback install. tests/agent-manifest.mjs pins this list to AGENT_FILES.
 FILES=$(curl -fsSL "$MASTER/download/agent/manifest.json" 2>/dev/null | tr -d '[]"[:space:]' | tr ',' ' ')
-[ -n "$FILES" ] || FILES="agent.js capabilities.js agent-protocol.js proc-tree.js log.js persistence.js win-launcher.js limits.js usage.js which.js diff.js mcp-config.js accounts.js codex-accounts.js session-title.js tail-read.js checkpoints.js index-head.js session-index.js session-settings.js session-head.js transcript.js claude-data.js pool.js project-files.js machine-config.js command-catalog.js usage-behaviour.js codex-attachment.js project-doc.js upload-types.js engine-events.js claude-events.js codex-events.js grok-events.js engine-runs.js package.json"
+[ -n "$FILES" ] || FILES="agent.js capabilities.js agent-protocol.js proc-tree.js log.js persistence.js win-launcher.js limits.js usage.js which.js diff.js mcp-config.js accounts.js codex-accounts.js session-title.js tail-read.js checkpoints.js index-head.js session-index.js session-settings.js session-head.js transcript.js claude-data.js pool.js project-files.js machine-config.js command-catalog.js usage-behaviour.js codex-attachment.js project-doc.js upload-types.js engine-events.js claude-events.js codex-events.js grok-events.js engine-runs.js live-output.js instance-lock.js update-signature.js engine-install.js extensions.js extensions-claude.js extensions-codex.js extensions-grok.js extensions-redact.js toml-edit.js json-edit.js package.json"
 
 # heal.sh drives this unattended (TERMDECK_NO_PROMPT=1) — a repair that stops to ask
 # a question is a repair nobody finishes.
@@ -84,10 +84,76 @@ echo "${CYAN}==> Installing dependencies (ws, chokidar) ...${RESET}"
 ( cd "$DIR" && npm install --omit=dev --no-audit --no-fund --silent )
 
 printf 'TERMDECK_AGENT_TOKEN=%s\nTERMDECK_MASTER_URL=%s\n' "$TERMDECK_AGENT_TOKEN" "$MASTER" > "$ENVFILE"
+# A home moved with TERMDECK_HOME has to be remembered, or the running agent (whose
+# supervisor does not carry the installer's shell) falls back to ~/.termdeck for its
+# log and state. The agent reads this file itself, so this covers launchd too.
+if [ -n "${TERMDECK_HOME:-}" ]; then
+  printf 'TERMDECK_HOME=%s\n' "$HOME_DIR" >> "$ENVFILE"
+fi
 chmod 600 "$ENVFILE"
 
-echo "${CYAN}==> Registering the background service ...${RESET}"
 OS="$(uname -s)"
+
+# Stop the agent this install is replacing. Re-running the install command on a
+# box with no service manager used to start a SECOND agent beside the first: both
+# dialled in on one token and took turns being the connected one. The new agent
+# would only stand by behind the old one (agent/instance-lock.js), so the
+# installer clears the way and the fresh install is the one that runs. Found
+# three ways, because older agents wrote no lock: the lock file, a command line
+# naming this agent.js, and (Linux) a `node agent.js` whose working directory is
+# this agent folder.
+is_this_agent() {
+  [ "$1" = "$$" ] && return 1
+  if [ -r "/proc/$1/cmdline" ]; then
+    C=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null)
+  else
+    C=$(ps -p "$1" -o command= 2>/dev/null)
+  fi
+  case "$C" in
+    *node*"$DIR/agent.js"*) return 0 ;;
+    *node*agent.js*)
+      [ "$1" = "$LOCK_PID" ] && return 0
+      [ "$(readlink "/proc/$1/cwd" 2>/dev/null)" = "$DIR" ] && return 0 ;;
+  esac
+  return 1
+}
+stop_running_agents() {
+  if [ "$OS" = "Linux" ] && command -v systemctl >/dev/null 2>&1 && systemctl --user cat termdeck-agent >/dev/null 2>&1; then
+    systemctl --user stop termdeck-agent >/dev/null 2>&1 || true
+  fi
+  if [ "$OS" = "Darwin" ] && [ -f "$HOME/Library/LaunchAgents/io.termdeck.agent.plist" ]; then
+    launchctl unload "$HOME/Library/LaunchAgents/io.termdeck.agent.plist" 2>/dev/null || true
+  fi
+  LOCK_PID=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$HOME_DIR/agent.lock" 2>/dev/null | head -n 1)
+  if [ -d /proc/self ]; then
+    CANDIDATES=$(cd /proc && ls -d [0-9]* 2>/dev/null)
+  else
+    CANDIDATES=$(ps -axo pid=,command= 2>/dev/null | awk -v d="$DIR/agent.js" 'index($0, d) { print $1 }')
+  fi
+  STOPPED=""
+  for P in $LOCK_PID $CANDIDATES; do
+    case " $STOPPED " in *" $P "*) continue ;; esac
+    is_this_agent "$P" || continue
+    kill "$P" 2>/dev/null && STOPPED="$STOPPED $P"
+  done
+  [ -n "$STOPPED" ] || return 0
+  mkdir -p "$HOME_DIR/logs"
+  printf 'stopped by the installer to start the new install' > "$HOME_DIR/logs/last-exit"
+  echo "${CYAN}==> Stopped the agent that was already running (process$STOPPED) ...${RESET}"
+  LEFT="$STOPPED"
+  for _ in 1 2 3 4 5; do
+    STILL=""
+    for P in $LEFT; do kill -0 "$P" 2>/dev/null && STILL="$STILL $P"; done
+    LEFT="$STILL"
+    [ -z "$LEFT" ] && break
+    sleep 1
+  done
+  for P in $LEFT; do kill -9 "$P" 2>/dev/null || true; done
+  rm -f "$HOME_DIR/agent.lock"
+}
+stop_running_agents
+
+echo "${CYAN}==> Registering the background service ...${RESET}"
 SERVICE_MSG=""
 SERVICE_HINT=""
 SERVICE_WARN=""
@@ -116,6 +182,10 @@ EnvironmentFile=$ENVFILE
 ExecStart=/usr/bin/env node $DIR/agent.js
 Restart=always
 RestartSec=3
+# A chat's child (a linter, a build) blowing up gets OOM-killed inside this unit's
+# cgroup. The default OOMPolicy=stop then takes the agent and every other running
+# chat down with it. continue: the kernel kills the runaway child, nothing else.
+OOMPolicy=continue
 
 [Install]
 WantedBy=default.target
@@ -189,7 +259,7 @@ else
   # in this file because nothing anywhere said so. Register a @reboot cron line
   # instead; if even that is unavailable, say plainly that it will not come back
   # (and the machine card says it too, so it survives this scrollback).
-  ( cd "$DIR" && TERMDECK_AGENT_TOKEN="$TERMDECK_AGENT_TOKEN" TERMDECK_MASTER_URL="$MASTER" nohup node agent.js >/dev/null 2>&1 & )
+  ( cd "$DIR" && TERMDECK_AGENT_TOKEN="$TERMDECK_AGENT_TOKEN" TERMDECK_MASTER_URL="$MASTER" nohup node "$DIR/agent.js" >/dev/null 2>&1 & )
   CRON_LINE="@reboot cd $DIR && env \$(cat $ENVFILE | xargs) node $DIR/agent.js >/dev/null 2>&1"
   if command -v crontab >/dev/null 2>&1 &&
      { crontab -l 2>/dev/null | grep -v '\.termdeck/agent/agent\.js'; echo "$CRON_LINE"; } | crontab - 2>/dev/null; then

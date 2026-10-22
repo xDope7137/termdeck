@@ -3,9 +3,9 @@
 # up. This is the escalation for what the agent cannot fix itself: a wedged scheduled
 # task, a node_modules npm left half-written, a rollback that ran out of road.
 # Served by the master with the real origin baked in; run it as:
-#   iwr __MASTER_URL__/heal.ps1 | iex
+#   iwr https://termdeck.io/heal.ps1 | iex
 $ErrorActionPreference = "Stop"
-$Master = "__MASTER_URL__"
+$Master = "https://termdeck.io"
 $Attempts = 3
 # Env seam so a test can exercise the retry loop without three real pauses.
 $RetrySecs = if ($env:TERMDECK_HEAL_RETRY_SECS) { [int]$env:TERMDECK_HEAL_RETRY_SECS } else { 5 }

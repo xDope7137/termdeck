@@ -143,4 +143,4 @@ function watch(log) {
   return t;
 }
 
-module.exports = { ensure, watch, runCmdText, runVbsText, RUN_CMD, RUN_VBS, REPAIR_LIMIT, CHECK_MS };
+module.exports = { ensure, watch, runCmdText, runVbsText, RUN_CMD, REPAIR_LIMIT, CHECK_MS };

@@ -20,6 +20,10 @@ it stays online across reboots.
 
     $env:TERMDECK_AGENT_TOKEN="agt_..."; iwr https://termdeck.io/install.ps1 | iex
 
+**Any platform, with npm**:
+
+    npx termdeck-agent install --token agt_...
+
 What it sets up:
 - **Linux**: systemd user service `termdeck-agent` (run `sudo loginctl enable-linger $USER` to keep it running after logout), or a `@reboot` cron entry where systemd user services are unavailable.
 - **macOS**: launchd agent `io.termdeck.agent` (`~/Library/LaunchAgents/`).
@@ -35,8 +39,9 @@ If you'd rather not pipe a script: install Node.js 18+, then
     done
     npm install --omit=dev
 
-The agent is about 35 files, and the list comes from `manifest.json` so a manual
-install never misses one.
+The agent is about 50 files, and the list comes from `manifest.json` so a manual
+install never misses one. Then start it:
+
     TERMDECK_AGENT_TOKEN=agt_... TERMDECK_MASTER_URL=https://termdeck.io node agent.js
 
 To keep it running, use the matching template in this folder:

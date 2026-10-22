@@ -4,9 +4,9 @@
 # This is the escalation for the cases the agent cannot fix itself: a wedged supervisor,
 # a node_modules that npm left half-written, a rollback that ran out of road.
 # Served by the master with the real origin baked in; run it as:
-#   curl -fsSL __MASTER_URL__/heal.sh | sh
+#   curl -fsSL https://termdeck.io/heal.sh | sh
 set -e
-MASTER="__MASTER_URL__"
+MASTER="https://termdeck.io"
 ATTEMPTS=3
 # Env seam so a test can exercise the retry loop without waiting out three real pauses
 # (same trick as TERMDECK_WHICH_MISS_TTL_MS in lib/which.js).

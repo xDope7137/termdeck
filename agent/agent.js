@@ -23,6 +23,52 @@ const { execSync } = require('child_process');
 const protocol = require('./agent-protocol');
 const { UPDATE_BOUNDS } = protocol;
 
+// The agent's own settings file, read by the agent itself. The docs tell an owner to put
+// a setting such as TERMDECK_FULL_ACCESS=off in agent.env and restart, and that used to
+// work only where the SUPERVISOR loaded the file: systemd's EnvironmentFile= did, but the
+// macOS launchd plist carries just the token and the master URL, so on a Mac the safety
+// switch and the TERMDECK_*_EXE overrides were silently ignored (QA 2026-10-08).
+// Reading it here makes the step mean the same thing on every supervisor, including
+// plists written by older installers.
+//
+// The process environment WINS: a key the supervisor already set is left alone, so
+// systemd and launchd keep whatever they pass, and only the missing keys are filled.
+// It sits above `require('./log')` because log.js reads TERMDECK_HOME at load. The file
+// is the one beside this agent's directory (install.sh puts agent.js in <home>/agent/),
+// or <TERMDECK_HOME>/agent.env when the supervisor names a home. Windows has no
+// agent.env (its launcher calls agent.env.cmd), so this is a no-op there.
+//
+// Kept free of `require` between the markers so tests/agent-env-file.mjs can lift it.
+// ── env-file:begin ──
+function parseEnvFile(text) {
+  const out = [];
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!m) continue;
+    let value = m[2];
+    const q = value[0];
+    if ((q === '"' || q === "'") && value.length >= 2 && value.endsWith(q)) value = value.slice(1, -1);
+    out.push([m[1], value]);
+  }
+  return out;
+}
+function applyEnvFile(text, env) {
+  const applied = [];
+  for (const [key, value] of parseEnvFile(text)) {
+    if (env[key] !== undefined) continue;
+    env[key] = value;
+    applied.push(key);
+  }
+  return applied;
+}
+// ── env-file:end ──
+try {
+  const envHome = process.env.TERMDECK_HOME || path.dirname(__dirname);
+  applyEnvFile(fs.readFileSync(path.join(envHome, 'agent.env'), 'utf8'), process.env);
+} catch { /* no agent.env (Windows, a dev checkout): the supervisor's env is the whole env */ }
+
 // Loaded here, above the heal block, because the most valuable thing this log ever
 // records is a failed update — and that happens before anything else is loaded. It
 // is also the one require up here that CANNOT be allowed to throw: falling back to
@@ -51,6 +97,12 @@ catch { log = { info: console.log, warn: console.warn, error: console.error, not
 // in a subdirectory and self-update rewrites only what is in there, so anything that has to
 // outlive an update and is not code belongs at this level rather than beside agent.js.
 // Hoisted here from further down the file, where it used to sit next to its only reader.
+// The bin folder of the Node running this agent, and the usual npm global bins,
+// go on PATH before anything resolves or spawns an engine. launchd starts us with
+// /usr/bin:/bin:/usr/sbin:/sbin, which hid every CLI Homebrew's npm installed and
+// left one that was found unable to run its `#!/usr/bin/env node` line.
+try { require('./engine-install').widenPath(); } catch {}
+
 const HOME_DIR = process.env.TERMDECK_HOME || path.join(os.homedir(), '.termdeck');
 const STATE_FILE = path.join(__dirname, '.update-state.json');
 const ROLLBACK_DIR = path.join(__dirname, '.rollback');
@@ -104,6 +156,27 @@ function undoUpdate(reason) {
   process.exit(1);
 }
 
+// One agent per install (agent/instance-lock.js). Taken before anything else
+// here touches shared state: a second agent that went on to count boots or undo
+// an update would be acting on the running agent's files. A newcomer stands by,
+// says so once, and starts the moment the running one stops. Guarded like
+// persistence below: an agent that self-updated from a manifest without this
+// file still boots, it just has no lock.
+let instanceLock; try { instanceLock = require('./instance-lock'); } catch { instanceLock = null; }
+const LOCK_FILE = instanceLock ? instanceLock.lockFile(HOME_DIR) : null;
+if (instanceLock) {
+  instanceLock.waitForLock(LOCK_FILE, { script: __filename }, {
+    onStandby: (holder) => log.warn(`Another Termdeck agent is already running for this install (process ${holder.pid}), so this one (process ${process.pid}) is standing by and will not connect. It takes over by itself if that one stops. To run this one instead, stop process ${holder.pid}, or re-run the install command, which replaces the running agent.`),
+  });
+  instanceLock.keep(LOCK_FILE, { script: __filename }, {
+    onLost: (holder) => {
+      log.warn(`Another Termdeck agent (process ${holder.pid}) now holds this install, so this one (process ${process.pid}) is stopping to leave exactly one connected.`);
+      log.noteExit('another agent took over this install');
+      process.exit(0);
+    },
+  });
+}
+
 // Boot watchdog #1: code that crash-loops never reaches the socket, so the only
 // place left to count is the boot itself.
 (function healOnBoot() {
@@ -114,9 +187,10 @@ function undoUpdate(reason) {
   writeJson(STATE_FILE, st);
 })();
 
-let WebSocket, makeCapabilities, ROOTS, ENGINES, VERSION;
+let WebSocket, makeCapabilities, ROOTS, ENGINES, VERSION, updateSignature;
 try {
   WebSocket = require('ws');
+  updateSignature = require('./update-signature');
   ({ makeCapabilities, ROOTS, ENGINES } = require('./capabilities'));
   // Single source of truth — package.json is one of the files self-update re-downloads
   // alongside this one, so a hardcoded copy here always drifts out of sync with it.
@@ -145,6 +219,9 @@ let winLauncher; try { winLauncher = require('./win-launcher'); } catch { winLau
   const why = log.takeExitReason();
   log.info(`--- Termdeck agent starting — version ${VERSION}, ${os.platform()} ${os.arch()}, Node ${process.versions.node} ---`);
   if (persistenceLib) log.info(persistenceLib.describe(PERSISTENCE));
+  if (persistenceLib && persistenceLib.ensureOomPolicy && persistenceLib.ensureOomPolicy({ state: PERSISTENCE }) === 'written') {
+    log.info('Set the service to survive a chat\'s command running out of memory (systemd OOMPolicy=continue).');
+  }
   if (first) log.info('First start on this machine after install.');
   else if (why) log.info(`Previous run stopped on purpose: ${why}.`);
   else log.warn('Previous run ended without stopping on purpose — the machine restarted, Termdeck was closed, or the agent crashed. It has been restarted automatically.');
@@ -157,6 +234,12 @@ let winLauncher; try { winLauncher = require('./win-launcher'); } catch { winLau
 }
 
 const TOKEN = process.env.TERMDECK_AGENT_TOKEN;
+// Out of the environment as soon as it is read: every engine, tool, shell and MCP server
+// this agent starts inherits process.env, and the token is the machine's identity on the
+// master (a prompt-injected `env | curl` would hand it over). Restarts get it back from
+// agent.env (through the supervisor, or the env-file read at the top of this file), never
+// from this process's environment.
+delete process.env.TERMDECK_AGENT_TOKEN;
 // The origin this machine was installed against. Written into ~/.termdeck/agent.env by
 // install.sh and never changed after, which makes it the one address that is always as good
 // as it was on the day someone set this machine up. Everything below treats it as the floor
@@ -206,11 +289,29 @@ const MASTER_HTTP = HOME_MASTER.replace(/^ws/, 'http'); // for the plain-HTTP /d
 // to dial has to outlive that.
 const WS_ORIGIN_FILE = path.join(HOME_DIR, '.ws-origin.json');
 
+// The machine token rides every dial as a bearer header, so an advertised origin can only
+// ever be one the install already trusted: TLS whenever home is TLS, and the same site as
+// home (its host, or a subdomain of home's registrable domain). Without this a master that
+// was compromised, or anything able to forge a welcome, could move the fleet's tokens to a
+// host of its choosing, permanently, since a welcome from there is what pins an origin.
+const HOME_URL = (() => { try { return new URL(HOME_MASTER); } catch { return null; } })();
+function sameSite(hostname) {
+  if (!HOME_URL) return false;
+  const home = HOME_URL.hostname.toLowerCase();
+  const h = String(hostname).toLowerCase();
+  if (h === home) return true;
+  // An IP or single-label home (dev) has no registrable domain to share.
+  if (/^[\d.]+$/.test(home) || home.includes(':') || !home.includes('.')) return false;
+  const site = home.split('.').slice(-2).join('.');
+  return h === site || h.endsWith(`.${site}`);
+}
 function cleanOrigin(raw) {
   if (!raw || typeof raw !== 'string') return null;
   try {
     const u = new URL(raw);
     if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return null;
+    if (u.protocol === 'ws:' && HOME_URL && HOME_URL.protocol === 'wss:') return null;
+    if (!sameSite(u.hostname)) return null;
     return `${u.protocol}//${u.host}`;
   } catch { return null; }
 }
@@ -252,7 +353,7 @@ process.on('unhandledRejection', (err) => {
 // capabilities.js. Refuses while a Termdeck-owned claude/codex turn is running so a live
 // session started by Termdeck isn't cut off. A terminal-held session can keep running:
 // the master passes force=true when it knows Termdeck itself does not own an active turn.
-const AGENT_FILES = ['agent.js', 'capabilities.js', 'agent-protocol.js', 'proc-tree.js', 'log.js', 'persistence.js', 'win-launcher.js', 'limits.js', 'usage.js', 'which.js', 'diff.js', 'mcp-config.js', 'accounts.js', 'codex-accounts.js', 'session-title.js', 'tail-read.js', 'checkpoints.js', 'index-head.js', 'session-index.js', 'session-settings.js', 'session-head.js', 'transcript.js', 'claude-data.js', 'pool.js', 'project-files.js', 'machine-config.js', 'command-catalog.js', 'usage-behaviour.js', 'codex-attachment.js', 'project-doc.js', 'upload-types.js', 'engine-events.js', 'claude-events.js', 'codex-events.js', 'grok-events.js', 'engine-runs.js', 'package.json'];
+const AGENT_FILES = ['agent.js', 'capabilities.js', 'agent-protocol.js', 'proc-tree.js', 'log.js', 'persistence.js', 'win-launcher.js', 'limits.js', 'usage.js', 'which.js', 'diff.js', 'mcp-config.js', 'accounts.js', 'codex-accounts.js', 'session-title.js', 'tail-read.js', 'checkpoints.js', 'index-head.js', 'session-index.js', 'session-settings.js', 'session-head.js', 'transcript.js', 'claude-data.js', 'pool.js', 'project-files.js', 'machine-config.js', 'command-catalog.js', 'usage-behaviour.js', 'codex-attachment.js', 'project-doc.js', 'upload-types.js', 'engine-events.js', 'claude-events.js', 'codex-events.js', 'grok-events.js', 'engine-runs.js', 'live-output.js', 'instance-lock.js', 'update-signature.js', 'engine-install.js', 'extensions.js', 'extensions-claude.js', 'extensions-codex.js', 'extensions-grok.js', 'extensions-redact.js', 'toml-edit.js', 'json-edit.js', 'package.json'];
 
 // Compile-check before anything is installed. A truncated download, an HTML error
 // page from the tunnel, a 200 with an empty body — all of them used to be written
@@ -484,19 +585,22 @@ async function installUpdate(ws, caps, req) {
     const deadline = Date.now() + UPDATE_DOWNLOAD_BUDGET_MS;
     const startedAt = Date.now();
 
-    // Pull the file list from the master, not our own baked-in AGENT_FILES: a stale agent's
-    // list can't name modules added after it shipped, so it would fetch a new capabilities.js
-    // without its new deps and crash-loop on require. Fall back to the local list if an older
-    // master has no manifest yet — and note the fallback is also what a TIMED-OUT manifest
-    // lands on, which is right: this agent's own list is a worse answer than the master's,
-    // but it is a far better one than failing the update outright.
-    let files = AGENT_FILES;
-    try {
-      const list = JSON.parse(await fetchUpdateFile(`${MASTER_HTTP}/download/agent/manifest.json`, deadline, 'manifest.json'));
-      if (Array.isArray(list) && list.length) files = list;
-    } catch (e) {
-      log.warn(`Could not read the file list from Termdeck (${e.message}) — using the list this version shipped with.`);
-    }
+    // The file list comes from the release signature, not our own baked-in AGENT_FILES:
+    // a stale agent's list can't name modules added after it shipped, so it would fetch
+    // a new capabilities.js without its new deps and crash-loop on require. The list,
+    // the hash of every file on it and the version are signed offline
+    // (agent/update-signature.js), so the master can deliver a release but cannot
+    // write one. No signature, a bad one, or an older version: nothing is installed.
+    // TERMDECK_AGENT_UPDATE_KEY replaces the pinned key; it is this machine's own
+    // setting, which the master has no way to reach.
+    const keys = process.env.TERMDECK_AGENT_UPDATE_KEY ? [process.env.TERMDECK_AGENT_UPDATE_KEY.trim()] : updateSignature.UPDATE_KEYS;
+    const signed = updateSignature.verifySigned(
+      JSON.parse(await fetchUpdateFile(`${MASTER_HTTP}/download/agent/signature.json`, deadline, 'signature.json')),
+      { keys, currentVersion: VERSION },
+    );
+    const files = Object.keys(signed.files);
+    if (!files.length || !files.includes('agent.js') || !files.includes('package.json')) throw new Error('the signed release is missing agent.js or package.json');
+    if (target && target !== signed.version) log.info(`Termdeck offered ${target}; the signed release it serves is ${signed.version}, which is what gets installed.`);
 
     // Stage + validate the WHOLE set before touching the running install. The old
     // loop wrote each file as it arrived, so a 502 on file 7 of 12 left a half-new
@@ -508,6 +612,7 @@ async function installUpdate(ws, caps, req) {
       // The list is the master's, but it lands in a path join — keep it a plain filename.
       if (!/^[\w-]+\.(js|json)$/.test(file)) throw new Error(`${file}: refusing odd filename`);
       const body = await fetchUpdateFile(`${MASTER_HTTP}/download/agent/${file}`, deadline, file);
+      updateSignature.checkBody(signed.files, file, body);
       validate(file, body);
       return body;
     });
@@ -614,6 +719,15 @@ const INDEX_PEEK_MS = Number(process.env.TERMDECK_AGENT_INDEX_PEEK_MS) || 1500;
 const AUTH_BACKOFF_MS = Number(process.env.TERMDECK_AGENT_AUTH_BACKOFF_MS) || 60_000;
 const AUTH_BACKOFF_MAX = AUTH_BACKOFF_MS * 30;
 let backoffMax = BACKOFF_MAX;
+// How long a dial may sit between connect and 'open'. The dead-link watchdog below only
+// starts on 'open', so before this existed an upgrade that was never answered left the
+// socket with no event to come: no 'open', 'error', 'close' or 'unexpected-response'.
+// Measured on 2026-10-05: a Windows agent redialled through a Cloudflare blip, the TCP
+// connect landed and the upgrade did not, and the process sat silent for two hours while
+// holding agent.lock, so the scheduled task could not start a replacement either. ws
+// turns this timeout into 'error' then 'close', which the handlers below already redial.
+const HANDSHAKE_MS = Number(process.env.TERMDECK_AGENT_HANDSHAKE_MS) || 15_000;
+const HANDSHAKE_TIMEOUT_MSG = 'Opening handshake has timed out'; // ws's own wording, lib/websocket.js
 
 function dial() {
   const ws = new WebSocket(MASTER + '/agent', {
@@ -621,7 +735,10 @@ function dial() {
     // Offer permessage-deflate so transcript/listTree frames compress on the wire.
     // threshold skips tiny control frames; master negotiates no-context-takeover.
     perMessageDeflate: { threshold: 1024 },
+    handshakeTimeout: HANDSHAKE_MS,
   });
+  // Set by 'error' so the 'close' that follows can say why, instead of a generic drop.
+  let handshakeTimedOut = false;
 
   // Returns whether the frame actually went out: a send into a closing socket is
   // a dropped frame, not an error.
@@ -805,6 +922,12 @@ function dial() {
       redial();
       return;
     }
+    // Never connected, so not "Disconnected": this attempt reached the network and got no answer.
+    if (handshakeTimedOut) {
+      log.warn(`Termdeck did not answer this connection attempt within ${Math.round(HANDSHAKE_MS / 1000)}s, usually a network or Cloudflare problem rather than this machine. Giving up on it and reconnecting in ${Math.round(backoff / 1000)}s.`);
+      redial();
+      return;
+    }
     // Codes worth naming, because they are the ones customers see and they mean
     // very different things: 1001/1006 is the network or Cloudflare dropping an
     // idle tunnel (routine, reconnects), 1000 is usually Termdeck restarting for
@@ -854,6 +977,8 @@ function dial() {
     // Not fatal on its own — a close always follows, and that line carries the
     // reconnect. Logged because a repeated one here is the tell for a proxy or
     // firewall between this machine and Termdeck.
+    // A handshake timeout is said once, by the close line, rather than twice.
+    if (e && e.message === HANDSHAKE_TIMEOUT_MSG) { handshakeTimedOut = true; return; }
     log.warn(`Connection problem: ${e.message}. Will keep retrying.`);
   });
 }
@@ -935,6 +1060,12 @@ try {
     fs.writeFileSync(noteAt, UNINSTALL_NOTE);
   }
 } catch { /* a note is never worth failing a boot over */ }
+
+// macOS: no idle sleep while a chat runs here (persistence.js keepAwake). Runs
+// live in the module-level registry, so this outlasts any one connection.
+try {
+  if (persistenceLib && persistenceLib.keepAwake) persistenceLib.keepAwake({ busy: () => require('./engine-runs').registry.busy() });
+} catch { /* sleeping is the old behaviour, never worth failing a boot over */ }
 
 dial();
 

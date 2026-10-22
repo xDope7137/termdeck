@@ -173,17 +173,58 @@ async function list(rootPid) {
 // sides drop every quote character and collapse whitespace before comparing. A
 // containment match covers an engine that names only the inner command, and it
 // needs 12 characters on the short side so `ls` can never match half the tree.
+//
+// The engine's wrapper is not always the one that runs (B38). Codex reports every
+// exec as a login shell, `/bin/bash -lc '<script>'`, but with a shell snapshot (the
+// GPT-6 code-mode path, `tools.exec_command`, and the user shell) it spawns
+// `/bin/bash -c <script>`: neither line contains the other, so the exec ran on. So
+// both sides also lose their shell wrapper (sh/bash/zsh -c, -lc, -l -c; PowerShell
+// -Command; cmd /c), and two wrapped commands with the same script are one exec. A
+// wrapped command also owns a process that IS its script: `bash -c 'sleep 60'`
+// execs sleep in place of itself.
 function normCommand(s) {
   return String(s || '').replace(/["'`]/g, '').replace(/\s+/g, ' ').trim();
 }
 
-function commandMatches(procCommand, wanted) {
-  const a = normCommand(procCommand);
-  const b = normCommand(wanted);
-  if (!a || !b) return false;
-  if (a === b) return true;
+// An optional path in front of the shell's name: POSIX, or a Windows one that may
+// hold spaces once its quotes are gone (C:\Program Files\PowerShell\7\pwsh.exe).
+const SHELL_PATH = String.raw`(?:[a-zA-Z]:\\(?:.*?\\)?|\S*[\\/])?`;
+const SHELL_WRAPPERS = [
+  new RegExp(String.raw`^${SHELL_PATH}(?:ba|z|da|k|fi|tc|c)?sh(?:\.exe)?\s+(?:-\S+\s+)*?-(?!-)[a-zA-Z]*c[a-zA-Z]*\s+(.+)$`),
+  new RegExp(String.raw`^${SHELL_PATH}(?:powershell|pwsh)(?:\.exe)?\s+(?:\S+\s+)*?-(?:c|command)\s+(.+)$`, 'i'),
+  new RegExp(String.raw`^${SHELL_PATH}cmd(?:\.exe)?\s+(?:\/\S+\s+)*?\/c\s+(.+)$`, 'i'),
+];
+
+// The script a shell wrapper runs, or null when the line is not one.
+function shellScript(normalized) {
+  for (const re of SHELL_WRAPPERS) {
+    const m = re.exec(normalized);
+    if (m && m[1].trim()) return m[1].trim();
+  }
+  return null;
+}
+
+function contains(a, b) {
   const [short, long] = a.length < b.length ? [a, b] : [b, a];
   return short.length >= 12 && long.includes(short);
+}
+
+// How surely a process is running `wanted`: 3 the same line, 2 the same script
+// under a shell wrapper the engine named, 1 one line holds the other, 0 not it.
+function matchScore(procCommand, wanted) {
+  const a = normCommand(procCommand);
+  const b = normCommand(wanted);
+  if (!a || !b) return 0;
+  if (a === b) return 3;
+  const sa = shellScript(a);
+  const sb = shellScript(b);
+  if (sb && (sa || a) === sb) return 2;
+  if (contains(a, b) || (sa && sb && contains(sa, sb))) return 1;
+  return 0;
+}
+
+function commandMatches(procCommand, wanted) {
+  return matchScore(procCommand, wanted) > 0;
 }
 
 // POSIX: the whole group first (a PTY-backed exec is a session leader, and its
@@ -205,18 +246,37 @@ function killPids(leader, pids, graceMs) {
 
 // Kill every descendant of rootPid whose command line is one of `commands`, with
 // its own subtree. Returns the pids matched (the top of each killed tree).
-async function reapCommands(rootPid, commands, { rows = null, graceMs = 1500, kill = killPids } = {}) {
-  const wanted = (commands || []).map((c) => (Array.isArray(c) ? c.join(' ') : String(c || ''))).filter((c) => c.trim());
+//
+// `others` are the commands other turns on the same server have in flight. A
+// process that fits one of those at least as well as ours is left alone: two
+// chats running the same script cannot be told apart by the process list, and
+// Stop in one must not kill the other's.
+async function reapCommands(rootPid, commands, { rows = null, graceMs = 1500, kill = killPids, others = [] } = {}) {
+  const lines = (list) => (list || []).map((c) => (Array.isArray(c) ? c.join(' ') : String(c || ''))).filter((c) => c.trim());
+  const wanted = lines(commands);
+  const theirs = lines(others);
   if (!wanted.length || typeof rootPid !== 'number' || !Number.isFinite(rootPid)) return [];
   const all = rows || await snapshot();
+  const best = (command, list) => list.reduce((n, w) => Math.max(n, matchScore(command, w)), 0);
+  const byPid = new Map(all.map((r) => [r.pid, r]));
+  const isShell = (r) => !!(r && shellScript(normCommand(r.command)));
   const covered = new Set();
   const matched = [];
   // descendants() is breadth-first, so a matching shell is seen before the
   // processes it started and takes them with it.
   for (const k of descendants(all, rootPid)) {
     if (covered.has(k.pid)) continue;
-    if (!wanted.some((w) => commandMatches(k.command, w))) continue;
     const tree = [k.pid, ...descendants(all, k.pid).map((d) => d.pid)];
+    let ours = best(k.command, wanted);
+    // Under a shell nobody matched, a process is a step of that shell's script
+    // (the `sleep 1` of another chat's loop), not an exec of its own: only its
+    // exact line counts.
+    if (ours && ours < 3 && k.ppid !== rootPid && isShell(byPid.get(k.ppid))) ours = 0;
+    if (!ours) continue;
+    if (theirs.length && best(k.command, theirs) >= ours) {
+      for (const pid of tree) covered.add(pid);
+      continue;
+    }
     for (const pid of tree) covered.add(pid);
     matched.push(k.pid);
     kill(k.pid, tree, graceMs);
@@ -224,4 +284,4 @@ async function reapCommands(rootPid, commands, { rows = null, graceMs = 1500, ki
   return matched;
 }
 
-module.exports = { list, descendants, snapshot, stdoutTarget, reapCommands, commandMatches };
+module.exports = { list, descendants, snapshot, reapCommands, commandMatches, matchScore };

@@ -136,4 +136,74 @@ function describe(state) {
   }
 }
 
-module.exports = { detect, describe, lingerEnabled, inferMode, MODES, MARKER_FILE };
+// macOS: keep the Mac from idle-sleeping while a chat is running on it.
+//
+// A Mac left alone mid-turn went to sleep, the agent froze, and the turn died as
+// "Machine disconnected". The master log shows the pattern on every Mac agent:
+// a connect during a Power Nap wake, then "no pong within 60s" exactly 90s
+// later, then nothing for an hour. `caffeinate -i` holds an idle-sleep
+// assertion, the same one a download in progress takes; `-w` ties it to this
+// agent's pid, so it can never outlive us. The display may still sleep, and
+// closing the lid still sleeps the Mac: that is the owner's call, not ours.
+// Released as soon as nothing is running, so an idle Mac sleeps as it always did.
+function keepAwake({ busy, platform = process.platform, spawnFn = require('child_process').spawn, every = 5000, setIntervalFn = setInterval, pid = process.pid } = {}) {
+  if (platform !== 'darwin') return { tick: () => {}, held: () => false, stop: () => {} };
+  let child = null;
+  let broken = false; // no caffeinate on this box: stop trying rather than spawn every tick
+  const release = () => { if (child) { try { child.kill(); } catch {} child = null; } };
+  function tick() {
+    let want = false;
+    try { want = busy() > 0; } catch {}
+    if (want && !child && !broken) {
+      try {
+        const c = spawnFn('/usr/bin/caffeinate', ['-i', '-w', String(pid)], { stdio: 'ignore' });
+        child = c;
+        c.on('error', () => { broken = true; if (child === c) child = null; });
+        c.on('exit', () => { if (child === c) child = null; });
+      } catch { broken = true; child = null; }
+    } else if (!want) {
+      release();
+    }
+  }
+  const timer = setIntervalFn(tick, every);
+  if (timer && timer.unref) timer.unref();
+  return { tick, held: () => !!child, stop: () => { clearInterval(timer); release(); } };
+}
+
+// Linux systemd user unit: a chat's OOM-killed child must not stop the agent.
+//
+// Everything a chat runs (claude, codex, their linters and builds) lives in this
+// unit's cgroup. With systemd's default OOMPolicy=stop, the kernel killing one
+// runaway child (tsgolint at 13 GB, on the owner's own box) fails the WHOLE unit:
+// the agent and every other running chat die with it, Restart=always brings it
+// back, the chat retries the same lint, and the machine crash-loops.
+// deploy/install.sh now writes OOMPolicy=continue into the unit; installs from
+// before that get it as a drop-in here, so nobody has to re-run the installer.
+// Only when /proc/self/cgroup proves we ARE termdeck-agent.service, so a
+// hand-rolled unit under another name is left alone.
+const UNIT_NAME = 'termdeck-agent.service';
+const OOM_DROP_IN = '# Written by the Termdeck agent (agent/persistence.js ensureOomPolicy).\n[Service]\nOOMPolicy=continue\n';
+function ensureOomPolicy({
+  state,
+  platform = process.platform,
+  configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+  readFile = (f) => fs.readFileSync(f, 'utf8'),
+  writeFile = (f, s) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, s); },
+  spawnFn = require('child_process').spawn,
+} = {}) {
+  if (platform !== 'linux' || !state || state.mode !== 'systemd-user') return 'skipped';
+  let cgroup = '';
+  try { cgroup = readFile('/proc/self/cgroup'); } catch { return 'skipped'; }
+  if (!cgroup.includes(`/${UNIT_NAME}`)) return 'skipped';
+  const file = path.join(configHome, 'systemd', 'user', `${UNIT_NAME}.d`, 'oom-policy.conf');
+  try { if (readFile(file) === OOM_DROP_IN) return 'present'; } catch {}
+  try { writeFile(file, OOM_DROP_IN); } catch { return 'failed'; }
+  // daemon-reload applies it to the running unit; no restart needed.
+  try {
+    const c = spawnFn('systemctl', ['--user', 'daemon-reload'], { stdio: 'ignore' });
+    if (c && c.on) c.on('error', () => {});
+  } catch {}
+  return 'written';
+}
+
+module.exports = { detect, describe, lingerEnabled, inferMode, MODES, keepAwake, ensureOomPolicy };

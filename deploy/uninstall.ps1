@@ -1,7 +1,7 @@
 # Termdeck agent uninstaller — Windows (PowerShell). Reverses install.ps1: removes the
 # logon task, kills the running agent, then deletes the agent files + token.
 # Served by the master; run it as:
-#   iwr __MASTER_URL__/uninstall.ps1 | iex
+#   iwr https://termdeck.io/uninstall.ps1 | iex
 $ErrorActionPreference = "Stop"
 $Dir = Join-Path $env:USERPROFILE ".termdeck\agent"
 $Task = "TermdeckAgent"
@@ -29,7 +29,7 @@ $Task = "TermdeckAgent"
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
   Write-Host "==> Re-launching elevated (needed to remove the scheduled task) — approve the UAC prompt..." -ForegroundColor Yellow
-  $master = "__MASTER_URL__"
+  $master = "https://termdeck.io"
   $relaunch = "iwr $master/uninstall.ps1 -UseBasicParsing | iex"
   # -Wait, so a caller (heal.ps1) learns what actually happened instead of being
   # told "done" while the elevated child is still deciding.

@@ -170,6 +170,9 @@ const TABLE = [
   // The background shells a transcript records, scanned where the file lives:
   // a few hundred bytes cross the tunnel where the whole file used to.
   { name: 'bgShellScan', timeoutMs: 30_000, codes: ['AGENT_OUTDATED'], note: "scanBackgroundShells over one transcript, run agent-side; also { runs }, how each background Agent run ended" },
+  // A Claude chat's subagent spend, per model, off its subagents/ transcripts,
+  // which the chat's own cumulativeUsage never counts.
+  { name: 'subagentUsage', timeoutMs: 10_000, codes: ['AGENT_OUTDATED'], note: "per-model token totals of one chat's subagents/agent-*.jsonl, tallied agent-side" },
 
   // -- watching -------------------------------------------------------------
   // Batch entries are [path, size, mtimeMs] since features/04 phase 4; an
@@ -233,6 +236,21 @@ const TABLE = [
   },
 
   // -- the machine itself ---------------------------------------------------
+  // Every MCP server, plugin and skill one engine is configured with, their
+  // connection health, and a switch for each (features/01-extensions). The master
+  // names the projects; the agent drops any that are not project-shaped. `toggle`
+  // writes one key of one named item and is refused outright when the machine
+  // owner set TERMDECK_CONFIG_READONLY. `health` runs `claude mcp list`, which
+  // connects to every server and can take most of two minutes.
+  {
+    name: 'extensions',
+    ops: ['list', 'health', 'toggle'],
+    defaultOp: 'list',
+    timeoutMs: 60_000,
+    opTimeoutMs: { health: 120_000 },
+    codes: ['AGENT_OUTDATED', 'CONFIG_READONLY', 'ENGINE_MISSING', 'UNKNOWN_ITEM', 'NOT_SUPPORTED', 'WRITE_FAILED', 'CLI_FAILED'],
+    note: "MCP servers, plugins and skills on this machine: list, health, and an on/off switch per item",
+  },
   { name: 'machineConfig', codes: ['AGENT_OUTDATED', 'CONFIG_FAILED'], note: "the engine's own configuration, read off that box" },
   { name: 'usageBehaviour', timeoutMs: 60_000, codes: ['AGENT_OUTDATED', 'USAGE_FAILED'], note: 'WHY the limit is being spent; walks a week of transcripts' },
   { name: 'usage', timeoutMs: 30_000, note: 'tokens and cost for #/usage; a cold scan of a big ~/.claude runs long' },
@@ -245,7 +263,7 @@ const TABLE = [
   { name: 'models', timeoutMs: 15_000, note: 'the model list, computed locally; 15s so a lapsed token can refresh first' },
   { name: 'cliStatus', timeoutMs: 30_000, note: 'is each CLI installed and signed in; three version probes plus a catalog check' },
   { name: 'agentLog', note: "the tail of the agent's own log, for the owner to read" },
-  { name: 'pidAliveMany', note: 'which of these pids are alive on that box, one frame for the whole set' },
+  { name: 'pidAliveMany', note: 'which of these pids are alive on that box, and which are CLIs this agent spawned' },
   { name: 'codexAttached', timeoutMs: 10_000, codes: ['AGENT_OUTDATED'], note: 'Codex threads held by a live local client; ids and holder pids only' },
   { name: 'cwdCheck', timeoutMs: 10_000, codes: ['BAD_CWD'], note: 'does this folder exist on that box' },
   { name: 'fsList', timeoutMs: 10_000, codes: ['BAD_CWD', 'FS_LIST_FAILED'], note: 'folder picker: directory names only, and the one read outside the roots' },
@@ -261,6 +279,13 @@ const TABLE = [
     opTimeoutMs: { usage: 30_000, preflight: 45_000, switch: 45_000 },
     codes: ['AGENT_OUTDATED'],
     note: 'which Claude login this box uses',
+  },
+  {
+    name: 'engineInstall',
+    timeoutMs: 15_000,
+    ops: ['start', 'status'],
+    codes: ['AGENT_OUTDATED', 'BAD_ENGINE', 'BUSY'],
+    note: "npm install -g of one engine's own package; the caller names the engine, never the package",
   },
   {
     name: 'codexAccounts',
@@ -337,15 +362,6 @@ const frame = (name) => BY_NAME.get(name) || null;
 // [0, 0, N] against an agent line that moved to 0.1.x long ago, so they gated
 // nothing at all and nobody could see it.
 const opNames = () => FRAMES.map((r) => r.name);
-
-// Every `t` the AGENT may send back. transport.js's onFrame must dispatch each of
-// these and nothing else: an unlisted arrival is binned, and a listed one with no
-// row behind it is a dead arm left by a rename.
-const replyTypes = () => {
-  const out = [];
-  for (const r of FRAMES) if (r.reply) out.push(r.reply);
-  return [...new Set(out)];
-};
 
 // How long the master waits on one frame, honouring a per-op override.
 function timeoutFor(name, op = null) {
@@ -481,7 +497,6 @@ module.exports = {
   DEFAULT_TIMEOUT_MS,
   frame,
   opNames,
-  replyTypes,
   timeoutFor,
   opAllowed,
 };
