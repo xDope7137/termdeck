@@ -4,6 +4,13 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.145x · 2026-10-23
+
+- **Stop all no longer leaves a chat stuck on "running"**: after stopping a background shell, the
+  next message runs instead of waiting in the queue.
+- **The file explorer opens cleanly on the first chat in a new folder** *(agent)*, instead of
+  briefly showing a request error.
+
 ## 0.1.137x · 2026-10-12/22
 
 - **`npx termdeck-agent`.** Install, check, repair or remove the agent with npm, the same way on
