@@ -1898,7 +1898,17 @@ function makeCapabilities(send, opts = {}) {
     // The string test first, before a single fs call. See validateRelPath.
     const v = projectFilesLib.validateRelPath(m.relPath);
     if (v.error) throw fail(v.error, v.code);
-    if (!(await confined(m.path))) throw fail('path not permitted');
+    if (!(await confined(m.path))) {
+      // The first chat in a new folder: the engine has not made the transcript's
+      // folder yet, so confined() cannot resolve its parent. Inside a root and
+      // simply absent is "not written yet", which the master answers with a 404
+      // the dock retries, not a refusal it turns into a 502 (bugs.md N7).
+      const lexical = path.resolve(m.path);
+      if (rootOf(lexical) && !(await fsp.lstat(lexical).catch(() => null))) {
+        throw fail('This chat has not written its transcript yet', 'ENOENT');
+      }
+      throw fail('path not permitted');
+    }
     const engine = engineOf(m);
     const cwd = await rootFromTranscript(m, engine);
     if (!cwd) throw fail('This chat has no project folder on disk yet', 'NO_CWD');
