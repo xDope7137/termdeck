@@ -4,6 +4,25 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.147x · 2026-10-24
+
+- **A Free plan.** Connect one machine with no card: one session at a time and 30 browser turns
+  a month. A cancelled plan moves to Free and keeps your machines, chats and rules.
+- **Settings, rebuilt.** One page with a searchable rail, in four groups: Preferences, Workspace,
+  Account and Data. New pages:
+  - **Profile**: your name and a year of activity as a heatmap, with streaks.
+  - **Security & login**: change your password, see every browser signed in and sign any of
+    them out.
+  - **Billing**: your plan, payments and promo codes. A cancelled plan can be resumed.
+  - **Keyboard shortcuts**: every key the app answers to.
+  - **Machines**: a list, with a page of its own for each machine.
+  - **Usage** and **Archived chats** now live in Settings too.
+- **Notifications per event**: choose the in-app toast and sound separately for each kind of
+  event, as push already allowed.
+- **A short connection blip no longer fails a background shell's turn.** The turn picks up where
+  it was instead of showing a false FAILED toast.
+- **Terminals keep their chats on a reconnect** instead of blanking every pane to "Loading…".
+
 ## 0.1.145x · 2026-10-23
 
 - **Stop all no longer leaves a chat stuck on "running"**: after stopping a background shell, the
