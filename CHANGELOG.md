@@ -4,6 +4,17 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.148x · 2026-10-26
+
+- **Answer the questions Codex asks while it keeps working** *(agent)*. Codex now asks most of its
+  questions without stopping. Each one appears in the chat as a **Codex asked** card: pick a
+  choice or type an answer, and it goes into the running turn, or starts a new one if Codex has
+  finished. You get a push and a bell alert for it as a question.
+- **Codex questions read back as questions.** Reading a chat back, a question Codex asked shows
+  the choices and the one you picked, or "not answered", instead of raw JSON.
+- **A Codex question on your phone is a question**, not an approval: it notifies under Questions
+  and plans, without Approve/Deny buttons.
+
 ## 0.1.147x · 2026-10-24
 
 - **A Free plan.** Connect one machine with no card: one session at a time and 30 browser turns
