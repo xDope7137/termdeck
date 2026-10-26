@@ -85,6 +85,10 @@ const TYPES = {
     'anchor?': 'object', 'likeRule?': 'object', 'turnRule?': 'string', 'toolUseId?': 'string',
   },
   'approval.resolved': { requestId: 'string', outcome: APPROVAL_OUTCOMES },
+  // A question the engine asked without stopping for it (Codex's
+  // request_user_input_async): nothing to answer here, the reply is a message.
+  // Carried so the person hears of it; questions are [{ question, options }].
+  'question.async': { callId: 'string', questions: 'array' },
 
   // Token counts as the engine reports them. costUsd is null for engines that only
   // expose tokens (Codex, Grok); consumers must not treat null as zero. `total` is

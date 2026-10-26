@@ -76,6 +76,28 @@ try {
 let log;
 try { log = require('./log'); }
 catch { log = { info: console.log, warn: console.warn, error: console.error, noteExit() {}, takeExitReason: () => null, isFirstRun: () => false }; }
+const describeError = log.describeError || ((e) => String((e && e.message) || e));
+
+// An unexpected stop, said plainly in the customer's own log, stack included: a
+// crash that leaves only "it restarted" behind cannot be fixed by anyone. Installed
+// this early so a throw anywhere below, a failed require included, is recorded too.
+// log.js redacts the token out of the whole line, the stack with it, and writes
+// synchronously, so the line is on disk before the exit.
+const stoppedUnexpectedly = (err) => {
+  try {
+    const stack = err && typeof err.stack === 'string' ? `\n${err.stack}` : '';
+    log.error(`Agent stopped unexpectedly: ${describeError(err)}. It will restart automatically in a few seconds.${stack}`);
+  } catch { /* exiting regardless */ }
+  process.exit(1);
+};
+process.on('uncaughtException', stoppedUnexpectedly);
+process.on('unhandledRejection', stoppedUnexpectedly);
+
+// What the previous run left in the log, read before this run writes its first
+// line: once it has, the newest line is this run's own and says nothing about how
+// the last one ended. Read again below if this run had to stand by for the lock.
+const firstRun = log.isFirstRun();
+let lastLine = log.lastEntry ? log.lastEntry() : null;
 
 // ---------------------------------------------------------------------------
 // Self-healing update. This block runs BEFORE every other require on purpose:
@@ -110,6 +132,28 @@ const STAGING_DIR = path.join(__dirname, '.staging');
 const QUARANTINE_FILE = path.join(__dirname, '.quarantine.json');
 const HEAL_MAX_BOOTS = 3;           // boots with an unconfirmed update before we undo it
 const HEAL_HANDSHAKE_MS = 5 * 60 * 1000; // ...or this long running without a welcome
+
+// Defensive, like capabilities.js's tail-read require: an agent that pulled this
+// agent.js from a manifest fetch that failed halfway has no persistence.js, and
+// reporting how it was started is never worth refusing to boot over.
+let persistenceLib; try { persistenceLib = require('./persistence'); } catch { persistenceLib = null; }
+
+// Only the copy at HOME_DIR/agent maintains the install (persistence.js installCopy).
+// One run from a repo checkout or a worktree still connects and serves, but never
+// writes launcher files, service drop-ins or a self-update into the directory it
+// runs from, and never dials on the installed agent's own machine token: the master
+// keeps one agent per token, so that dial turned the installed agent away for up to
+// half an hour at a time. Decided before the instance lock, so a refused copy has
+// touched nothing of the install's on the way out.
+const COPY = persistenceLib && persistenceLib.installCopy ? persistenceLib.installCopy({ home: HOME_DIR }) : { installed: true };
+if (!COPY.installed) {
+  const token = process.env.TERMDECK_AGENT_TOKEN;
+  if (token && process.env.TERMDECK_AGENT_DEV_TOKEN_OK !== '1' && persistenceLib.installedTokens({ homes: [HOME_DIR, path.join(os.homedir(), '.termdeck')] }).has(token)) {
+    log.error(`Not connecting: this agent is running from ${COPY.dir}, not the installed copy at ${COPY.installedDir}, and it was given the installed agent's machine token. Connecting would take this machine's place on Termdeck and turn the installed agent away. Give a development copy its own token from Add machine in the dashboard, or set TERMDECK_AGENT_DEV_TOKEN_OK=1 to do this on purpose.`);
+    process.exit(1);
+  }
+  log.warn(`Running from ${COPY.dir}, not the installed agent at ${COPY.installedDir}, so this is treated as a development or test run. It will not restore run.cmd or run.vbs, change the scheduled task or service, or install updates into ${COPY.dir}.`);
+}
 
 const readJson = (f, dflt) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return dflt; } };
 const writeJson = (f, v) => { try { fs.writeFileSync(f, JSON.stringify(v)); } catch {} };
@@ -165,9 +209,15 @@ function undoUpdate(reason) {
 let instanceLock; try { instanceLock = require('./instance-lock'); } catch { instanceLock = null; }
 const LOCK_FILE = instanceLock ? instanceLock.lockFile(HOME_DIR) : null;
 if (instanceLock) {
+  let stoodBy = false;
   instanceLock.waitForLock(LOCK_FILE, { script: __filename }, {
-    onStandby: (holder) => log.warn(`Another Termdeck agent is already running for this install (process ${holder.pid}), so this one (process ${process.pid}) is standing by and will not connect. It takes over by itself if that one stops. To run this one instead, stop process ${holder.pid}, or re-run the install command, which replaces the running agent.`),
+    onStandby: (holder) => {
+      stoodBy = true;
+      log.warn(`Another Termdeck agent is already running for this install (process ${holder.pid}), so this one (process ${process.pid}) is standing by and will not connect. It takes over by itself if that one stops. To run this one instead, stop process ${holder.pid}, or re-run the install command, which replaces the running agent.`);
+    },
   });
+  // The run that just let go of the lock is the previous one now.
+  if (stoodBy && log.lastEntry) lastLine = log.lastEntry();
   instanceLock.keep(LOCK_FILE, { script: __filename }, {
     onLost: (holder) => {
       log.warn(`Another Termdeck agent (process ${holder.pid}) now holds this install, so this one (process ${process.pid}) is stopping to leave exactly one connected.`);
@@ -203,10 +253,6 @@ try {
   throw e;
 }
 
-// Defensive, like capabilities.js's tail-read require: an agent that pulled this
-// agent.js from a manifest fetch that failed halfway has no persistence.js, and
-// reporting how it was started is never worth refusing to boot over.
-let persistenceLib; try { persistenceLib = require('./persistence'); } catch { persistenceLib = null; }
 const PERSISTENCE = persistenceLib ? persistenceLib.detect() : null;
 // The two Windows launcher files the scheduled task starts this agent through.
 // Guarded for the same reason as persistence above, and no-ops off Windows.
@@ -215,22 +261,29 @@ let winLauncher; try { winLauncher = require('./win-launcher'); } catch { winLau
 // The opening lines of every run: what is running, and what happened to the run
 // before it. "It restarted" on its own is the least useful thing a log can say.
 {
-  const first = log.isFirstRun();
+  const first = firstRun;
   const why = log.takeExitReason();
+  const end = !first && !why && log.previousRunEnd ? log.previousRunEnd({ last: lastLine }) : { kind: 'unknown' };
   log.info(`--- Termdeck agent starting — version ${VERSION}, ${os.platform()} ${os.arch()}, Node ${process.versions.node} ---`);
-  if (persistenceLib) log.info(persistenceLib.describe(PERSISTENCE));
-  if (persistenceLib && persistenceLib.ensureOomPolicy && persistenceLib.ensureOomPolicy({ state: PERSISTENCE }) === 'written') {
+  if (persistenceLib && COPY.installed) log.info(persistenceLib.describe(PERSISTENCE));
+  if (persistenceLib && COPY.installed && persistenceLib.ensureOomPolicy && persistenceLib.ensureOomPolicy({ state: PERSISTENCE }) === 'written') {
     log.info('Set the service to survive a chat\'s command running out of memory (systemd OOMPolicy=continue).');
   }
+  const at = (ms) => new Date(ms).toISOString();
   if (first) log.info('First start on this machine after install.');
   else if (why) log.info(`Previous run stopped on purpose: ${why}.`);
+  else if (end.kind === 'rebooted') log.info(`Previous run ended because the machine restarted: its last log line is from ${at(end.lastAt)} and the machine started at ${at(end.bootedAt)}.`);
+  else if (end.kind === 'crashed') log.warn(`Previous run crashed at ${at(end.lastAt)}; the error and its stack are on the "Agent stopped unexpectedly" line before this start. It has been restarted automatically.`);
+  else if (end.kind === 'died') log.warn(`Previous run died unexpectedly: its last log line is from ${at(end.lastAt)} and the machine has been up since ${at(end.bootedAt)}, so the agent was killed (logging out, Task Manager, a service stop) or crashed without logging why.${process.platform === 'win32' ? ' A Windows shutdown with Fast Startup on also reads this way.' : ''} It has been restarted automatically.`);
   else log.warn('Previous run ended without stopping on purpose — the machine restarted, Termdeck was closed, or the agent crashed. It has been restarted automatically.');
   // Windows only: put run.cmd / run.vbs back if they have gone. The scheduled
   // task starts this agent THROUGH them and retries every 2 minutes, and
   // wscript.exe answers a missing script with a modal dialog — so losing one is
   // not a silent failure, it is a message box on the customer's desktop 720
   // times a day. See agent/win-launcher.js.
-  if (winLauncher) winLauncher.watch(log);
+  // The installed copy only: run.cmd sources the real agent.env.cmd, so one
+  // written beside a checkout's agent.js is a launcher for the machine token.
+  if (winLauncher && COPY.installed) winLauncher.watch(log);
 }
 
 const TOKEN = process.env.TERMDECK_AGENT_TOKEN;
@@ -332,18 +385,6 @@ if (!TOKEN) { console.error('TERMDECK_AGENT_TOKEN is required'); process.exit(1)
 // Nothing is lost locally — all four of its call sites were paired with a
 // log.error/log.warn on the very next line, and agent/log.js is what the
 // customer hands us anyway (redacted, bounded, rotated).
-
-// An unexpected stop, said plainly and in the customer's own log — this is the
-// line that turns "it just died" into something reportable. The stack stays out
-// of it (internals are ours, not theirs); the message is enough to act on.
-process.on('uncaughtException', (err) => {
-  log.error(`Agent stopped unexpectedly: ${err && err.message}. It will restart automatically in a few seconds.`);
-  process.exit(1);
-});
-process.on('unhandledRejection', (err) => {
-  log.error(`Agent stopped unexpectedly: ${err && err.message}. It will restart automatically in a few seconds.`);
-  process.exit(1);
-});
 
 // Re-fetch our own 3 files from the master (same files install.sh already trusts and
 // downloaded), npm install, then exit — the OS-level supervisor that install.sh registered
@@ -566,6 +607,14 @@ async function installUpdate(ws, caps, req) {
     log.info(`Update postponed — a chat is running on this machine right now. It will be applied within ${Math.round(UPDATE_IDLE_RETRY_MS / 1000)}s of this machine going idle.`);
     retryUpdateWhenIdle(ws, caps, req);
     const error = 'busy: a Termdeck-held session is running on this machine';
+    ack(false, error);
+    return { ok: false, error };
+  }
+  // Not even with force: a self-update copies files over the directory it runs from,
+  // and for a copy that is not the installed one that is someone's checkout.
+  if (!COPY.installed) {
+    log.warn(`Update to ${target || 'a newer version'} not installed: this agent runs from ${COPY.dir}, not the installed copy, and an update would overwrite the files there.`);
+    const error = 'not the installed agent: running from a development copy';
     ack(false, error);
     return { ok: false, error };
   }
@@ -979,7 +1028,7 @@ function dial() {
     // firewall between this machine and Termdeck.
     // A handshake timeout is said once, by the close line, rather than twice.
     if (e && e.message === HANDSHAKE_TIMEOUT_MSG) { handshakeTimedOut = true; return; }
-    log.warn(`Connection problem: ${e.message}. Will keep retrying.`);
+    log.warn(`Connection problem: ${describeError(e)}. Will keep retrying.`);
   });
 }
 

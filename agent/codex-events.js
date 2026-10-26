@@ -523,6 +523,15 @@ function createCodexTranslator({ threadId = null } = {}) {
           }
           break;
         }
+        // A question Codex asked without stopping (request_user_input_async): it
+        // waits for nothing, so this is the only moment to tell the person.
+        if (item.type === 'agentMessage' && item.delivery === 'async' && Array.isArray(item.questions)) {
+          const questions = item.questions.slice(0, 10).map((q) => ({
+            question: String((q && q.title) || '').slice(0, 1000),
+            options: Array.isArray(q && q.options) ? q.options.slice(0, 12).map((o) => String(o).slice(0, 200)) : [],
+          })).filter((q) => q.question);
+          if (questions.length) events.push({ type: 'question.async', callId: String(item.id || ''), questions });
+        }
         const opened = itemBlocks.get(item.id);
         if (!opened) break;
         for (const idx of opened) {

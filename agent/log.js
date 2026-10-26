@@ -14,18 +14,30 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const util = require('util');
+
+// A test that never set TERMDECK_HOME used to land here on the real machine's log:
+// tests/agent-capability-watch.mjs throws "close blew up" on purpose, and 259 copies
+// of its stack trace sat in a real agent.log, shown in Settings, Machines, Logs. So
+// a test process with no home of its own gets no file at all, only stdout. `live`
+// is the one tier that runs against the real home on purpose (test.mjs).
+function isTestRun(env = process.env, execArgv = process.execArgv) {
+  if (env.TERMDECK_TEST_TIER === 'live') return false;
+  return env.NODE_ENV === 'test' || !!env.NODE_TEST_CONTEXT || !!env.TERMDECK_TEST_TIER || execArgv.includes('--test');
+}
+const DISK = !!process.env.TERMDECK_HOME || !isTestRun();
 
 const HOME_DIR = process.env.TERMDECK_HOME || path.join(os.homedir(), '.termdeck');
 const LOG_DIR = path.join(HOME_DIR, 'logs');
-const LOG_FILE = path.join(LOG_DIR, 'agent.log');
-const PREV_FILE = `${LOG_FILE}.1`;
+const LOG_FILE = DISK ? path.join(LOG_DIR, 'agent.log') : null;
+const PREV_FILE = DISK ? `${LOG_FILE}.1` : null;
 // One rotation, one old file. A log that eats the disk is worse than a short one,
 // and everything anyone has ever needed is near the end.
 const MAX_BYTES = 1024 * 1024;
 // The marker that turns "it restarted" into "it restarted BECAUSE". Written on a
 // deliberate exit, read and cleared on the next boot; its absence is itself the
 // answer (something killed us).
-const EXIT_FILE = path.join(LOG_DIR, 'last-exit');
+const EXIT_FILE = DISK ? path.join(LOG_DIR, 'last-exit') : null;
 
 const redact = (s) => String(s).replace(/agt_[A-Za-z0-9_-]+/g, 'agt_***');
 
@@ -39,7 +51,7 @@ function rotate() {
 
 function write(level, message) {
   const line = `${new Date().toISOString()}  ${level.padEnd(5)}  ${redact(message)}\n`;
-  try {
+  if (DISK) try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
     rotate();
     fs.appendFileSync(LOG_FILE, line);
@@ -55,11 +67,11 @@ const error = (m) => write('ERROR', m);
 
 // Has this machine ever logged anything? Distinguishes a first-ever start from a
 // restart with no exit marker, which otherwise reads as a crash.
-const isFirstRun = () => !fs.existsSync(LOG_FILE) && !fs.existsSync(PREV_FILE);
+const isFirstRun = () => DISK && !fs.existsSync(LOG_FILE) && !fs.existsSync(PREV_FILE);
 
 // Why we are about to stop. Written just before a deliberate exit.
 function noteExit(reason) {
-  try {
+  if (DISK) try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
     fs.writeFileSync(EXIT_FILE, String(reason));
   } catch {}
@@ -68,6 +80,7 @@ function noteExit(reason) {
 // ...and read back once, on the way up. Cleared so the NEXT unexplained restart
 // is reported as one.
 function takeExitReason() {
+  if (!DISK) return null;
   try {
     const reason = fs.readFileSync(EXIT_FILE, 'utf8').trim();
     fs.rmSync(EXIT_FILE, { force: true });
@@ -93,6 +106,7 @@ const readTail = (file, bytes) => {
 // rotated file when the current one is short — otherwise a rotation seconds before
 // someone asks would hand them an empty page.
 function tail(bytes = 64 * 1024) {
+  if (!DISK) return '';
   const cap = Math.max(1024, Math.min(bytes, 512 * 1024));
   let text = readTail(LOG_FILE, cap);
   if (text.length < cap) text = readTail(PREV_FILE, cap - text.length) + text;
@@ -102,4 +116,52 @@ function tail(bytes = 64 * 1024) {
   return text;
 }
 
-module.exports = { info, warn, error, tail, noteExit, takeExitReason, isFirstRun, redact, LOG_FILE };
+// A cause for any thrown value, never an empty string. "Connection problem: ." was a
+// real line, eight times in one log: Node's dual-stack connect fails with an
+// AggregateError whose message is empty, and plenty of socket errors carry only a
+// code. The message when there is one, then the inner errors, the code, the name,
+// and a short inspect as the last resort.
+function describeError(e) {
+  if (e === null || e === undefined) return 'unknown error';
+  if (typeof e !== 'object') return String(e).trim() || 'unknown error';
+  const message = String(e.message || '').trim();
+  const code = e.code ? String(e.code) : '';
+  if (message) return code && !message.includes(code) ? `${message} (${code})` : message;
+  const inner = Array.isArray(e.errors) ? [...new Set(e.errors.map(describeError))].join('; ') : '';
+  if (inner || code) return inner || code;
+  const name = String(e.name || '');
+  if (name && name !== 'Error') return name;
+  const own = Object.keys(e);
+  if (own.length) return `${name || 'Error'} ${util.inspect(Object.fromEntries(own.map((k) => [k, e[k]])), { depth: 1, breakLength: Infinity })}`.slice(0, 200);
+  return `${name || 'Error'} with no message`;
+}
+
+// The last line in the log that carries a timestamp. Stack-trace lines do not, so
+// this walks back past them to the line they belong to.
+function lastEntry(text = tail(16 * 1024)) {
+  const lines = String(text).split('\n');
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const m = lines[i].match(/^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+([A-Z]+)\s+(.*)$/);
+    if (m && Number.isFinite(Date.parse(m[1]))) return { at: Date.parse(m[1]), level: m[2], message: m[3] };
+  }
+  return null;
+}
+
+// Why the previous run ended, when it left no exit marker. About half of all starts
+// on one machine read "ended without stopping on purpose", which lumps a reboot in
+// with a crash. The previous run's last line against the OS boot time splits them:
+// a line from before the boot means the machine went down under it. A crash that got
+// as far as the handlers in agent.js leaves its own ERROR line, which says so outright.
+// Read it BEFORE this run writes anything, or the last line is our own.
+//
+// os.uptime() rather than asking WMI for LastBootUpTime: the same answer without a
+// process spawn on the boot path. Windows Fast Startup resumes the kernel instead of
+// booting it, so there a shutdown and power-on reads as the machine having stayed up;
+// the "died" wording says that.
+function previousRunEnd({ last = lastEntry(), bootedAt = Date.now() - os.uptime() * 1000 } = {}) {
+  if (!last) return { kind: 'unknown' };
+  if (last.level === 'ERROR' && /^Agent stopped unexpectedly/.test(last.message)) return { kind: 'crashed', lastAt: last.at, bootedAt };
+  return { kind: last.at < bootedAt ? 'rebooted' : 'died', lastAt: last.at, bootedAt };
+}
+
+module.exports = { info, warn, error, tail, noteExit, takeExitReason, isFirstRun, redact, describeError, lastEntry, previousRunEnd, isTestRun, LOG_FILE };

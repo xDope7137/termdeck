@@ -136,6 +136,39 @@ function describe(state) {
   }
 }
 
+// Is this the installed agent, or a copy started from somewhere else: a repo
+// checkout, a worktree, a test? Only <home>/agent is what the installer registered.
+// A Windows agent run from C:\...\termdeck-v2\.claude\worktrees\p00-m0\agent wrote
+// run.cmd and run.vbs into that worktree, and its run.cmd sources the real
+// agent.env.cmd, so anything that ran it put a second agent on the machine token.
+// agent.js keeps every install-maintenance step to the copy this says is installed.
+function installCopy({ dir = __dirname, home = HOME_DIR, platform = process.platform } = {}) {
+  const P = platform === 'win32' ? path.win32 : path;
+  const norm = (p) => {
+    let r = P.resolve(p);
+    try { r = fs.realpathSync(r); } catch { /* not there: compare as given */ }
+    return platform === 'win32' ? r.toLowerCase() : r;
+  };
+  const installedDir = P.join(home, 'agent');
+  return { installed: norm(dir) === norm(installedDir), dir, installedDir };
+}
+
+// The machine tokens the installed agent runs on, read from the files the installers
+// write: agent.env (install.sh) and agent.env.cmd (install.ps1). A copy that is not
+// the installed one and dials with one of these takes the machine's single slot on
+// the master, which turns the installed agent away for up to half an hour per try.
+function installedTokens({ homes = [HOME_DIR, path.join(os.homedir(), '.termdeck')], readFile = (f) => fs.readFileSync(f, 'utf8') } = {}) {
+  const out = new Set();
+  for (const home of new Set(homes)) {
+    for (const name of ['agent.env', 'agent.env.cmd']) {
+      let text;
+      try { text = readFile(path.join(home, name)); } catch { continue; }
+      for (const m of String(text).matchAll(/TERMDECK_AGENT_TOKEN=["']?(agt_[A-Za-z0-9_-]+)/g)) out.add(m[1]);
+    }
+  }
+  return out;
+}
+
 // macOS: keep the Mac from idle-sleeping while a chat is running on it.
 //
 // A Mac left alone mid-turn went to sleep, the agent froze, and the turn died as
@@ -206,4 +239,4 @@ function ensureOomPolicy({
   return 'written';
 }
 
-module.exports = { detect, describe, lingerEnabled, inferMode, MODES, keepAwake, ensureOomPolicy };
+module.exports = { detect, describe, lingerEnabled, inferMode, MODES, keepAwake, ensureOomPolicy, installCopy, installedTokens };

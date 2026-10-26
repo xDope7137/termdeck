@@ -509,14 +509,81 @@ function questionsOf(input) {
       const label = o && typeof o === 'object' ? o.label : o;
       return String(label == null ? '' : label).slice(0, 200);
     }).filter(Boolean) : [];
-    return {
+    const item = {
       question: String(src.question || src.header || '').slice(0, 1000),
       header: typeof src.header === 'string' ? src.header.slice(0, 100) : '',
       options,
       multiSelect: !!src.multiSelect,
     };
+    // Codex answers by question id, not by the question's text.
+    if (typeof src.id === 'string' && src.id) item.id = src.id.slice(0, 200);
+    return item;
   }).filter((q) => q.question);
   return out.length ? out : null;
+}
+
+// Codex's request_user_input output, {"answers":{"<id>":{"answers":["Blue"]}}},
+// as the { id: answer } map the viewer marks picks from. `{}` when the question
+// went unanswered ("Don't answer" replies with no answers); null for any other
+// output, so a tool that merely returned JSON is never taken for one.
+function codexAnswersOf(text) {
+  if (typeof text !== 'string' || !text.startsWith('{"answers"')) return null;
+  let o;
+  try { o = JSON.parse(text); } catch { return null; }
+  const a = o && typeof o === 'object' && Object.keys(o).length === 1 ? o.answers : null;
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return null;
+  const out = {};
+  let n = 0;
+  for (const [id, v] of Object.entries(a)) {
+    if (!v || typeof v !== 'object' || !Array.isArray(v.answers)) return null;
+    if (n >= ANSWERS_MAX || id === '__proto__') continue;
+    out[id.slice(0, ANSWER_TEXT_MAX)] = v.answers.map(String).join(', ').slice(0, ANSWER_TEXT_MAX);
+    n += 1;
+  }
+  return out;
+}
+
+// Codex's request_user_input_async, {"questions":[{"title":"...","options":["A","B"]}]}:
+// a question it asks and keeps working past. The id is the question's index,
+// which is what the reply names it by (asyncReplyOf).
+function asyncQuestionsOf(input) {
+  const qs = input && typeof input === 'object' && Array.isArray(input.questions) ? input.questions : null;
+  if (!qs) return null;
+  const out = [];
+  qs.slice(0, QUESTIONS_MAX).forEach((src, i) => {
+    const title = src && typeof src === 'object' ? src.title : null;
+    if (typeof title !== 'string' || !title.trim()) return;
+    const options = Array.isArray(src.options) ? src.options.slice(0, OPTIONS_MAX).map((o) => String(o == null ? '' : o).slice(0, 200)).filter(Boolean) : [];
+    out.push({ id: String(i), question: title.slice(0, 1000), header: '', options, multiSelect: false });
+  });
+  return out.length ? out : null;
+}
+
+// The answer to one, as the Codex app sends it: a user message of
+//   <send_user_message_question_reply>
+//   [{"answer":"A","question":"...","questionItemId":"[\"request_user_input_async\",\"call_x\",0]"}]
+//   </send_user_message_question_reply>
+// read as { kind: 'question-reply', answers: [{ callId, index, question, answer }] }.
+const ASYNC_REPLY_RE = /^\s*<send_user_message_question_reply>\s*([\s\S]*?)\s*<\/send_user_message_question_reply>\s*$/;
+function asyncReplyOf(text) {
+  const m = ASYNC_REPLY_RE.exec(text);
+  if (!m) return null;
+  let list;
+  try { list = JSON.parse(m[1]); } catch { return null; }
+  if (!Array.isArray(list)) return null;
+  const answers = [];
+  for (const a of list.slice(0, QUESTIONS_MAX)) {
+    if (!a || typeof a !== 'object' || typeof a.answer !== 'string') continue;
+    let ref = null;
+    try { ref = JSON.parse(a.questionItemId); } catch {}
+    answers.push({
+      callId: Array.isArray(ref) && typeof ref[1] === 'string' ? ref[1] : null,
+      index: Array.isArray(ref) && Number.isInteger(ref[2]) ? ref[2] : null,
+      question: typeof a.question === 'string' ? a.question.slice(0, 1000) : '',
+      answer: a.answer.slice(0, ANSWER_TEXT_MAX),
+    });
+  }
+  return answers.length ? { kind: 'question-reply', answers } : null;
 }
 
 function assistantBlocks(content) {
@@ -2883,6 +2950,9 @@ function rolloutToMessage(rec, turnId, agents = null) {
       const text = rolloutContentText(p.content);
       if (!text.trim()) return null;
       if (p.role === 'user') {
+        // Ahead of the synthetic check, which takes any tag-shaped text for the CLI's.
+        const reply = asyncReplyOf(text);
+        if (reply) return { ...base, role: 'user', messageId: null, blocks: [reply] };
         if (isSyntheticUserText(text)) return null;
         return { ...base, role: 'user', messageId: null, blocks: promptTextBlocks(text) };
       }
@@ -2918,6 +2988,12 @@ function rolloutToMessage(rec, turnId, agents = null) {
       // Codex the checklist rendering, the pinned strip above the composer and
       // the terminals-canvas strip, none of which know about engines. Without
       // this it rendered as a raw JSON fold like any other tool call.
+      // A question Codex asks without stopping: a card in the chat, answered by
+      // a later message (asyncReplyOf), not a tool row.
+      if (p.name === 'request_user_input_async') {
+        const questions = asyncQuestionsOf(input);
+        if (questions) return { ...base, blocks: [{ kind: 'question', id: p.call_id || null, questions }] };
+      }
       const plan = p.name === 'update_plan' && input && typeof input === 'object' ? input.plan : null;
       // An empty or unreadable plan falls through to the normal tool rendering
       // rather than painting an empty checklist.
@@ -2982,6 +3058,15 @@ function rolloutToMessage(rec, turnId, agents = null) {
         inputJson: body.text,
         truncated: body.truncated,
       };
+      // Codex's AskUserQuestion: the same questions block, so the viewer draws
+      // the questions instead of their JSON.
+      if (name === 'request_user_input') {
+        const questions = questionsOf(input);
+        if (questions) {
+          block.questions = questions;
+          block.inputPreview = questions.length === 1 ? questions[0].question.slice(0, PREVIEW_MAX) : `${questions.length} questions`;
+        }
+      }
       if (row && row.verb) block.verb = row.verb;
       if (row && row.pollOf) block.pollOf = row.pollOf;
       if (row && row.diff) {
@@ -3008,6 +3093,7 @@ function rolloutToMessage(rec, turnId, agents = null) {
       const body = truncate(stripAnsi(raw), TOOL_RESULT_MAX);
       const ansi = ansiSibling(raw, body.text, TOOL_RESULT_MAX);
       const images = codexImages(p.output);
+      const answers = isError ? null : codexAnswersOf(out.text);
       return {
         ...base,
         blocks: [{
@@ -3025,6 +3111,7 @@ function rolloutToMessage(rec, turnId, agents = null) {
           ...(said && said.rowVerb ? { rowVerb: said.rowVerb } : {}),
           ...(said && said.rowDescription ? { rowDescription: said.rowDescription } : {}),
           ...(said && said.agent ? { agent: said.agent } : {}),
+          ...(answers ? { answers } : {}),
           truncated: body.truncated,
         }],
       };
