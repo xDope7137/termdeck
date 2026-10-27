@@ -1,0 +1,81 @@
+/* ============================================================
+   Termdeck - New chat page theme ("Graphite")
+
+   The New chat page (#/new) runs its own theme, on purpose and on the
+   owner's request: a true-neutral graphite canvas, one floating composer
+   card, white primary action, and a soft ambient glow tinted by the engine
+   the draft will run on (Claude, Codex or Grok). Everything the page paints
+   spends these --nx-* values. Every chat's composer and the sidebar spend
+   them too; the rest of the workspace keeps its own palette for now.
+
+   Declared on :root (not under body.nc-page) because the popovers the page
+   opens are appended to <body> and have to resolve the same values, and a
+   composite like --nx-ring must compute where its parts are declared.
+   ============================================================ */
+
+:root {
+  /* Surfaces, darkest to lightest. */
+  --nx-bg: #09090b;
+  --nx-surface: #131316;
+  --nx-surface-2: #1a1a1e;
+  --nx-surface-hover: #222228;
+  --nx-surface-press: #2a2a31;
+
+  /* Hairlines. */
+  --nx-line: rgba(255, 255, 255, 0.07);
+  --nx-line-strong: rgba(255, 255, 255, 0.13);
+  --nx-line-focus: rgba(255, 255, 255, 0.28);
+
+  /* Text. */
+  --nx-text: #f4f4f5;
+  --nx-muted: #a1a1aa;
+  --nx-faint: #71717a;
+  /* The quietest tier small text may take: 4.6:1 on --nx-surface-hover and
+     better on everything darker. --nx-faint is 4.1:1 on --nx-bg, so it is
+     for glyphs, placeholders and large type only. */
+  --nx-subtle: #8a8a93;
+
+  /* The one filled action on the page. */
+  --nx-primary: #fafafa;
+  --nx-primary-fg: #09090b;
+  --nx-primary-off: #2a2a31;
+  --nx-primary-off-fg: #71717a;
+
+  /* States. */
+  --nx-online: #34d399;
+  --nx-warn: #fbbf24;
+  --nx-danger: #f87171;
+  --nx-plan: #a5b4fc;
+  --nx-plan-bg: rgba(165, 180, 252, 0.10);
+  --nx-online-ring: rgba(52, 211, 153, 0.18);
+  --nx-warn-bg: rgba(251, 191, 36, 0.07);
+  --nx-warn-line: rgba(251, 191, 36, 0.26);
+  --nx-danger-bg: rgba(248, 113, 113, 0.08);
+
+  /* Engine identity, as RGB triples so the glow can take any alpha. */
+  --nx-glow-claude: 217, 119, 87;
+  --nx-glow-codex: 110, 168, 254;
+  --nx-glow-grok: 200, 200, 210;
+  --nx-glow: var(--nx-glow-claude);
+
+  /* Shape. */
+  --nx-radius-card: 22px;
+  --nx-radius-menu: 16px;
+  --nx-radius-chip: 999px;
+  --nx-radius-row: 10px;
+  --nx-radius-list: 14px;
+  --nx-radius-sheet: 20px;
+
+  /* Depth. */
+  --nx-shadow-card:
+    0 1px 0 0 rgba(255, 255, 255, 0.05) inset,
+    0 24px 64px -24px rgba(0, 0, 0, 0.75),
+    0 8px 24px -12px rgba(0, 0, 0, 0.5);
+  --nx-shadow-menu:
+    0 1px 0 0 rgba(255, 255, 255, 0.05) inset,
+    0 24px 48px -12px rgba(0, 0, 0, 0.7);
+  --nx-ring: 0 0 0 4px rgba(255, 255, 255, 0.06);
+
+  /* Column. */
+  --nx-col: 760px;
+}

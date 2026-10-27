@@ -1,0 +1,482 @@
+/* ============================================================
+   Termdeck - Color tokens
+
+   The workspace palette is Termdeck's own cool midnight system. Blue-charcoal
+   surfaces keep long coding sessions calm while clear luminance steps separate
+   the navigation well, canvas, cards, controls, and hover states. The slight
+   cool cast belongs to the environment; saturated colour still names a state
+   or identity, as required by DESIGN.md.
+
+   Green is the product thread: mint marks focus and selection, while a stronger
+   green marks live state and primary action. Amber means work in flight, coral
+   means attention or danger, blue means tools and information, and violet means
+   a question. Each semantic hue has a text-strength partner where needed.
+
+   Contrast is a floor, not a visual aspiration. tests/contrast-tokens.mjs checks
+   every text tier on every surface in both themes, the info badge on its own
+   tint, the primary pairing, and control edges. Values below are therefore a
+   coordinated palette rather than isolated picks.
+
+   The ember / gold / rose ramp below is the first-generation warm palette.
+   Nothing paints from it directly any more; it survives only because the
+   dashboard remap further down re-points those names at the neutral ramp for
+   component CSS that still spells them.
+   ============================================================ */
+
+:root {
+  /* --- Brand: Ember (primary, warm orange) ------------------ */
+  --ember-50:  #fdf3ec;
+  --ember-100: #fbe2d0;
+  --ember-200: #f6c39c;
+  --ember-300: #f0a068;
+  --ember-400: #ea7f3c;
+  --ember-500: #e2611b; /* primary */
+  --ember-600: #c64f14;
+  --ember-700: #a23e14;
+  --ember-800: #813317;
+  --ember-900: #692b17;
+  --ember-950: #3a1408;
+
+  /* --- Accent: Gold (gradient head / highlights) ------------ */
+  --gold-100: #fdefcb;
+  --gold-300: #f6cd63;
+  --gold-400: #efb42d;
+  --gold-500: #d9970a;
+
+  /* --- Accent: Rose (gradient tail / secondary emphasis) ---- */
+  --rose-100: #fbdde6;
+  --rose-300: #f19bb5;
+  --rose-400: #e86d92;
+  --rose-500: #d94472;
+  --rose-600: #b83160;
+
+  /* --- Semantic: Red (error/danger) -------------------------- */
+  --red-100:   #fbdcd6;
+  --red-500:   #dc4a37;
+  --red-600:   #b8382b;
+
+  /* The warm-sunset --gradient-brand / --gradient-brand-soft that used to sit
+     here were first-generation (ember) values, redefined further down this same
+     file and therefore never rendered — dead code carrying five colours that are
+     not in DESIGN.md. The live definitions are in the dashboard remap below. */
+}
+
+/* ============================================================
+   Termdeck — Dashboard theme remap
+   Black and white carry the interface; brand green is reserved
+   for identity, primary actions, focus, live state, and selection.
+   Legacy ember/gold/rose token names remain mapped for older
+   component CSS until those selectors are fully retired.
+   ============================================================ */
+
+/* The second selector paints any element in the DEFAULT palette no matter which
+   theme the document is on — the theme picker's preview tiles, which have to
+   show Ink while you are looking at them from Slate.
+   Two scopes, ONE block, on purpose: a preview built from its own copy of the
+   values is a picture of a palette that used to be true, and the first token
+   anyone changes here is the one it stops advertising honestly. Inherited values
+   always lose to a declaration on the element itself, so no specificity fight —
+   see tokens/themes.css for the same pairing on every other theme. */
+:root,
+[data-theme-preview="ink"] {
+  --brand-green-50:  #effdf5;
+  --brand-green-100: #d9fbe7;
+  --brand-green-200: #b5f5d0;
+  --brand-green-300: #82ebae;
+  --brand-green-400: #58dc8e;
+  --brand-green-500: #42d187;
+  --brand-green-600: #25a85f;
+  --brand-green-700: #20854f;
+  --brand-green-800: #1f6942;
+  --brand-green-900: #1b5738;
+  --brand-green-950: #0b301e;
+
+  --ink-0:   #ffffff;
+  --ink-50:  #f7f7f7;
+  --ink-100: #eeeeee;
+  --ink-200: #d7d7d7;
+  --ink-300: #b6b6b6;
+  --ink-400: #8c8c8c;
+  --ink-500: #6f6f6f;
+  --ink-600: #545454;
+  --ink-700: #333333;
+  --ink-800: #1c1c1c;
+  --ink-850: #151515;
+  --ink-900: #0b0b0b;
+  --ink-950: #000000;
+
+  /* Older component names still resolve through this neutral compatibility
+     ramp. The main accent is set explicitly below instead of smuggling colour
+     through a retired ember name. */
+  --ember-50:  var(--ink-800);
+  --ember-100: var(--ink-700);
+  --ember-200: var(--ink-500);
+  --ember-300: var(--ink-200);
+  --ember-400: #ffffff;
+  --ember-500: #a3e9bd;   /* tracks --workspace-accent */
+  --ember-600: var(--ink-200);
+  --ember-700: var(--ink-300);
+  --ember-800: var(--ink-400);
+  --ember-900: var(--ink-500);
+  --ember-950: var(--ink-900);
+
+  --gold-100: var(--ink-100);
+  --gold-300: var(--ink-200);
+  --gold-400: var(--ink-300);
+  --gold-500: var(--ink-400);
+  --rose-100: var(--ink-100);
+  --rose-300: var(--ink-300);
+  --rose-400: var(--ink-400);
+  --rose-500: var(--ink-500);
+  --rose-600: var(--ink-600);
+
+  --workspace-brand-start: #1f6942;
+  --workspace-brand-end: #285b9f;
+  --gradient-brand: linear-gradient(135deg, var(--workspace-brand-start), var(--workspace-brand-end));
+  --gradient-brand-soft: linear-gradient(135deg, rgba(66, 209, 135, 0.18), rgba(79, 145, 247, 0.08));
+
+  /* --- Product workspace ------------------------------------
+     Five cool luminance rungs keep depth visible without turning every panel
+     into a bright grey card. The nav remains the deepest region, the canvas is
+     next, then surfaces, raised controls, and hover feedback. */
+  --workspace-bg: #0c1117;
+  --workspace-surface: #161e27;
+  --workspace-surface-raised: #1d2834;
+  --workspace-surface-hover: #263443;
+  --workspace-border: rgba(196, 216, 235, 0.14);
+  --workspace-border-strong: #354657;
+
+  /* Navigation well — the sidebar and the files dock, the two surfaces that sit
+     BELOW the canvas rather than on it. They were four literals (#000, #141414,
+     #1e1e1e, #262626) declared twice over, once as .files-panel's --fp-* and
+     once as .workspace-app .sidebar's --sidebar-ref-*, with the same values in
+     both places and nothing keeping them in step. One set, named for the job.
+
+     It is intentionally blue-black rather than pure black, which reduces the
+     visual cliff between the navigation and content while preserving depth. */
+  --workspace-nav-bg: #070a0d;
+  --workspace-nav-hover: #10171f;
+  --workspace-nav-selected: #18222d;
+  --workspace-nav-border: #263443;
+
+  /* The sidebar's rail. In Ink it is the Graphite theme (tokens/new-chat.css):
+     a true-neutral well with white-alpha hairlines and its own text tiers,
+     after T3 Code's thread sidebar. Its own set rather than the nav well's,
+     because home.css builds the marketing pages on --workspace-nav-* and those
+     pages never load the Graphite sheet. A theme re-points all eight, so the
+     rail follows the theme instead of leaving a black column beside a lighter
+     canvas. Read only by the app, which always has --nx-* loaded. */
+  --workspace-rail-bg: var(--nx-bg);
+  --workspace-rail-hover: var(--nx-surface);
+  --workspace-rail-selected: var(--nx-surface-hover);
+  --workspace-rail-line: var(--nx-line);
+  --workspace-rail-line-strong: var(--nx-line-strong);
+  --workspace-rail-text: var(--nx-text);
+  --workspace-rail-muted: var(--nx-muted);
+  --workspace-rail-faint: var(--nx-subtle);
+
+  /* The chat pane: the app bar, a chat's header and its transcript. In Ink it
+     is Graphite too, so the conversation sits on the same true-neutral ground
+     as the rail beside it and the composer card under it. Its own set for the
+     rail's reason: a theme re-points all ten, and Slate keeps its canvas.
+     Read only by the app, which always has --nx-* loaded. */
+  --workspace-chat-bg: var(--nx-bg);
+  --workspace-chat-surface: var(--nx-surface);
+  --workspace-chat-raised: var(--nx-surface-2);
+  --workspace-chat-hover: var(--nx-surface-hover);
+  --workspace-chat-press: var(--nx-surface-press);
+  --workspace-chat-line: var(--nx-line);
+  --workspace-chat-line-strong: var(--nx-line-strong);
+  --workspace-chat-text: var(--nx-text);
+  --workspace-chat-muted: var(--nx-muted);
+  --workspace-chat-faint: var(--nx-subtle);
+
+  /* The file dock shares Graphite's neutral ladder in Ink. A separate set
+     keeps Slate's brighter rail, reader and controls together. */
+  --workspace-dock-bg: var(--nx-bg);
+  --workspace-dock-surface: var(--nx-surface);
+  --workspace-dock-raised: var(--nx-surface-2);
+  --workspace-dock-hover: var(--nx-surface-hover);
+  --workspace-dock-press: var(--nx-surface-press);
+  --workspace-dock-line: var(--nx-line);
+  --workspace-dock-line-strong: var(--nx-line-strong);
+  --workspace-dock-control: var(--nx-faint);
+  --workspace-dock-text: var(--nx-text);
+  --workspace-dock-muted: var(--nx-muted);
+  --workspace-dock-faint: var(--nx-subtle);
+
+  /* The pages: the board and Settings, and each page after them as it moves
+     over. Graphite in Ink, so a page sits on the ground the rail and the chat
+     already stand on. Its own set for the rail's reason: a theme re-points all
+     eleven, and Slate keeps its canvas. Read only by the app.
+     --workspace-page-control is a control's edge, not a hairline: 4.1:1 on
+     the page ground and 3.6:1 on its raised rung, over the 3:1 an input's
+     boundary owes. */
+  --workspace-page-bg: var(--nx-bg);
+  --workspace-page-surface: var(--nx-surface);
+  --workspace-page-raised: var(--nx-surface-2);
+  --workspace-page-hover: var(--nx-surface-hover);
+  --workspace-page-press: var(--nx-surface-press);
+  --workspace-page-line: var(--nx-line);
+  --workspace-page-line-strong: var(--nx-line-strong);
+  --workspace-page-control: var(--nx-faint);
+  --workspace-page-text: var(--nx-text);
+  --workspace-page-muted: var(--nx-muted);
+  --workspace-page-faint: var(--nx-subtle);
+  /* Worst text contrast across bg, surface, and raised is 13.90 / 8.73 / 5.21. */
+  --workspace-text: #f4f7fa;
+  --workspace-muted: #bdc7d2;
+  --workspace-faint: #8c9aaa;
+  --workspace-accent: #a3e9bd;
+  --workspace-accent-rgb: 163, 233, 189;
+  --workspace-live: #42d187;
+  --workspace-busy: #f2bd4f;
+  --workspace-danger: #ff6b7a;
+  /* Danger needs its own hover step so destructive controls answer the pointer
+     without borrowing the primary hue. */
+  --workspace-danger-hover: #ff8490;
+  /* Categorical series. Three steps of the same neutral ramp, kept far enough
+     apart to read as three bars, plus the app's one amber. The names are
+     hues that these values have not been for several palettes; they stay
+     because ~20 rules and admin.css spell them, and renaming them is not what
+     a palette swap is. */
+  --workspace-data-peach: #f2bd4f;
+  --workspace-data-sky: #9299a1;
+  --workspace-data-violet: #c3c8cd;
+  --workspace-data-yellow: #70767c;
+
+  /* The Usage page runs deliberately quieter than the rest of the app: a grey
+     accent rather than the near-white one, so a wall of numbers does not read
+     as a wall of primary actions.
+     The -rgb member used to disagree with its own hex (174 against 200), kept
+     verbatim through earlier passes because nothing was touching the palette.
+     This pass is touching the palette, so the two now agree; the tints built
+     from the -rgb value lighten very slightly as a result. */
+  --workspace-data-accent: #c3c8cd;
+  --workspace-data-accent-rgb: 195, 200, 205;
+  --workspace-data-accent-dim: #555a5e;
+
+  /* The one well in the product that sinks below the canvas instead of lifting
+     off it: the Usage hero. Both ends move with the theme so the well never
+     becomes a black rectangle dropped into a lighter page. */
+  --workspace-well-from: #0b1016;
+  --workspace-well-to: #070a0d;
+
+  /* Diff — the one surface where two hues sit side by side. Both name a git
+     state, so they pass the color-is-semantic rule rather than decorating.
+     The base pair is DESIGN.md's diff-add / diff-remove, used at marker and
+     gutter strength (3:1 floor). The -fg pair is lightened for 12px mono code
+     text, which needs 4.5:1 on near-black. Text takes -fg, fills take base. */
+  --workspace-diff-add: #42d187;
+  --workspace-diff-remove: #ea5c8b;
+  --workspace-diff-modify: #f2bd4f;
+  --workspace-diff-add-fg: #79e5ac;
+  --workspace-diff-remove-fg: #ff8fb5;
+
+  /* Transcript: a tool call is the one thing in a turn that is neither prose
+     nor a state, so it gets its own hue and nothing else in the app uses it.
+     Result status reuses the existing live/danger pair. */
+  --workspace-tool: #68b7ff;
+
+  /* --- Terminal output (ANSI SGR) ----------------------------------------
+     The eight ANSI foregrounds, for a tool result rendered with the colour its
+     command actually printed (public/js/ansi.js). NOT eight new values: every
+     one is a colour DESIGN.md already lists, chosen by what the hue MEANS in
+     terminal output rather than by matching a terminal's palette.
+
+     Red, green and amber are the state trio and they need no argument here —
+     that IS what a test runner prints them for, so they take the tokens that
+     already mean error / added / changed. Blue and purple are borrowed from the
+     tool and decision hues, which is safe precisely because this text sits
+     inside a payload panel where neither of those meanings is in play. Cyan is
+     the only one with no existing token, and #22d3ee is the tool-verb ramp's
+     own cyan (DESIGN.md § the tool-verb ramp) rather than a new pick.
+
+     Black and white are the two that must not be taken literally: true black on
+     a near-black card is invisible, and terminal "white" is body text. Both
+     resolve to the greyscale tier that carries the same weight in this app.
+
+     All eight are TEXT, so all eight clear the Two-Strength Rule's 4.5:1 on
+     --workspace-bg; the -fg members of their pairs are chosen for that reason
+     (diff-add-fg, not diff-add). Backgrounds are deliberately absent — see
+     public/js/ansi.js for what it declines to render and why. */
+  --ansi-black: var(--workspace-faint);          /* #8b8b8b — "dim", not invisible */
+  --ansi-red: var(--workspace-danger);           /* a failing test is an error */
+  --ansi-green: var(--workspace-diff-add-fg);    /* text-strength green */
+  --ansi-yellow: var(--workspace-diff-modify);   /* the app's one amber */
+  --ansi-blue: var(--workspace-tool);
+  --ansi-magenta: var(--workspace-cat-purple);
+  --ansi-cyan: #5dd8e6;                          /* the tool-verb ramp's cyan */
+  --ansi-white: var(--workspace-text);           /* #fafafa — terminal white is body text */
+
+  /* --- Info -------------------------------------------------------------
+     The fourth semantic, and the one the palette was actually missing. green
+     live / amber working / red needs-you all mean something HAPPENED; nothing
+     carried "here is a fact you did not ask for" — a changelog note, a plan
+     tier callout, a badge on a nav item. Those were borrowing --workspace-tool,
+     which already means "a tool call" in a transcript two panes away.
+
+     Info is the deeper blue and tool is the lighter cyan-blue. Two blues, two
+     jobs: a filled info badge should not read as a tool call. */
+  --workspace-info: #4f91f7;
+  --workspace-info-fg: #0c1117;        /* filled badge text, on the info fill */
+  --workspace-info-soft: rgba(79, 145, 247, 0.14);  /* tinted badge ground */
+  --workspace-info-border: rgba(79, 145, 247, 0.36);
+  /* The soft badge sets its glyph on its own tint, not on the raw surface.
+     --workspace-info-text therefore lifts independently of the solid fill and
+     clears 5.78:1 on the lightest tinted Slate surface. */
+  --workspace-info-text: #a5c9ff;      /*  worst 5.78:1 on a tinted Slate raised */
+
+  /* Decision categories. A pending plan and a pending question are both "we
+     stopped and need you", so they need to be told apart at a glance without
+     reading. Same value as --workspace-tool for blue, kept separate because the
+     names mean different things and will drift apart if the palette moves. */
+  --workspace-cat-blue: #68b7ff;       /* plan ready */
+  --workspace-cat-purple: #c49cff;     /* question */
+
+  /* Primary action. The same green as --workspace-live on purpose: the app has
+     exactly one "go" colour, and a filled button never appears where a live dot
+     does, so sharing the hue reads as one idea rather than two meanings. */
+  --workspace-primary: #42d187;
+  --workspace-primary-hover: #63dfa0;
+  /* Named for the primary because that is its measured pairing — 8.9:1 on the
+     fill, 11.4:1 on hover — but the job is broader: this is the ink that goes
+     on ANY light or saturated fill. The accent-white avatars and toggles, the
+     danger-red chips, the gradient tiles and a highlighted syntax token were
+     all spelling it by hand (#0a0a0a, #000, #140f09, #15120c, #06210a,
+     #1a1a1a — six literals for one idea, three of them left over from the warm
+     charcoal palette), which is precisely the set that cannot follow a theme. */
+  --workspace-primary-fg: #0c1117;
+
+  /* Scrollbar chrome: quiet cool thumb, mint only while dragging. */
+  --workspace-scrollbar-thumb: rgba(196, 216, 235, 0.16);
+  --workspace-scrollbar-thumb-hover: rgba(196, 216, 235, 0.30);
+  --workspace-scrollbar-thumb-active: #a3e9bd;
+
+  /* --- Edge highlight -----------------------------------------
+     A raised bevel, not a single line: a crisp inset top highlight where
+     the light lands, plus a soft inset shadow gathered low on the card
+     where it falls off — the two paired reads as a machined panel's
+     edge without casting the drop shadow the Flat-Console Rule forbids
+     on resting surfaces (see DESIGN.md's Elevation & Depth). The first
+     version was the top highlight alone, hand-written once on the
+     composer and nowhere else, which is why it barely read next to a
+     flat `box-shadow: none` session tile or settings card. The bottom
+     shadow's blur/spread is tuned tight (not a tall vignette) so it
+     still reads as an edge accent, not a fill, on a ~70px board card —
+     the shortest surface this token has to cover. One token, one
+     focus-brightened sibling, so every flat card/composer/popover/modal
+     in the app carries the same edge instead of each one reinventing
+     (or skipping) it. Popovers and modals already carry a real cast
+     shadow — they're the two surfaces Flat-Console exempts because they
+     float rather than rest — so they LAYER the bevel onto that shadow
+     below rather than using this token alone. */
+  --workspace-edge-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.10), inset 0 -6px 8px -6px rgba(0, 0, 0, 0.45);
+  --workspace-edge-highlight-focus: inset 0 1px 0 rgba(255, 255, 255, 0.13), inset 0 -6px 8px -6px rgba(0, 0, 0, 0.45);
+
+  /* --- Elevation ladder --------------------------------------------------
+     Five named levels, so "how raised is this" stops being decided per rule.
+
+     These are not the layered drop-shadows they were modelled on. A faint black
+     shadow over a midnight canvas produces almost no measurable delta.
+
+     On a near-black canvas the two things that actually read are a LIGHTNESS
+     STEP (the surface ladder: bg -> surface -> raised -> hover) and light
+     catching a top edge. That is not a preference, it is arithmetic: the canvas
+     is rgb(12, 17, 23), so the darkest a shadow can paint the pixel beside a card
+     is only a few steps down, and most of that is spent before the blur starts.
+     Measured 2026-08-19 by rendering the board four ways: bevel only, Linear's
+     --shadow-low, black at 0.6 over 12px, and black at 0.9 over 30px. The last
+     is a 9x heavier shadow than the first and the screenshots are impossible to
+     tell apart.
+
+     The Flat-Console Rule was lifted for cards on 2026-08-19 at the user's
+     request, and --elevation-2 carries a real cast shadow now. Keep the
+     expectations right, though: on Ink that shadow is nearly free and nearly
+     invisible, and the reason a card reads as raised here is the rung under it,
+     not the shadow over it. It earns its keep on themes whose canvas is not
+     near-black. Slate's is rgb(24, 33, 43), where the same layers have room to
+     bite.
+
+     The two floating levels' cast layers are Linear's --shadow-medium /
+     --shadow-high over their --shadow-low, rather than the taller, heavier
+     stack that was here. A 40-60px black plume was drawn for a page that lifts
+     things off white; on this canvas it reads as a smudge rather than a height. */
+  --elevation-0: none;                                   /* flat band, no border */
+  --elevation-1: none;                                   /* + 1px hairline border */
+  /* Resting card / control: one tight contact layer, one wide negative-spread
+     pool, and the bevel that carries most of the separation. */
+  --elevation-2: 0 1px 2px rgba(0, 0, 0, 0.9),
+                 0 8px 24px -8px rgba(0, 0, 0, 0.9),
+                 var(--workspace-edge-highlight);
+  --elevation-3: 0 4px 24px rgba(0, 0, 0, 0.2), 0 2px 4px rgba(0, 0, 0, 0.1), var(--workspace-edge-highlight);
+  --elevation-4: 0 7px 32px rgba(0, 0, 0, 0.35), 0 2px 4px rgba(0, 0, 0, 0.1), var(--workspace-edge-highlight);
+  /* The surface each level is meant to sit on, so a component picks one pair
+     rather than a shadow and a background that disagree. */
+  --elevation-2-bg: var(--workspace-surface);
+  --elevation-3-bg: var(--workspace-popover-bg, #1d2834);
+  --elevation-4-bg: var(--workspace-overlay-bg, #111820);
+
+  /* --- Popover -----------------------------------------------
+     Surfaces that float above the workspace rather than reflow it
+     (the context/token breakdown, and menus that follow). They annotate
+     what is behind them, so they use the raised rung and carry their own border
+     and shadow rather than borrowing the flat chrome's. */
+  --workspace-popover-bg: #1d2834;
+  --workspace-popover-border: rgba(196, 216, 235, 0.18);
+  --workspace-popover-shadow: var(--elevation-3);
+  --workspace-popover-radius: var(--radius-lg);
+  --workspace-popover-z: 60;
+
+  /* --- Overlay -----------------------------------------------
+     Modal surfaces. Unlike a popover they take the whole attention
+     rather than annotating something behind them, so they get their own
+     rung and one shared scrim for the app underneath.
+
+     The rung sits BELOW --workspace-surface on purpose. A modal is a
+     frame that holds cards, and a frame level with its own contents has
+     no hierarchy left to give them:
+
+       --workspace-bg              #0c1117   the app
+       --workspace-overlay-bg      #111820   a modal, lifted off it
+       --workspace-surface         #161e27   a card inside the modal
+       --workspace-surface-raised  #1d2834   a control on that card */
+  --workspace-overlay-bg: #111820;
+  --workspace-overlay-border: rgba(196, 216, 235, 0.15);
+  --workspace-overlay-shadow: var(--elevation-4);
+  --workspace-overlay-radius: var(--radius-xl);
+  /* The heavy cool scrim lets the softer cast shadows above still read as
+     height because the app behind a modal goes further down. */
+  --workspace-scrim: rgba(3, 7, 11, 0.86);
+  --workspace-scrim-blur: 6px;
+
+  /* Focus. Solid mint, because the palette uses one thread for focus,
+     selection, and identity, and two rings rather than one wash.
+     A single translucent ring measured 1.25-1.63:1 against the surfaces
+     it bordered where WCAG 2.2 SC 1.4.11 wants 3:1, and a solid one
+     abutting a green toggle only reaches 1.9:1. The dark inner ring
+     gives the light outer one a neighbour it always beats, whatever the
+     control underneath is painted.
+
+     Built from other tokens, which makes it the one kind that does NOT follow
+     a re-scoped palette: a custom property assembled from var()s computes where
+     it is DECLARED, so this resolves here, against this palette, and inherits
+     as a finished string. Re-skinning
+     a subtree underneath it changes nothing — measured at 1.17:1 on a light
+     surface that had re-declared every colour under it. Anything scoping a new
+     palette has to re-declare these two by hand. */
+  --workspace-focus-ring: 0 0 0 2px var(--workspace-bg), 0 0 0 4px var(--workspace-accent);
+  --workspace-focus-ring-inset: inset 0 0 0 2px var(--workspace-bg), inset 0 0 0 4px var(--workspace-accent);
+
+  /* The edge of a CONTROL, which is not the same job as --workspace-border.
+     A card's outline groups things that are already legible without it; a text
+     field, a select and a bare-fill button are identified by their boundary and
+     nothing else, and WCAG 2.2 SC 1.4.11 asks 3:1 of exactly that. The shared
+     hairline measured 1.25-1.32:1 against both the control's fill and the
+     surface behind it, so every input in the product was a rectangle you had to
+     already know was there.
+
+     Controls get this measured opaque edge; grouping keeps the quiet hairline,
+     which is the distinction the criterion actually draws. */
+  --workspace-control-border: #8191a3;
+}

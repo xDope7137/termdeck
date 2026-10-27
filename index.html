@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en" class="site">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#09090b">
+  <meta name="robots" content="index,follow,max-image-preview:large">
+  <title>Termdeck: one web UI for Claude Code, Codex and Grok on your own machines</title>
+  <meta name="description" content="Termdeck is a fleet board for the coding-agent CLIs already running on your machines. Approve tool calls from your phone, drive any session from any browser, and resume it in the terminal. The agent is open source.">
+  <link rel="canonical" href="https://xdope7137.github.io/termdeck/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Termdeck">
+  <meta property="og:title" content="Termdeck: one web UI for Claude Code, Codex and Grok">
+  <meta property="og:description" content="Every coding-agent session on every machine, in one browser tab. Approve tool calls from your phone. The agent that runs on your machine is open source.">
+  <meta property="og:url" content="https://xdope7137.github.io/termdeck/">
+  <meta property="og:image" content="https://termdeck.io/media/og-termdeck.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="https://termdeck.io/media/og-termdeck.png">
+  <link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">
+  <link rel="icon" href="assets/img/icon-tab.svg" type="image/svg+xml">
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="assets/fonts/geist-variable.woff2">
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="assets/fonts/dm-mono-400-normal-latin.woff2">
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="assets/fonts/dm-mono-500-normal-latin.woff2">
+  <!-- A snapshot of termdeck.io's own theme (Graphite): the token files, home.css and
+       site.css copied from the site, so this page wears the same palette and type. -->
+  <link rel="stylesheet" href="assets/css/colors.css">
+  <link rel="stylesheet" href="assets/css/scrollbars.css">
+  <link rel="stylesheet" href="assets/css/new-chat.css">
+  <link rel="stylesheet" href="assets/css/marketing.css">
+  <link rel="stylesheet" href="assets/css/home.css">
+  <link rel="stylesheet" href="assets/css/site.css">
+  <script src="assets/js/reveal.js" defer></script>
+  <script src="assets/js/nav-chrome.js" defer></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Termdeck",
+    "url": "https://termdeck.io/",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Linux, Windows",
+    "description": "A web UI and remote control for local Claude Code, OpenAI Codex CLI and xAI Grok CLI sessions, with tool approvals on your phone, diffs, usage tracking and multi-machine fleet management.",
+    "sameAs": ["https://github.com/xDope7137/termdeck"]
+  }
+  </script>
+  <style>
+    /* This page only: the screenshot band under the hero and the engine marks in the table head. */
+    .gp-shot .shell{padding-top:0}
+    .gp-shot .post-figure img{box-shadow:var(--home-lift)}
+    .gp-engine{display:inline-flex;align-items:center;gap:8px}
+    .gp-engine img{width:16px;height:16px}
+  </style>
+</head>
+<body class="vs-page">
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="nav">
+    <a class="brand" href="https://termdeck.io/?ref=github-pages" aria-label="Termdeck home"><img class="mk" src="assets/img/icon.svg" alt="" width="26" height="26" decoding="async">termdeck</a>
+    <nav class="nav-links" id="site-menu" aria-label="Primary navigation">
+      <a href="#features">Features</a>
+      <a href="#engines">Engines</a>
+      <a href="#how">How it works</a>
+      <a href="#faq">FAQ</a>
+      <a href="https://termdeck.io/docs?ref=github-pages">Docs</a>
+      <a class="nav-menu-only" href="https://github.com/xDope7137/termdeck">GitHub</a>
+      <a class="nav-menu-only" href="https://termdeck.io/signup?ref=github-pages">Free trial</a>
+    </nav>
+    <div class="nav-actions">
+      <a class="login" href="https://github.com/xDope7137/termdeck">GitHub</a>
+      <a class="btn btn-signup btn-sm" href="https://termdeck.io/signup?ref=github-pages">Free trial</a>
+      <button class="nav-menu-btn" type="button" aria-expanded="false" aria-controls="site-menu" aria-label="Menu">Menu</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="vs-hero">
+      <div class="shell">
+        <p class="kicker">Claude Code, Codex CLI and Grok, on your own machines</p>
+        <h1 class="vs-title">The agents are running. <span class="hl">Go live your life.</span></h1>
+        <p class="vs-lede">Termdeck is one web board for the coding-agent sessions already running on your laptop, desktop and servers. When a run stops on a tool approval, your phone buzzes. Tap Allow, and it keeps going. Back at your desk, the same session still opens in the terminal.</p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="https://termdeck.io/signup?ref=github-pages">Start free trial <span class="arrow">&rarr;</span></a>
+          <a class="btn btn-ghost" href="https://github.com/xDope7137/termdeck">Read the agent source</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="gp-shot">
+      <div class="shell">
+        <figure class="post-figure">
+          <img src="assets/img/termdeck-dashboard.png" alt="The Termdeck dashboard: the fleet sidebar, a Claude Code session transcript and a tool approval card" width="1512" height="945" decoding="async">
+          <figcaption>One sidebar for every machine, sorted by which session needs you. More on <a href="https://termdeck.io/?ref=github-pages">termdeck.io</a>.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="vs-section" id="features">
+      <div class="shell">
+        <div class="vs-section-head">
+          <p class="kicker">The minute after</p>
+          <h2 class="vs-section-title">Running the agents was never the hard part.</h2>
+        </div>
+        <div class="vs-highlight-grid">
+          <div class="vs-card">
+            <h3>Approve from your phone</h3>
+            <p>Web Push fires even with no browser open. Allow or Deny right on the notification, or open the session for the full card.</p>
+          </div>
+          <div class="vs-card">
+            <h3>One fleet board</h3>
+            <p>Laptop, desktop, VM, the box under the desk. Every session on every machine, sorted by who is waiting on you.</p>
+          </div>
+          <div class="vs-card">
+            <h3>Every session shows up</h3>
+            <p>Termdeck reads the CLI's own session files, so sessions you started in a terminal months ago are already there and searchable.</p>
+          </div>
+          <div class="vs-card">
+            <h3>Resume in the terminal</h3>
+            <p>A session you drove from your phone still opens with <code>claude --resume</code> or <code>codex resume</code>. Same files, same working directory.</p>
+          </div>
+          <div class="vs-card">
+            <h3>Docked diff review</h3>
+            <p>Changed files with line counts next to the transcript, and a pull request opened from the same panel.</p>
+          </div>
+          <div class="vs-card">
+            <h3>Cost and limit meters</h3>
+            <p>Cost per project, token totals, and rolling and weekly limit pacing, so you see the wall before you hit it.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="vs-section" id="engines">
+      <div class="shell">
+        <div class="vs-section-head">
+          <p class="kicker">Three engines, one UI</p>
+          <h2 class="vs-section-title">Pick the engine per chat. Learn the UI once.</h2>
+        </div>
+        <div class="vs-cmp-wrap">
+          <table class="vs-cmp">
+            <thead>
+              <tr>
+                <th scope="col"><span class="vh">Feature</span></th>
+                <th scope="col" class="us"><span class="gp-engine"><img src="assets/img/claude.svg" alt="" width="16" height="16">Claude Code</span></th>
+                <th scope="col" class="us"><span class="gp-engine"><img class="mono-mark" src="assets/img/chatgpt.svg" alt="" width="16" height="16">Codex CLI</span></th>
+                <th scope="col" class="us"><span class="gp-engine"><img class="mono-mark" src="assets/img/grok.svg" alt="" width="16" height="16">Grok</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td class="row">Render every past session</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+              <tr><td class="row">Drive turns from the browser</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+              <tr><td class="row">Inline tool approvals</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+              <tr><td class="row">Model and reasoning effort per turn</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+              <tr><td class="row">Native plan mode</td><td>Yes</td><td>Yes</td><td class="them">No</td></tr>
+              <tr><td class="row">Resume in its own CLI afterwards</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="vs-note">You bring your own Claude, OpenAI or xAI subscription. Termdeck never resells inference. Compare it with other tools on <a href="https://termdeck.io/vs?ref=github-pages">termdeck.io/vs</a>.</p>
+      </div>
+    </section>
+
+    <section class="vs-section" id="how">
+      <div class="shell">
+        <div class="vs-section-head">
+          <p class="kicker">How it works</p>
+          <h2 class="vs-section-title">Two minutes, and no inbound port.</h2>
+        </div>
+        <ol class="post-steps">
+          <li><strong>Sign up</strong> at <a class="engine-link" href="https://termdeck.io/signup?ref=github-pages">termdeck.io</a> and start the free trial.</li>
+          <li><strong>Add a machine.</strong> The dashboard gives you a one-line install that carries that machine's token. It works on macOS, Linux and Windows.</li>
+          <li><strong>Add a project folder.</strong> Its sessions are already there.</li>
+        </ol>
+        <div class="post-code">
+          <div class="post-code-h">macOS / Linux</div>
+          <pre><code>curl -fsSL https://termdeck.io/install.sh | TERMDECK_AGENT_TOKEN=agt_... sh</code></pre>
+        </div>
+        <div class="post-code">
+          <div class="post-code-h">Any platform, with npm</div>
+          <pre><code>npx termdeck-agent install --token agt_...</code></pre>
+        </div>
+        <p class="vs-note">The agent dials out over a WebSocket, so there is no firewall rule, tunnel or VPN on your side. Runs happen on your machine, and a dropped connection only means a viewer went away, not that the run was lost. Full guide: <a href="https://termdeck.io/docs/install?ref=github-pages">install the agent</a>.</p>
+      </div>
+    </section>
+
+    <section class="vs-section" id="open">
+      <div class="shell">
+        <div class="vs-section-head">
+          <p class="kicker">Open source agent</p>
+          <h2 class="vs-section-title">Read what runs on your machine before you run it.</h2>
+        </div>
+        <div class="vs-highlight-grid">
+          <a class="vs-card" href="https://github.com/xDope7137/termdeck/blob/main/agent/capabilities.js">
+            <h3>A fixed list, not a shell</h3>
+            <p>The agent answers a typed list of capabilities. Reads stay inside the transcript folders and the open chat's project. <code>capabilities.js</code> is the whole list.</p>
+          </a>
+          <a class="vs-card" href="https://github.com/xDope7137/termdeck/blob/main/agent/update-signature.js">
+            <h3>Signed updates</h3>
+            <p>Every release is signed offline. An installed agent takes an update only when the signature and every file hash check out, with a rollback snapshot kept.</p>
+          </a>
+          <a class="vs-card" href="https://github.com/xDope7137/termdeck/blob/main/docs/INVARIANTS.md">
+            <h3>Written down</h3>
+            <p>The rules the system relies on are in the repo, each one with the failure that produced it.</p>
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <section class="vs-section" id="faq">
+      <div class="shell">
+        <div class="vs-section-head">
+          <p class="kicker">FAQ</p>
+          <h2 class="vs-section-title">Questions people ask first.</h2>
+        </div>
+        <div class="vs-faq">
+          <div class="vs-faq-card">
+            <h3>Do my code and transcripts leave my machine?</h3>
+            <p>No. The agent reads and renders them in place. The control plane is hosted, but it keeps no copy of your conversations. Details in <a href="https://termdeck.io/docs/security?ref=github-pages">security</a>.</p>
+          </div>
+          <div class="vs-faq-card">
+            <h3>Is there a self-hosted version?</h3>
+            <p>No, on purpose. You connect a machine to your account and drive it through the cloud. Only the agent, the part on your machine, is open source.</p>
+          </div>
+          <div class="vs-faq-card">
+            <h3>Can I take over a session running in a terminal?</h3>
+            <p>Yes. A terminal-attached session streams live in view-only mode, and Take over closes the idle terminal client and hands you the composer.</p>
+          </div>
+          <div class="vs-faq-card">
+            <h3>What does it cost?</h3>
+            <p>Every account starts with a 14-day trial. Plans and prices are on <a href="https://termdeck.io/docs/plans?ref=github-pages">termdeck.io/docs/plans</a>.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="vs-section">
+      <div class="shell">
+        <div class="vs-cta">
+          <p class="kicker">termdeck.io</p>
+          <h2 class="vs-section-title">Your agents are already running.</h2>
+          <p class="vs-cta-copy">Connect a machine and the sessions on it are on your phone in two minutes.</p>
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="https://termdeck.io/signup?ref=github-pages">Start free trial <span class="arrow">&rarr;</span></a>
+            <a class="btn btn-ghost" href="https://termdeck.io/?ref=github-pages">Visit termdeck.io</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="hsec">
+    <div class="rail">
+      <div class="foot">
+        <div class="foot-base"><span>&copy; 2026 Termdeck LLC &middot; <a class="engine-link" href="https://termdeck.io/?ref=github-pages">termdeck.io</a> &middot; <a class="engine-link" href="https://github.com/xDope7137/termdeck">GitHub</a></span><span>Not affiliated with Anthropic, OpenAI or xAI.</span></div>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

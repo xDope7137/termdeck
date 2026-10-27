@@ -1,0 +1,51 @@
+/* Shared scrollbar chrome for the product, marketing, and admin surfaces.
+   A theme overrides the --workspace-scrollbar-* tokens in tokens/colors.css;
+   this file only decides the geometry and which token goes where.
+
+   The three colours used to be literals here, and they were the last of a
+   palette nobody had run in months: two off-white alphas that were not the
+   app's white, and a lime rgba(185, 248, 94, 0.78) thumb that flashed on every
+   drag. colors.css had already declared --workspace-scrollbar-* for exactly
+   this job and nothing consumed them. Now they do, so a scrollbar follows a
+   theme instead of quietly outliving one. */
+
+:root {
+  --scrollbar-size: 8px;
+  --scrollbar-radius: 4px;
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: var(--workspace-scrollbar-thumb, rgba(255, 255, 255, 0.14));
+  --scrollbar-thumb-hover: var(--workspace-scrollbar-thumb-hover, rgba(255, 255, 255, 0.28));
+  --scrollbar-thumb-active: var(--workspace-scrollbar-thumb-active, #a3e9bd);
+
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: var(--scrollbar-track);
+}
+
+*::-webkit-scrollbar-thumb {
+  min-width: 32px;
+  min-height: 32px;
+  border-radius: var(--scrollbar-radius);
+  /* Transparent border + padding-box clip keeps an 8px hit target while the
+     painted thumb reads closer to 4px — quiet chrome, easy to grab. */
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  background-color: var(--scrollbar-thumb);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollbar-thumb-hover);
+}
+
+*::-webkit-scrollbar-thumb:active {
+  background-color: var(--scrollbar-thumb-active);
+}

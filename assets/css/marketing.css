@@ -1,0 +1,48 @@
+/* Marketing tokens. Every public page (html.site) wears the app's Graphite
+   theme, so every value here points at tokens/new-chat.css (linked by the
+   head-assets partial) instead of copying it: when Graphite moves, the whole
+   site moves with it. The workspace keeps its own palette. */
+:root.site {
+  --home-canvas: var(--nx-bg);
+  --home-surface: var(--nx-surface);
+  --home-raised: var(--nx-surface-2);
+  --home-hover: var(--nx-surface-hover);
+  --home-press: var(--nx-surface-press);
+  --home-well: var(--nx-bg);
+  --home-text: var(--nx-text);
+  --home-muted: var(--nx-muted);
+  /* --nx-faint is for glyphs and large type only; small copy takes --nx-subtle. */
+  --home-faint: var(--nx-subtle);
+  --home-glyph: var(--nx-faint);
+  --home-accent: var(--nx-primary);
+  --home-accent-hover: var(--nx-muted);
+  --home-accent-ink: var(--nx-primary-fg);
+  --home-heading-accent: var(--nx-text);
+  --home-border: var(--nx-line-strong);
+  --home-line: var(--nx-line);
+  --home-line-focus: var(--nx-line-focus);
+  /* A control's edge, as on Graphite pages: --workspace-page-control. */
+  --home-control-border: var(--nx-faint);
+  --home-highlight: var(--nx-muted);
+  --home-live: var(--nx-online);
+  --home-live-ring: var(--nx-online-ring);
+  --home-busy: var(--nx-warn);
+  --home-busy-bg: var(--nx-warn-bg);
+  --home-busy-line: var(--nx-warn-line);
+  --home-danger: var(--nx-danger);
+  --home-danger-bg: var(--nx-danger-bg);
+  --home-plan: var(--nx-plan);
+  --home-plan-bg: var(--nx-plan-bg);
+  --home-shadow: var(--nx-primary-fg);
+  --home-glow-claude: var(--nx-glow-claude);
+  --home-glow-codex: var(--nx-glow-codex);
+  --home-glow-grok: var(--nx-glow-grok);
+  --home-dot: rgba(255, 255, 255, 0.045);
+  --home-edge: 0 1px 0 0 rgba(255, 255, 255, 0.05) inset;
+  --home-lift: var(--nx-shadow-card);
+  --home-menu-shadow: var(--nx-shadow-menu);
+  --home-radius-card: var(--nx-radius-card);
+  --home-radius-list: var(--nx-radius-list);
+  --home-radius-row: var(--nx-radius-row);
+  --home-radius-chip: var(--nx-radius-chip);
+}
