@@ -409,32 +409,62 @@ const httpOf = (origin) => origin.replace(/^ws/, 'http');
 const link = { failovers: 0, reason: null, rtt: null };
 
 const probe = (origin, timeoutMs) => endpointsLib.probe(httpOf(origin), timeoutMs);
+const fmtMs = (ms) => (Number.isFinite(ms) ? `${ms}ms` : 'no answer');
+const fmtRtts = (rtts) => Object.entries(rtts).map(([o, ms]) => `${httpOf(o)} ${fmtMs(ms)}`).join(', ');
 
-// While on a fallback, check the primary now and then and move back once it has stayed
-// healthy (endpoints.js Failback). One timer, because one socket is live at a time.
-const failback = new endpointsLib.Failback();
-let failbackTimer = null;
-function armFailback(sock) {
-  clearTimeout(failbackTimer);
-  if (!endpoints || !endpoints.onFallback) return;
-  failback.start(Date.now());
+// Time every address (endpoints.js latency), remember the result for the next failover,
+// and return it.
+async function timeRoutes(opts) {
+  const rtts = await endpointsLib.measure(endpoints.list, httpOf, opts);
+  if (endpoints) endpoints.timed(rtts);
+  return rtts;
+}
+
+// Before the first dial: start on whichever address answers fastest right now, not on
+// whichever one happened to be in use when this process last stopped.
+async function pickStartRoute() {
+  if (!endpoints) return;
+  const rtts = await timeRoutes({ deadlineMs: endpointsLib.ROUTE_START_MS });
+  if (!endpoints) return;
+  const best = endpointsLib.ranked(endpoints.list, rtts)[0];
+  if (!Number.isFinite(rtts[best])) {
+    log.warn(`No Termdeck address answered a timing check (${fmtRtts(rtts)}). Dialling ${httpOf(endpoints.current)} anyway.`);
+    return;
+  }
+  if (best !== endpoints.current) endpoints.use(best);
+  saveEndpoints();
+  log.info(`Using ${httpOf(best)}, the fastest route from here (${fmtRtts(rtts)}).`);
+}
+
+// While connected, time every address now and then and move to one that is clearly
+// faster two rounds running (endpoints.js Reroute). One timer, because one socket is
+// live at a time.
+const reroute = new endpointsLib.Reroute();
+let rerouteTimer = null;
+function armReroute(sock) {
+  clearTimeout(rerouteTimer);
+  reroute.reset();
+  if (!endpoints) return;
+  const live = () => sock.readyState === WebSocket.OPEN && endpoints;
   const tick = async () => {
-    if (sock.readyState !== WebSocket.OPEN || !endpoints || !endpoints.onFallback) return;
-    const ok = await probe(endpoints.primary);
-    if (sock.readyState !== WebSocket.OPEN || !endpoints || !endpoints.onFallback) return;
-    if (failback.result(ok, Date.now()) === 'failback') {
-      log.info(`Moving back to ${httpOf(endpoints.primary)}: it has answered every check for ${Math.round(failback.trial / 60_000)} minutes.`);
-      endpoints.home();
+    if (!live()) return;
+    const rtts = await timeRoutes();
+    if (!live()) return;
+    const from = endpoints.current;
+    const to = reroute.vote(endpointsLib.better(endpoints.list, from, rtts));
+    if (to) {
+      log.info(`Moving to ${httpOf(to)}: it answers faster than ${httpOf(from)} (${fmtRtts(rtts)}).`);
+      endpoints.use(to);
       saveEndpoints();
-      sock._movingHome = true;
-      try { sock.close(1000, 'failback'); } catch { /* the close handler redials either way */ }
+      sock._rerouting = true;
+      try { sock.close(1000, 'reroute'); } catch { /* the close handler redials either way */ }
       return;
     }
-    failbackTimer = setTimeout(tick, Math.max(0, failback.nextAt - Date.now()));
-    failbackTimer.unref();
+    rerouteTimer = setTimeout(tick, reroute.pending ? endpointsLib.ROUTE_CONFIRM_MS : endpointsLib.ROUTE_EVERY_MS);
+    rerouteTimer.unref();
   };
-  failbackTimer = setTimeout(tick, Math.max(0, failback.nextAt - Date.now()));
-  failbackTimer.unref();
+  rerouteTimer = setTimeout(tick, endpointsLib.ROUTE_EVERY_MS);
+  rerouteTimer.unref();
 }
 
 if (!TOKEN) { console.error('TERMDECK_AGENT_TOKEN is required'); process.exit(1); }
@@ -903,7 +933,7 @@ function dial() {
   const redial = () => {
     if (redialled) return;
     redialled = true;
-    clearTimeout(failbackTimer);
+    clearTimeout(rerouteTimer);
     if (health.rtt() != null) link.rtt = health.rtt();
     // Move to the next address when this one let us down: we cut a bad link, or a dial
     // failed on the path itself (endpoints.js dialFailedOnPath). Anything the master
@@ -916,7 +946,7 @@ function dial() {
         link.failovers += 1;
         link.reason = linkLost || 'dial';
         saveEndpoints();
-        log.warn(`Switching to ${httpOf(endpoints.current)}: the connection through ${httpOf(dialledOrigin)} ${linkLost === 'slow' ? 'was too slow' : linkLost ? 'stopped answering' : 'could not be opened'}. It moves back once that address has been healthy for a while.`);
+        log.warn(`Switching to ${httpOf(endpoints.current)}: the connection through ${httpOf(dialledOrigin)} ${linkLost === 'slow' ? 'was too slow' : linkLost ? 'stopped answering' : 'could not be opened'}. It goes on timing every address and moves to the fastest one that works.`);
         backoff = 1000;
       }
     }
@@ -1056,14 +1086,20 @@ function dial() {
         const changed = !endpoints || endpoints.list.join() !== named.join();
         if (!endpoints) endpoints = new endpointsLib.Endpoints(named, dialledOrigin);
         else if (changed) endpoints.reset(named);
-        if (changed) log.info(`Termdeck can be reached at ${named.map(httpOf).join(' and ')}. This machine switches between them on its own if one stops working.`);
+        if (changed) log.info(`Termdeck can be reached at ${named.map(httpOf).join(' and ')}. This machine uses whichever answers fastest and switches on its own if one stops working.`);
         endpoints.dialOk();
         saveEndpoints();
-        armFailback(ws);
+        armReroute(ws);
       } else if (endpoints) {
         log.info(`Termdeck is no longer naming fallback addresses, so this machine stays on ${httpOf(MASTER)}.`);
         endpoints = null;
         try { fs.unlinkSync(ENDPOINTS_FILE); } catch { /* already gone */ }
+        // Still on an address the master no longer names: go home now, not whenever this
+        // link next happens to drop.
+        if (dialledOrigin !== MASTER) {
+          ws._rerouting = true;
+          try { ws.close(1000, 'reroute'); } catch { /* the close handler redials either way */ }
+        }
       }
       return;
     }
@@ -1102,7 +1138,7 @@ function dial() {
       redial();
       return;
     }
-    if (ws._movingHome) {
+    if (ws._rerouting) {
       log.info(`Reconnecting through ${httpOf(dialTarget())}.`);
       redial();
       return;
@@ -1252,7 +1288,9 @@ try {
   if (persistenceLib && persistenceLib.keepAwake) persistenceLib.keepAwake({ busy: () => require('./engine-runs').registry.busy() });
 } catch { /* sleeping is the old behaviour, never worth failing a boot over */ }
 
-dial();
+// Picking the route first is bounded (ROUTE_START_MS), and a failure in it is only a
+// missed pick, never a missed dial.
+pickStartRoute().catch(() => {}).then(dial);
 
 // Boot watchdog #2: code that runs but can never hand-shake. The boot counter
 // above can't see this one — the process is perfectly happy, it just never gets
