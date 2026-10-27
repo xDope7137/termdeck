@@ -7,7 +7,7 @@
 **Web control plane for the coding-agent CLIs already on your machines.**
 Claude Code, OpenAI Codex CLI and Grok: one fleet board, every device, tool approvals on your phone.
 
-[**termdeck.io**](https://termdeck.io?ref=github) · [Install](#install) · [How it works](#how-it-works) · [FAQ](#faq)
+[**termdeck.io**](https://termdeck.io?ref=github) · [Landing page](https://xdope7137.github.io/termdeck/) · [Install](#install) · [How it works](#how-it-works) · [FAQ](#faq)
 
 <br />
 
