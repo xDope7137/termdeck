@@ -69,7 +69,10 @@ const TYPE_FRAMES = {
 // So the agent's refusal arm is conditioned on an id, not merely on an unknown `t`.
 // Relax that and every machine answers 2,880 refusals a day to a frame nobody is
 // waiting on. tests/agent-capability-dispatch.mjs pins the silence.
-const UNANSWERED_FRAMES = ['keepalive'];
+//
+// `heartbeat` is the same shape: the master's echo of the agent's own numbered
+// heartbeat (agent/endpoints.js), which agent.js reads before dispatch.
+const UNANSWERED_FRAMES = ['keepalive', 'heartbeat'];
 
 // ---------------------------------------------------------------------------
 // Self-update: two boxes, two clocks, one contract

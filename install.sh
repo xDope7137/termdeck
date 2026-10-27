@@ -34,7 +34,7 @@ command -v curl >/dev/null 2>&1 || { echo "${RED}curl is required.${RESET}" >&2;
 # the 404, partway through, which is how the removed worktrees.js/context-doc.js would have
 # broken every fallback install. tests/agent-manifest.mjs pins this list to AGENT_FILES.
 FILES=$(curl -fsSL "$MASTER/download/agent/manifest.json" 2>/dev/null | tr -d '[]"[:space:]' | tr ',' ' ')
-[ -n "$FILES" ] || FILES="agent.js capabilities.js agent-protocol.js proc-tree.js log.js persistence.js win-launcher.js limits.js usage.js which.js diff.js mcp-config.js accounts.js codex-accounts.js session-title.js tail-read.js checkpoints.js index-head.js session-index.js session-settings.js session-head.js transcript.js claude-data.js pool.js project-files.js machine-config.js command-catalog.js usage-behaviour.js codex-attachment.js project-doc.js upload-types.js engine-events.js claude-events.js codex-events.js grok-events.js engine-runs.js live-output.js instance-lock.js update-signature.js engine-install.js extensions.js extensions-claude.js extensions-codex.js extensions-grok.js extensions-redact.js toml-edit.js json-edit.js package.json"
+[ -n "$FILES" ] || FILES="agent.js capabilities.js agent-protocol.js proc-tree.js log.js persistence.js win-launcher.js limits.js usage.js which.js diff.js mcp-config.js accounts.js codex-accounts.js session-title.js tail-read.js checkpoints.js index-head.js session-index.js session-settings.js session-head.js transcript.js claude-data.js pool.js project-files.js machine-config.js command-catalog.js usage-behaviour.js codex-attachment.js project-doc.js upload-types.js engine-events.js claude-events.js codex-events.js grok-events.js engine-runs.js live-output.js instance-lock.js update-signature.js engine-install.js extensions.js extensions-claude.js extensions-codex.js extensions-grok.js extensions-redact.js toml-edit.js json-edit.js endpoints.js package.json"
 
 # heal.sh drives this unattended (TERMDECK_NO_PROMPT=1) — a repair that stops to ask
 # a question is a repair nobody finishes.
@@ -168,6 +168,37 @@ write_marker() {
   chmod 600 "$HOME_DIR/persistence.json" 2>/dev/null || true
 }
 
+# launchd, through the domain-aware launchctl subcommands. The `unload` + `load` pair
+# this replaced left a Mac with no agent while this script printed "installed" three
+# ways: a job switched off in Login Items stays off through a plain load; load fails
+# ("Load failed: 5: Input/output error") while the old job is still being torn down
+# or with nobody logged in at the screen, and under `set -e` that aborted the install
+# after heal.sh had already removed the old one; and nothing checked that the agent
+# ever started. So: enable, bootstrap with a retry, legacy `load -w` only as a
+# fallback, then CHECK it runs. Returns non-zero when it does not; the caller says so.
+LAUNCHD_LABEL="io.termdeck.agent"
+launchd_up() {
+  LD_DOMAIN="gui/$(id -u)"
+  # No GUI session (an SSH login with nobody at the screen): the per-user domain
+  # still runs the job, and the gui one picks it up at the next login.
+  launchctl print "$LD_DOMAIN" >/dev/null 2>&1 || LD_DOMAIN="user/$(id -u)"
+  launchctl bootout "$LD_DOMAIN/$LAUNCHD_LABEL" >/dev/null 2>&1 || true
+  launchctl unload "$1" >/dev/null 2>&1 || true
+  launchctl enable "$LD_DOMAIN/$LAUNCHD_LABEL" >/dev/null 2>&1 || true
+  LD_LOADED=""
+  for _ in 1 2 3 4 5; do
+    if launchctl bootstrap "$LD_DOMAIN" "$1" >/dev/null 2>&1; then LD_LOADED=1; break; fi
+    sleep 1
+  done
+  [ -n "$LD_LOADED" ] || launchctl load -w "$1" >/dev/null 2>&1 || true
+  launchctl kickstart "$LD_DOMAIN/$LAUNCHD_LABEL" >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl print "$LD_DOMAIN/$LAUNCHD_LABEL" 2>/dev/null | grep -q 'state = running' && return 0
+    sleep 1
+  done
+  return 1
+}
+
 if [ "$OS" = "Linux" ] && command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
   UNIT="$HOME/.config/systemd/user/termdeck-agent.service"
   mkdir -p "$(dirname "$UNIT")"
@@ -248,11 +279,20 @@ elif [ "$OS" = "Darwin" ]; then
 </dict></plist>
 EOF
   chmod 600 "$PLIST"
-  launchctl unload "$PLIST" 2>/dev/null || true
-  launchctl load "$PLIST"
-  MODE="launchd"
-  SERVICE_MSG="running as the launchd agent 'io.termdeck.agent'."
-  SERVICE_HINT="macOS lists it under System Settings > General > Login Items & Extensions."
+  if launchd_up "$PLIST"; then
+    MODE="launchd"
+    SERVICE_MSG="running as the launchd agent 'io.termdeck.agent'."
+    SERVICE_HINT="macOS lists it under System Settings > General > Login Items & Extensions."
+  else
+    # Registered, and launchd still did not run it. Start it now so the machine is
+    # online, and say plainly that a restart will not bring it back (the machine
+    # card says so too, from the marker).
+    ( cd "$DIR" && TERMDECK_AGENT_TOKEN="$TERMDECK_AGENT_TOKEN" TERMDECK_MASTER_URL="$MASTER" nohup "$NODE" "$DIR/agent.js" >/dev/null 2>&1 & )
+    MODE="foreground"
+    SERVICE_MSG="started, but macOS did not start it as a background service."
+    SERVICE_WARN="It will NOT come back after a restart or logout. Turn on io.termdeck.agent under
+    System Settings > General > Login Items & Extensions, then run the install command again."
+  fi
 else
   # No systemd, no launchd. This used to be a bare `nohup ... &` — which dies at the
   # next reboot while the installer printed "installed" in green, the worst outcome

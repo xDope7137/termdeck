@@ -24,6 +24,11 @@ elif [ "$OS" = "Darwin" ]; then
     launchctl unload "$PLIST" >/dev/null 2>&1 || true
     rm -f "$PLIST"
   done
+  # install.sh bootstraps into gui/ or, with nobody at the screen, user/; the
+  # legacy unload above does not reach the user/ one.
+  for D in "gui/$(id -u)" "user/$(id -u)"; do
+    launchctl bootout "$D/io.termdeck.agent" >/dev/null 2>&1 || true
+  done
 fi
 # The @reboot line the no-service-manager branch may have written.
 if command -v crontab >/dev/null 2>&1; then

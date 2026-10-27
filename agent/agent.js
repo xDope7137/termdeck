@@ -237,10 +237,11 @@ if (instanceLock) {
   writeJson(STATE_FILE, st);
 })();
 
-let WebSocket, makeCapabilities, ROOTS, ENGINES, VERSION, updateSignature;
+let WebSocket, makeCapabilities, ROOTS, ENGINES, VERSION, updateSignature, endpointsLib;
 try {
   WebSocket = require('ws');
   updateSignature = require('./update-signature');
+  endpointsLib = require('./endpoints');
   ({ makeCapabilities, ROOTS, ENGINES } = require('./capabilities'));
   // Single source of truth — package.json is one of the files self-update re-downloads
   // alongside this one, so a hardcoded copy here always drifts out of sync with it.
@@ -375,6 +376,67 @@ const rememberedOrigin = () => cleanOrigin(readJson(WS_ORIGIN_FILE, {}).origin);
 // the very next attempt with nothing to restart.
 let MASTER = rememberedOrigin() || HOME_MASTER;
 
+// ---------------------------------------------------------------------------
+// The fallback addresses (agent/endpoints.js has the why and the rules).
+//
+// Separate from the advertised origin above, and it replaces it whenever the master sends
+// one: that origin is a single place to move TO, this is a list to move BETWEEN when the
+// network between this machine and one of them goes bad. Held under the same rules: an
+// address is only ever adopted off a welcome, only on this install's own site
+// (cleanOrigin), and home is always on the list as the floor.
+//
+// Persisted with the address in use, so a restart on a bad route goes straight to the one
+// that was working instead of rediscovering the bad one first.
+// ---------------------------------------------------------------------------
+const ENDPOINTS_FILE = path.join(HOME_DIR, '.endpoints.json');
+// Null until a master has named at least one address besides home: then nothing below
+// changes how this agent dials.
+let endpoints = (() => {
+  const saved = readJson(ENDPOINTS_FILE, null);
+  if (!saved || !Array.isArray(saved.endpoints)) return null;
+  const list = endpointsLib.endpointList(saved.endpoints, [HOME_MASTER], cleanOrigin);
+  return list.length > 1 ? new endpointsLib.Endpoints(list, cleanOrigin(saved.active)) : null;
+})();
+const saveEndpoints = () => {
+  if (!endpoints) return;
+  try { fs.mkdirSync(HOME_DIR, { recursive: true }); } catch { /* writeJson below swallows the consequence */ }
+  writeJson(ENDPOINTS_FILE, { endpoints: endpoints.list, active: endpoints.current, at: new Date().toISOString() });
+};
+const dialTarget = () => (endpoints ? endpoints.current : MASTER);
+const httpOf = (origin) => origin.replace(/^ws/, 'http');
+// What the next hello reports about the link, so the master's log shows which machines
+// fall back and how bad the route was when they did.
+const link = { failovers: 0, reason: null, rtt: null };
+
+const probe = (origin, timeoutMs) => endpointsLib.probe(httpOf(origin), timeoutMs);
+
+// While on a fallback, check the primary now and then and move back once it has stayed
+// healthy (endpoints.js Failback). One timer, because one socket is live at a time.
+const failback = new endpointsLib.Failback();
+let failbackTimer = null;
+function armFailback(sock) {
+  clearTimeout(failbackTimer);
+  if (!endpoints || !endpoints.onFallback) return;
+  failback.start(Date.now());
+  const tick = async () => {
+    if (sock.readyState !== WebSocket.OPEN || !endpoints || !endpoints.onFallback) return;
+    const ok = await probe(endpoints.primary);
+    if (sock.readyState !== WebSocket.OPEN || !endpoints || !endpoints.onFallback) return;
+    if (failback.result(ok, Date.now()) === 'failback') {
+      log.info(`Moving back to ${httpOf(endpoints.primary)}: it has answered every check for ${Math.round(failback.trial / 60_000)} minutes.`);
+      endpoints.home();
+      saveEndpoints();
+      sock._movingHome = true;
+      try { sock.close(1000, 'failback'); } catch { /* the close handler redials either way */ }
+      return;
+    }
+    failbackTimer = setTimeout(tick, Math.max(0, failback.nextAt - Date.now()));
+    failbackTimer.unref();
+  };
+  failbackTimer = setTimeout(tick, Math.max(0, failback.nextAt - Date.now()));
+  failbackTimer.unref();
+}
+
 if (!TOKEN) { console.error('TERMDECK_AGENT_TOKEN is required'); process.exit(1); }
 
 // This agent used to POST its own errors to Datadog's log intake. That is GONE:
@@ -394,7 +456,7 @@ if (!TOKEN) { console.error('TERMDECK_AGENT_TOKEN is required'); process.exit(1)
 // capabilities.js. Refuses while a Termdeck-owned claude/codex turn is running so a live
 // session started by Termdeck isn't cut off. A terminal-held session can keep running:
 // the master passes force=true when it knows Termdeck itself does not own an active turn.
-const AGENT_FILES = ['agent.js', 'capabilities.js', 'agent-protocol.js', 'proc-tree.js', 'log.js', 'persistence.js', 'win-launcher.js', 'limits.js', 'usage.js', 'which.js', 'diff.js', 'mcp-config.js', 'accounts.js', 'codex-accounts.js', 'session-title.js', 'tail-read.js', 'checkpoints.js', 'index-head.js', 'session-index.js', 'session-settings.js', 'session-head.js', 'transcript.js', 'claude-data.js', 'pool.js', 'project-files.js', 'machine-config.js', 'command-catalog.js', 'usage-behaviour.js', 'codex-attachment.js', 'project-doc.js', 'upload-types.js', 'engine-events.js', 'claude-events.js', 'codex-events.js', 'grok-events.js', 'engine-runs.js', 'live-output.js', 'instance-lock.js', 'update-signature.js', 'engine-install.js', 'extensions.js', 'extensions-claude.js', 'extensions-codex.js', 'extensions-grok.js', 'extensions-redact.js', 'toml-edit.js', 'json-edit.js', 'package.json'];
+const AGENT_FILES = ['agent.js', 'capabilities.js', 'agent-protocol.js', 'proc-tree.js', 'log.js', 'persistence.js', 'win-launcher.js', 'limits.js', 'usage.js', 'which.js', 'diff.js', 'mcp-config.js', 'accounts.js', 'codex-accounts.js', 'session-title.js', 'tail-read.js', 'checkpoints.js', 'index-head.js', 'session-index.js', 'session-settings.js', 'session-head.js', 'transcript.js', 'claude-data.js', 'pool.js', 'project-files.js', 'machine-config.js', 'command-catalog.js', 'usage-behaviour.js', 'codex-attachment.js', 'project-doc.js', 'upload-types.js', 'engine-events.js', 'claude-events.js', 'codex-events.js', 'grok-events.js', 'engine-runs.js', 'live-output.js', 'instance-lock.js', 'update-signature.js', 'engine-install.js', 'extensions.js', 'extensions-claude.js', 'extensions-codex.js', 'extensions-grok.js', 'extensions-redact.js', 'toml-edit.js', 'json-edit.js', 'endpoints.js', 'package.json'];
 
 // Compile-check before anything is installed. A truncated download, an HTML error
 // page from the tunnel, a 200 with an empty body — all of them used to be written
@@ -739,6 +801,12 @@ async function installUpdate(ws, caps, req) {
 // left to decide is WHEN to exit, and the answer is once no turn would die with it.
 // `force` is the operator's override here too.
 const UPDATE_RESTART_POLL_MS = 1000;
+// Non-zero on purpose, like undoUpdate's exit(1). launchd's plist says
+// SuccessfulExit=false so a clean exit (another agent took this install) stays
+// stopped; an update restart that exited 0 was read the same way, and every Mac
+// went offline on its first update until the owner logged in again. systemd
+// (Restart=always) and the Windows loop relaunch on any code. 75 is EX_TEMPFAIL.
+const UPDATE_RESTART_EXIT_CODE = 75;
 function restartWhenIdle(caps, force) {
   if (!force && caps.busy()) {
     if (!restartWhenIdle.waiting) log.info('A chat started while the update was installing; the agent restarts to apply it as soon as that chat is idle.');
@@ -747,7 +815,7 @@ function restartWhenIdle(caps, force) {
     return;
   }
   try { caps.destroy(); } catch {}
-  process.exit(0);
+  process.exit(UPDATE_RESTART_EXIT_CODE);
 }
 
 let backoff = 1000;
@@ -779,7 +847,7 @@ const HANDSHAKE_MS = Number(process.env.TERMDECK_AGENT_HANDSHAKE_MS) || 15_000;
 const HANDSHAKE_TIMEOUT_MSG = 'Opening handshake has timed out'; // ws's own wording, lib/websocket.js
 
 function dial() {
-  const ws = new WebSocket(MASTER + '/agent', {
+  const ws = new WebSocket(dialTarget() + '/agent', {
     headers: { Authorization: `Bearer ${TOKEN}` },
     // Offer permessage-deflate so transcript/listTree frames compress on the wire.
     // threshold skips tiny control frames; master negotiates no-context-takeover.
@@ -811,28 +879,53 @@ function dial() {
   // one machine took 71s to come back and another 6 minutes, with the box itself
   // perfectly healthy and every chat on it dark the whole time. public/js/ws.js
   // has carried this exact watchdog for the browser for the same reason
-  // (KNOWN-BUGS #28); the agent simply never got it. The master beats every 30s
-  // (ping + a `keepalive` data frame, lib/cloud/relay.js), so silence well past
-  // two of those is a dead pipe, not a quiet one.
-  const DEAD_AFTER_MS = Number(process.env.TERMDECK_AGENT_DEAD_MS) || 75_000;
+  // (KNOWN-BUGS #28); the agent simply never got it. The master beats every 10s
+  // (ping + a `keepalive` data frame, lib/cloud/relay.js), so silence past three
+  // of those is a dead pipe, not a quiet one. It was 75s against a 30s beat, which
+  // on a lossy route meant a minute and a half of dark chats per drop.
+  const DEAD_AFTER_MS = Number(process.env.TERMDECK_AGENT_DEAD_MS) || 35_000;
   let lastFrameAt = Date.now();
   // Whether THIS dial got as far as a welcome, which is the agent's own definition of the
   // master having accepted it. Everything the advertised origin does keys off this rather
   // than off 'open', because an origin that accepts TCP and upgrades but is not Termdeck is
   // exactly the failure worth surviving.
   let welcomed = false;
-  const dialledOrigin = MASTER;
+  const dialledOrigin = dialTarget();
+  // How this dial ended, for the fallback decision in redial(): an HTTP answer, the close
+  // code, and whether WE cut the link because it went bad (endpoints.js LinkHealth).
+  let httpStatus = null;
+  let closeCode = null;
+  let linkLost = null;
+  const health = new endpointsLib.LinkHealth();
   // Both endings land here and exactly one fires per dial — which is not automatic once
   // `unexpected-response` has a listener (see below), hence the guard.
   let redialled = false;
   const redial = () => {
     if (redialled) return;
     redialled = true;
+    clearTimeout(failbackTimer);
+    if (health.rtt() != null) link.rtt = health.rtt();
+    // Move to the next address when this one let us down: we cut a bad link, or a dial
+    // failed on the path itself (endpoints.js dialFailedOnPath). Anything the master
+    // answered, a 502 during a restart included, would be the same on every address.
+    if (endpoints) {
+      const moved = linkLost ? endpoints.next()
+        : endpointsLib.dialFailedOnPath({ welcomed, httpStatus, closeCode }) ? endpoints.dialFailed()
+          : (endpoints.dialOk(), false);
+      if (moved) {
+        link.failovers += 1;
+        link.reason = linkLost || 'dial';
+        saveEndpoints();
+        log.warn(`Switching to ${httpOf(endpoints.current)}: the connection through ${httpOf(dialledOrigin)} ${linkLost === 'slow' ? 'was too slow' : linkLost ? 'stopped answering' : 'could not be opened'}. It moves back once that address has been healthy for a while.`);
+        backoff = 1000;
+      }
+    }
     // Fall back on the FIRST failure of an advertised origin, never on the second. See the
-    // WS_ORIGIN_FILE header: the five-minute boot watchdog will undo a good self-update and
-    // quarantine the version if this agent spends that long without a welcome, so a
-    // patient retry here is how one wrong origin becomes a fleet-wide rollback.
-    if (!welcomed && dialledOrigin !== HOME_MASTER) {
+    // WS_ORIGIN_FILE header: a dial that cannot reach any welcome for five minutes is
+    // what the boot watchdog reads as a bad release, so a patient retry here is how one
+    // wrong origin turns into a rollback. Only without a fallback list, which has its own
+    // rotation and always includes home.
+    if (!endpoints && !welcomed && dialledOrigin !== HOME_MASTER) {
       log.warn(`Could not reach Termdeck at ${dialledOrigin}. Going back to ${HOME_MASTER}, which is where this machine was set up.`);
       try { fs.unlinkSync(WS_ORIGIN_FILE); } catch { /* never seen one, or already gone */ }
       MASTER = HOME_MASTER;
@@ -860,6 +953,7 @@ function dial() {
       if (ws.readyState !== WebSocket.OPEN) return;
       if (Date.now() - lastFrameAt < DEAD_AFTER_MS) return;
       log.warn(`No word from Termdeck for ${Math.round((Date.now() - lastFrameAt) / 1000)}s — treating this connection as dead and reconnecting.`);
+      linkLost = 'silent';
       try { ws.terminate(); } catch {} // terminate, not close: a half-open socket never completes a closing handshake
     }, Math.max(1000, Math.round(DEAD_AFTER_MS / 5)));
     // codex/grok flags gate the master's new-chat engine picker (the read layer works regardless).
@@ -883,7 +977,7 @@ function dial() {
     Promise.race([indexPeek, new Promise((r) => setTimeout(r, INDEX_PEEK_MS, null))]).catch(() => null).then((index) => {
       if (ws.readyState !== WebSocket.OPEN) return;
       try {
-        ws.send(JSON.stringify({ type: 'hello', platform: os.platform(), version: VERSION, roots: ROOTS, caps: protocol.opNames(), runEngines: ['claude', 'codex', 'grok'], wire: protocol.WIRE, codex: fs.existsSync(ENGINES.codex), grok: fs.existsSync(ENGINES.grok), runs: caps.engineRuns(), runServers: caps.engineServers ? caps.engineServers() : undefined, persistence: PERSISTENCE || undefined, quarantine: readJson(QUARANTINE_FILE, null) || undefined, index: index || undefined }));
+        ws.send(JSON.stringify({ type: 'hello', platform: os.platform(), version: VERSION, roots: ROOTS, caps: protocol.opNames(), runEngines: ['claude', 'codex', 'grok'], wire: protocol.WIRE, codex: fs.existsSync(ENGINES.codex), grok: fs.existsSync(ENGINES.grok), runs: caps.engineRuns(), runServers: caps.engineServers ? caps.engineServers() : undefined, persistence: PERSISTENCE || undefined, quarantine: readJson(QUARANTINE_FILE, null) || undefined, index: index || undefined, link: { endpoint: httpOf(dialledOrigin), rtt: link.rtt, failovers: link.failovers, reason: link.reason } }));
       } catch { /* the socket closed under us; the redial says hello again */ }
     });
     // The origin this dial actually used, which is not always the one in agent.env: the
@@ -893,11 +987,24 @@ function dial() {
     // master for remote agents) idle-drops a WebSocket at ~100s and does NOT count WS
     // ping/pong CONTROL frames as activity — only DATA frames. Without this the only
     // agent→master traffic between capability calls is pongs, so CF severs the socket
-    // on a fixed cycle. A 25s data frame (< CF's window) prevents it. The master
-    // ignores unknown `type` (see lib/cloud/relay.js).
+    // on a fixed cycle. A data frame well inside CF's window prevents it.
+    //
+    // It is also how this agent judges the route. Each heartbeat carries a number the
+    // master echoes (`t: 'heartbeat'`), and two unanswered in a row, or a minute of slow
+    // answers, moves this machine to its next address. Only with a list to move along:
+    // without one the dead-link watchdog above is the whole story, as it always was.
     heartbeat = setInterval(() => {
-      try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'heartbeat' })); } catch {}
-    }, 25000);
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const n = health.beat(Date.now(), ws.bufferedAmount);
+      try { ws.send(JSON.stringify({ type: 'heartbeat', n, rtt: health.rtt() ?? undefined })); } catch {}
+      const verdict = endpoints && welcomed ? health.verdict() : null;
+      if (!verdict) return;
+      linkLost = verdict;
+      log.warn(verdict === 'slow'
+        ? `Termdeck has been taking ${health.rtt()}ms to answer for the last minute through ${httpOf(dialledOrigin)}.`
+        : `Termdeck stopped answering through ${httpOf(dialledOrigin)}.`);
+      try { ws.terminate(); } catch {}
+    }, endpointsLib.HEARTBEAT_MS);
   });
   // Capability requests from the master (readFile/stat/watch/spawn). ws auto-responds to
   // server pings with pong at the protocol level; the heartbeat above covers the tunnel.
@@ -908,6 +1015,7 @@ function dial() {
   ws.on('message', (buf) => {
     lastFrameAt = Date.now();
     let m; try { m = JSON.parse(buf); } catch { return; }
+    if (m.t === 'heartbeat') return void health.echo(m.n, Date.now());
     if (m.t === 'update') return void selfUpdate(ws, caps, m);
     // The master accepted us. THIS is what makes an update permanent — not the
     // files landing, not the process starting. Cleared regardless of whether our
@@ -941,6 +1049,22 @@ function dial() {
       // indistinguishable from the seam not existing. The live socket is untouched: this
       // steers the NEXT dial, and the current one is working by definition.
       MASTER = advertised || HOME_MASTER;
+      // The fallback list. Named on every welcome, so a list the master stops sending is
+      // dropped here the same way, and a changed one replaces the old.
+      const named = Array.isArray(m.endpoints) ? endpointsLib.endpointList(m.endpoints, [HOME_MASTER], cleanOrigin) : [];
+      if (named.length > 1) {
+        const changed = !endpoints || endpoints.list.join() !== named.join();
+        if (!endpoints) endpoints = new endpointsLib.Endpoints(named, dialledOrigin);
+        else if (changed) endpoints.reset(named);
+        if (changed) log.info(`Termdeck can be reached at ${named.map(httpOf).join(' and ')}. This machine switches between them on its own if one stops working.`);
+        endpoints.dialOk();
+        saveEndpoints();
+        armFailback(ws);
+      } else if (endpoints) {
+        log.info(`Termdeck is no longer naming fallback addresses, so this machine stays on ${httpOf(MASTER)}.`);
+        endpoints = null;
+        try { fs.unlinkSync(ENDPOINTS_FILE); } catch { /* already gone */ }
+      }
       return;
     }
     caps.handle(m);
@@ -948,6 +1072,7 @@ function dial() {
   ws.on('close', (code, reason) => {
     clearInterval(heartbeat);
     clearInterval(deadCheck);
+    closeCode = code;
     // Don't kill anything. This close fires for a master deploy restart, a
     // Cloudflare idle drop, a missed pong: none of which say anything about the
     // health of a turn. Engine runs keep going and the next master resubscribes;
@@ -977,6 +1102,16 @@ function dial() {
       redial();
       return;
     }
+    if (ws._movingHome) {
+      log.info(`Reconnecting through ${httpOf(dialTarget())}.`);
+      redial();
+      return;
+    }
+    // A link we cut for being bad has already said why, and redial() says where next.
+    if (linkLost) {
+      redial();
+      return;
+    }
     // Codes worth naming, because they are the ones customers see and they mean
     // very different things: 1001/1006 is the network or Cloudflare dropping an
     // idle tunnel (routine, reconnects), 1000 is usually Termdeck restarting for
@@ -997,6 +1132,7 @@ function dial() {
   // agent reconnecting at all, on every machine, for every transient 5xx.
   ws.on('unexpected-response', (req, res) => {
     const status = res.statusCode;
+    httpStatus = status;
     res.resume();                       // drain, or the socket is held open by an unread body
     try { req.destroy(); } catch {}
     caps.park();                        // symmetry with close: never kill a run over a link answer
@@ -1122,8 +1258,30 @@ dial();
 // above can't see this one — the process is perfectly happy, it just never gets
 // accepted (a capability surface the master won't talk to, a socket that dials
 // and dies). unref'd so it is never the reason we stay alive.
+//
+// Five minutes without a welcome only blames the update when Termdeck is otherwise
+// reachable: some address this agent dials answers /healthz. On a bad route every
+// dial can fail for longer than that with the new code perfectly fine, and this used
+// to roll it back and quarantine it anyway (0.1.843, on a machine behind Airtel). If
+// nothing answers, the network is the problem, and the check comes back every minute
+// until either a welcome lands or Termdeck answers without one.
 if (readJson(STATE_FILE, null)) {
-  setTimeout(() => {
-    if (readJson(STATE_FILE, null)) undoUpdate(`could not reach Termdeck for ${Math.round(HEAL_HANDSHAKE_MS / 60000)} minutes after updating`);
-  }, HEAL_HANDSHAKE_MS).unref();
+  const HEAL_MS = Number(process.env.TERMDECK_AGENT_HEAL_MS) || HEAL_HANDSHAKE_MS;
+  let saidNetwork = false;
+  const check = async () => {
+    if (!readJson(STATE_FILE, null)) return;
+    const targets = endpoints ? endpoints.list : [...new Set([MASTER, HOME_MASTER])];
+    for (const origin of targets) {
+      if (await probe(origin, 10_000)) {
+        if (readJson(STATE_FILE, null)) undoUpdate(`Termdeck answers at ${httpOf(origin)} but this version could not connect to it for ${Math.round(HEAL_MS / 60000)} minutes after updating`);
+        return;
+      }
+    }
+    if (!saidNetwork) {
+      saidNetwork = true;
+      log.warn(`Still not connected ${Math.round(HEAL_MS / 60000)} minutes after updating to ${VERSION}, and Termdeck is not reachable from this machine at all, so the network is the likely cause rather than the update. Keeping it and retrying.`);
+    }
+    setTimeout(check, Math.min(60_000, HEAL_MS)).unref();
+  };
+  setTimeout(check, HEAL_MS).unref();
 }
