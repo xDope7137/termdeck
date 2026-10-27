@@ -133,6 +133,8 @@ macOS, Linux and Windows. The agent installs as a user service (`launchd` / `sys
 The agent **dials out** over a reverse WebSocket. There is no inbound port, no firewall rule and no
 tunnel on your side. Turns run on your machine: the agent spawns the CLI, reads its stream and keeps
 a numbered log, so a dropped link or a restart of the master is a viewer going away, not a lost run.
+If your network routes termdeck.io badly, the agent and the browser move their connection to
+edge.termdeck.io on their own and come back once termdeck.io is healthy.
 
 ```
 your machine                          termdeck.io

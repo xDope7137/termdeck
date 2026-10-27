@@ -4,6 +4,17 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.149x · 2026-10-27
+
+- **A second route to Termdeck** *(agent)*. Some internet providers route termdeck.io badly enough
+  to drop the connection every few minutes while everything else works. The agent now moves to
+  edge.termdeck.io on its own after two missed heartbeats or a minute of slow ones, and moves back
+  once termdeck.io has been healthy for five minutes. The browser does the same for its live
+  connection; the page stays on termdeck.io. If your firewall allow-lists hosts, allow both.
+- **Drops are noticed in about 30 seconds**, down from up to 90, on the agent and in the browser.
+- **A flaky network no longer rolls back a good update** *(agent)*. An update is only undone when
+  Termdeck is reachable and the new version still cannot connect.
+
 ## 0.1.148x · 2026-10-26
 
 - **Answer the questions Codex asks while it keeps working** *(agent)*. Codex now asks most of its
