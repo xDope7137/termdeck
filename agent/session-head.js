@@ -210,58 +210,6 @@ function claudeTailCwd(text) {
   return null;
 }
 
-// Which folder a chat's PROJECT is, given the cwd it opened in (`home`, from the head)
-// and the cwd on its newest record (`latest`, from claudeTailCwd above).
-//
-// Not simply `latest`, which is what this used to be. Claude Code stamps `cwd` on every
-// record, and its Bash tool's shell keeps its directory between calls, so a single
-// `cd server/app && grep ...` rewrites the chat's cwd for every record after it. Reading
-// the newest value meant an agent's `cd` looked exactly like the chat MOVING: the file
-// dock re-rooted onto whatever subdirectory a command happened to use, collapsing the
-// tree and dropping the open file every time (one real 211-line transcript on this repo's
-// own box did that 9 times, once per `cd`), and cwdFor() then spawned the next turn there.
-//
-// The only change worth calling a move is crossing a WORKTREE boundary, which is the case
-// the tail cwd was read for to begin with. So the answer is always a project or a worktree
-// ROOT, never a subdirectory of either:
-//
-//   <proj>              ->  <proj>/server/app            stay:  a cd inside the project
-//   <proj>              ->  <proj>/.claude/worktrees/x   enter: that worktree
-//   <proj>/.../wt/x     ->  <proj>/.../wt/x/server       stay:  still that worktree
-//   <proj>/.../wt/x     ->  <proj>/anywhere              leave: the project it was cut from
-//
-// Same shape as codexTailWorktree below, one boundary rather than a command count: Claude
-// records its cwd as a field, so this needs no inference, only a rule for which changes
-// are real.
-//
-// Mirrored by public/js/worktree-fold.js's projectCwd, which answers the same question for
-// the browser (main.js hands the dock that answer). The two MUST agree, and tests/project-cwd.mjs
-// runs both copies over one table to prove it.
-const WORKTREE_PARTS_RE = /^(.*?)([\\/]\.claude[\\/-]worktrees[\\/][^\\/]+)(?:[\\/]|$)/i;
-// Trailing separators only. normalizeCwd() is the fuller rule but it lives in
-// claude-data.js, which requires THIS file, and a cycle for a `//` nobody writes is a bad
-// trade. readIndexHead normalises the answer on the way out anyway.
-const stripEnd = (cwd) => String(cwd == null ? '' : cwd).replace(/[\\/]+$/, '');
-
-// The repo and the worktree root for a path inside a worktree, or null anywhere else.
-function worktreeParts(cwd) {
-  const m = WORKTREE_PARTS_RE.exec(cwd);
-  return m ? { base: m[1], root: m[1] + m[2] } : null;
-}
-
-function projectCwd(home, latest) {
-  const a = stripEnd(home);
-  const b = stripEnd(latest);
-  if (!b) return a || null; // a record with no cwd never un-sets one
-  const to = worktreeParts(b);
-  if (!a) return to ? to.root : b; // nothing to compare against: take what we have
-  const from = worktreeParts(a);
-  // Both sides of the same boundary, or neither in a worktree at all: a plain cd.
-  if ((from ? from.root : null) === (to ? to.root : null)) return a;
-  if (to) return to.root;          // moved INTO a worktree
-  return from.base || a;           // moved back OUT of one, to the repo it was cut from
-}
-
 // The raw last user prompt (last-prompt record), scanning the tail bottom-up. Last-resort
 // title when the head first-prompt is lost — e.g. a huge image-bearing first message
 // overflows HEAD_BYTES and its line won't parse — and the CLI wrote no custom/ai title.
@@ -717,7 +665,7 @@ function codexTurnState(text) {
 module.exports = {
   codexOrigin, codexTurnState,
   claudeHead, codexHead, grokHead,
-  claudeTailTitle, claudeCustomTitle, claudeTailCwd, projectCwd, claudeLastPrompt, claudeLastCommand, claudeLastCommandAt,
+  claudeTailTitle, claudeCustomTitle, claudeTailCwd, claudeLastPrompt, claudeLastCommand, claudeLastCommandAt,
   codexLastPrompt, codexTailWorktree, codexTailLeavesBase,
   isUsableTitle, readUserText, salvagePartialUserText, salvagePartialCodexUserText,
 };

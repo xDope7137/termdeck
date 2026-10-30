@@ -4,6 +4,11 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1497 · 2026-10-30
+
+- **The files panel follows the chat** *(agent)*. When the agent changes into another folder, the
+  explorer re-roots there and lists that folder's files, the same directory the CLI is working in.
+
 ## 0.1.149x · 2026-10-27
 
 - **The faster route, not just the working one** *(agent)*. The agent times termdeck.io and

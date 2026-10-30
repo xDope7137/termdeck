@@ -36,7 +36,7 @@
 const { decodeRollout, lastClaudeUserInputAt, lastCodexUserInputAt, lastGrokUserInputAt, lastRecordAt, firstGrokUserInput } = require('./transcript');
 const { cleanTitle, normalizeCwd } = require('./claude-data');
 const { scanTailWidening, REVISIT_SLACK } = require('./tail-read');
-const { codexOrigin, codexTurnState, claudeHead, codexHead, grokHead, claudeTailTitle, claudeCustomTitle, claudeTailCwd, projectCwd, claudeLastPrompt, claudeLastCommand, claudeLastCommandAt, codexLastPrompt, codexTailWorktree, codexTailLeavesBase } = require('./session-head');
+const { codexOrigin, codexTurnState, claudeHead, codexHead, grokHead, claudeTailTitle, claudeCustomTitle, claudeTailCwd, claudeLastPrompt, claudeLastCommand, claudeLastCommandAt, codexLastPrompt, codexTailWorktree, codexTailLeavesBase } = require('./session-head');
 
 // The index's own probe budget — deliberately not lib/tail-read.js's preview
 // budget, which is sized to render messages rather than to answer two questions.
@@ -192,14 +192,11 @@ async function readIndexHead(row, io) {
             }
           }
         }
-        // A chat's cwd can change mid-conversation (promoted into a fresh worktree)
-        // past HEAD_BYTES, and the tail is the only place that shows it. But NOT
-        // every change is a move: an agent's `cd` into a subdirectory rewrites the
-        // cwd on every record after it, and reading that as a relocation is what
-        // sent the file dock chasing the agent around the checkout. projectCwd is
-        // the rule for which ones count, and it answers with a project or worktree
-        // ROOT either way, which is what spawning and resuming want too.
-        h.cwd = projectCwd(h.cwd, claudeTailCwd(tailText));
+        // A chat's cwd can change mid-conversation (an agent's `cd`, a move into a
+        // worktree) past HEAD_BYTES. The tail's cwd is the current truth, so it wins
+        // over the head's when present: the files dock lists where the agent is now.
+        const tailCwd = claudeTailCwd(tailText);
+        if (tailCwd) h.cwd = tailCwd;
         lastUserAt = lastClaudeUserInputAt(tailText);
         lastActivityAt = lastRecordAt(tailText, 'claude');
         // No prose in the small tail: remember the bottom rung now, because a
