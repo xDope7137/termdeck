@@ -70,8 +70,9 @@ Three things fall out of that, for free:
 | Native plan mode | ● | ● | ○ |
 | Resumable in its own CLI afterwards | ● | ● | ● |
 
-The engine is picked per chat. They share one sidebar, one transcript renderer and one permission
-card, so there is nothing new to learn when you switch.
+The engine is picked per chat. They share one sidebar, one composer and one permission
+card, so there is nothing new to learn when you switch. Codex chats are drawn from Codex's own turn
+and item model rather than reshaped into another engine's.
 
 <br />
 
@@ -225,8 +226,10 @@ it is tested.
 
 #### Does it work with Codex CLI?
 
-Yes. Full turn driving over one shared `codex app-server` per machine, including native plan mode,
-with Claude Code and Grok in the same sidebar.
+Yes, natively. The agent speaks the open `codex app-server` protocol, one shared server per machine
+(Codex 0.163.0 or newer). History is read from Codex itself and drawn in Codex's own turns and items,
+approval cards offer Codex's own decisions, and plan mode, steering, `/compact`, `/review`, branching
+and rewinding are Codex's own operations. Claude Code and Grok sit in the same sidebar.
 
 #### What can the agent actually touch?
 

@@ -437,4 +437,113 @@ async function readIndexHead(row, io) {
   }
 }
 
-module.exports = { readIndexHead, scanCodexLifecycle, HEAD_BYTES, TAIL_BYTES, CODEX_LIFECYCLE_CHUNK_BYTES };
+// worktreeOf for a head built from a thread record: the PROJECT a chat working
+// in a git worktree belongs to, the field readIndexHead sets when it follows a
+// rollout into one (session-head.js codexTailWorktree) and the sidebar folds by
+// (public/js/worktree-fold.js). The record names the folder the thread works in
+// (`cwd`) and whether Codex found a repo there (`gitInfo`), not the repo's main
+// checkout, so that is the question asked here:
+//   * the CLI's own shape, `<repo>/.claude/worktrees/<name>` (or .claude-worktrees),
+//     answers without git;
+//   * otherwise, only for a thread Codex saw a repo for and only on the agent
+//     (io.worktreesOf / io.mainCheckoutOf, a memoized `git worktree list`), a
+//     cwd inside one of the repo's linked checkouts belongs to its main checkout.
+// Null for the main checkout itself, a folder that is not a repo, or no answer.
+const THREAD_WORKTREE_SHAPE = /^(.+?)[\\/]\.claude[\\/-]worktrees[\\/][^\\/]+(?:[\\/]|$)/i; // public/js/worktree-fold.js WORKTREE_SPLIT
+const sameSep = (p) => String(p).replace(/\\/g, '/').replace(/\/+$/, '');
+const within = (dir, root) => { const d = sameSep(dir); const r = sameSep(root); return !!r && (d === r || d.startsWith(`${r}/`)); };
+async function codexThreadWorktreeOf(thread, cwd, io) {
+  if (!cwd) return null;
+  const shaped = THREAD_WORKTREE_SHAPE.exec(cwd);
+  if (shaped && shaped[1]) return shaped[1];
+  if (!thread.gitInfo || typeof thread.gitInfo !== 'object') return null;
+  if (!io || typeof io.worktreesOf !== 'function' || typeof io.mainCheckoutOf !== 'function') return null;
+  try {
+    const linked = await io.worktreesOf(cwd);
+    if (!Array.isArray(linked) || !linked.some((root) => typeof root === 'string' && within(cwd, root))) return null;
+    // A linked checkout may sit inside the main one (`git worktree add wt/x`):
+    // being inside a linked root is what says it is not the main checkout.
+    const main = await io.mainCheckoutOf(cwd);
+    return typeof main === 'string' && main && sameSep(main) !== sameSep(cwd) ? main.replace(/[\\/]+$/, '') : null;
+  } catch {
+    return null;
+  }
+}
+
+// A Codex head off the app-server's own Thread record (thread/list, through the
+// native harness: agent/codex-harness.js listThreads), instead of out of the
+// rollout's bytes. Same fields readIndexHead answers for a codex row, so the
+// master cannot tell which one built it. What the record says is Codex's own
+// answer to the questions the byte parse infers: the title is the thread's name
+// (a rename) or its preview (the opening prompt), the cwd and the parent are
+// fields rather than a session_meta to find, and recencyAt is when the last turn
+// STARTED, which is what the sidebar sorts by.
+//
+// The one question the record cannot answer is whether ANOTHER process is in a
+// turn: status is this server's view, and a thread a terminal TUI is driving is
+// `notLoaded` here. So unless this server says the thread is active, the turn
+// state is still the rollout's lifecycle scan, which is incremental from the
+// previous parse's size and costs a chunk, not a head-and-tail parse.
+//
+// `row` is the same ask readIndexHead takes (headAsk); `io` the same io.
+// Never throws, like readIndexHead: a failed lifecycle read keeps the turn state
+// the previous parse had.
+async function codexThreadHead(thread, row, io) {
+  const t = thread && typeof thread === 'object' ? thread : {};
+  const ms = (s) => (Number.isFinite(s) && s > 0 ? Math.round(s * 1000) : null);
+  const prevAt = row.prevAt || null;
+  const shrank = Number.isFinite(row.prevSizeBytes) && row.prevSizeBytes > row.sizeBytes;
+  let lastUserAt = ms(t.recencyAt) || ms(t.createdAt);
+  // A floor, as in readIndexHead: a transcript only grows, so a carried prompt time
+  // never moves back (recencyAt is whole seconds, the byte parse's is ms).
+  if (prevAt != null && (lastUserAt == null || (!shrank && lastUserAt < prevAt))) lastUserAt = prevAt;
+  const lastActivityAt = ms(t.updatedAt) || row.prevActivityAt || null;
+  const src = t.source;
+  const spawn = src && typeof src === 'object' ? ((src.subagent || src.subAgent || {}).thread_spawn || null) : null;
+  const subagentOf = t.parentThreadId || (spawn ? spawn.parent_thread_id || 'unknown-parent' : null)
+    || (src && typeof src === 'object' && (src.subagent || src.subAgent) ? 'unknown-parent' : null);
+  const origin = t.originator === 'termdeck' ? 'termdeck'
+    : src === 'cli' ? 'cli'
+      : src === 'vscode' ? 'external' : null;
+  const prevTurn = Object.prototype.hasOwnProperty.call(row, 'prevCodexTurn') ? row.prevCodexTurn : null;
+  let codexTurn = prevTurn;
+  const status = t.status && t.status.type;
+  if (status === 'active') {
+    codexTurn = { active: true, at: lastActivityAt || Date.now(), outcome: 'running' };
+  } else {
+    try {
+      let scanned;
+      if (row.zst) {
+        scanned = codexTurnState(decodeRollout(await io.readAll(row.path), row.path));
+      } else {
+        const hasPrevious = prevTurn !== null && Number.isFinite(row.prevSizeBytes)
+          && row.prevSizeBytes >= 0 && row.prevSizeBytes <= row.sizeBytes;
+        const floor = hasPrevious ? Math.max(0, row.prevSizeBytes - REVISIT_SLACK) : 0;
+        scanned = await scanCodexLifecycle(row.path, row.sizeBytes, floor, (offset, length) => io.readFile(row.path, offset, length));
+      }
+      if (scanned !== undefined) {
+        codexTurn = !scanned ? prevTurn : prevTurn && prevTurn.at > scanned.at ? prevTurn : scanned;
+      }
+    } catch {}
+  }
+  const title = typeof t.name === 'string' && t.name.trim() ? t.name : typeof t.preview === 'string' && t.preview.trim() ? t.preview : null;
+  const cwd = typeof t.cwd === 'string' && t.cwd ? normalizeCwd(t.cwd) : null;
+  const worktreeOf = await codexThreadWorktreeOf(t, cwd, io);
+  return {
+    cwd,
+    title: title ? cleanTitle(title) : null,
+    titleKind: null,
+    lastUserAt,
+    lastActivityAt,
+    origin,
+    codexTurn,
+    firstUserUuid: null,
+    subagentOf,
+    // Set only when the cwd is a git worktree, as readIndexHead's. Additive.
+    ...(worktreeOf ? { worktreeOf: normalizeCwd(worktreeOf) } : {}),
+    noPromptBelow: null,
+    noTitleBelow: null,
+  };
+}
+
+module.exports = { readIndexHead, codexThreadHead, codexThreadWorktreeOf, scanCodexLifecycle, HEAD_BYTES, TAIL_BYTES, CODEX_LIFECYCLE_CHUNK_BYTES };

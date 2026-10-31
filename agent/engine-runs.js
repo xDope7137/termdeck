@@ -31,6 +31,17 @@
 // its translator; the approval policy stays on the master, which answers every
 // approval the run raises.
 //
+// Codex has two harnesses on that one shape while the native one is proven
+// (docs/codex-native.md). The NATIVE one (agent/codex-harness.js, the default)
+// drives the same shared server through lib/codex-rpc.js and lets Codex's own
+// notifications through as `codex.event`, and the agent says so with `codexNative`
+// in its hello caps. The LEGACY one (TERMDECK_CODEX_HARNESS=legacy) is the code
+// below that translates Codex into Claude's blocks with lib/codex-events.js; it is
+// deleted once nothing needs it. One harness per process, never both: two
+// app-servers on one machine would each take thread locks the other then refuses.
+// Either way the runs live here, in the same registry, sequenced log and
+// subscriptions as every other engine.
+//
 // Grok has the same shape over a different protocol: ONE `grok agent stdio` (the
 // Agent Client Protocol) per machine, a run is one session/prompt on one session,
 // lines are routed by sessionId, and Stop is session/cancel. lib/grok-events.js is
@@ -41,10 +52,13 @@
 
 const { spawn } = require('child_process');
 const { randomUUID } = require('crypto');
-const { createEventLog } = require('./engine-events');
+const { createEventLog, droppable = () => false } = require('./engine-events');
 const { createClaudeTranslator, turnStarting } = require('./claude-events');
 const { createCodexTranslator } = require('./codex-events');
 const { createGrokTranslator } = require('./grok-events');
+// Guarded: an agent that pulled this file before the native harness's three files
+// (codex-harness.js, codex-rpc.js, codex-turn.js) landed keeps the legacy one.
+let codexHarnessLib; try { codexHarnessLib = require('./codex-harness'); } catch { codexHarnessLib = null; }
 // Guarded like capabilities.js guards it: an agent that pulled this file before
 // proc-tree.js landed still runs turns, it only cannot reap a stopped exec.
 let procTree; try { procTree = require('./proc-tree'); } catch { procTree = null; }
@@ -300,6 +314,12 @@ function taped(tr, dir, engine, runId, opts) {
 
 const refuse = (message, code) => Object.assign(new Error(message), { code });
 
+// Which Codex harness this process runs: cfg.codexHarness, else the env, else native.
+function codexNativeWanted(cfg, env = process.env) {
+  const mode = String(cfg.codexHarness || env.TERMDECK_CODEX_HARNESS || 'native').trim().toLowerCase();
+  return mode !== 'legacy';
+}
+
 function createRunRegistry(opts = {}) {
   const cfg = { ...DEFAULTS, ...opts };
   const spawnFn = cfg.spawn || spawn;
@@ -307,6 +327,27 @@ function createRunRegistry(opts = {}) {
   const reapCommands = cfg.reapCommands || (procTree && procTree.reapCommands) || null;
   const now = cfg.now || Date.now;
   const runs = new Map(); // runId -> run
+  // The native Codex harness, or null for the legacy one. Spawns nothing until a
+  // Codex run, op or rpc first needs the server.
+  const harnessLib = cfg.codexHarnessLib || codexHarnessLib;
+  const codexNative = codexNativeWanted(cfg) && !!harnessLib;
+  const harness = codexNative ? harnessLib.createCodexHarness({
+    spawn: spawnFn,
+    kill,
+    reapCommands,
+    rpcMs: cfg.codexRpcMs,
+    resumeMs: cfg.codexResumeMs,
+    injectMs: cfg.codexInjectMs,
+    startGraceMs: cfg.codexStartGraceMs,
+  }) : null;
+  // The native harness runs only on a codex that speaks the protocol it was written
+  // against (MIN_CODEX_VERSION, lib/codex-rpc.js). agent/capabilities.js probes the
+  // installed one once at load and says so through gateCodexNative; until then, and
+  // in a registry nobody gates (the tests), native is on whenever it was wanted. A
+  // codex too old for it keeps this machine on the legacy harness, where its chats
+  // still work, instead of refusing every one of them with "update codex".
+  let nativeAllowed = null;
+  const nativeOn = () => !!harness && nativeAllowed !== false;
   // A running command's output, tailed off the CLI's own task file (Claude) or paced
   // from the engine's deltas (Codex), into the run's log as `tool.output`.
   const liveOut = liveOutputLib && cfg.liveOutput !== false
@@ -338,7 +379,7 @@ function createRunRegistry(opts = {}) {
     .replace(/\b[A-Za-z0-9_-]{40,}\b/g, '[REDACTED]');
 
   function start(spec) {
-    if (spec && spec.engine === 'codex') return startCodex(spec);
+    if (spec && spec.engine === 'codex') return nativeOn() ? startCodexNative(spec) : startCodex(spec);
     if (spec && spec.engine === 'grok') return startGrok(spec);
     const { engine, exe, args = [], cwd = null, env = process.env, content, thinking = null, sessionId = null, resumed = false, permissionMode = null, model = null } = spec;
     const adapter = ADAPTERS[engine];
@@ -488,7 +529,9 @@ function createRunRegistry(opts = {}) {
 
   function deliver(sub, ev) {
     sub.pending.push(ev);
-    if (ev.type === 'block.delta') {
+    // A native Codex run's streaming deltas batch the same way (droppable is
+    // engine-events.js's word for them).
+    if (ev.type === 'block.delta' || (ev.type === 'codex.event' && droppable(ev))) {
       if (!sub.timer) sub.timer = timer(() => flush(sub), cfg.batchMs);
       return;
     }
@@ -1069,6 +1112,79 @@ function createRunRegistry(opts = {}) {
     }
   }
 
+  /* ---------------- Codex, native: agent/codex-harness.js drives the turn ---------------- */
+
+  // The same run record every shared-child run has, with the harness's handle as
+  // its `tr` and a stand-in for its process: the server is the harness's, and a
+  // run only ever needs its pid and whether it is still there.
+  function startCodexNative(spec) {
+    const runId = spec.runId || randomUUID();
+    if (runs.has(runId)) throw refuse(`run ${runId} already exists`, 'BAD_RUN');
+    let run = null;
+    const early = []; // anything the harness says before the run exists (nothing, today)
+    let endedEarly = false;
+    const sink = {
+      emit: (events) => { if (run) for (const e of events) push(run, e); else early.push(...events); },
+      finished: () => { if (run) nativeFinished(run); else endedEarly = true; },
+    };
+    const h = harness.start(spec, sink); // BUSY, BAD_RUN, BAD_ENGINE, SPAWN_FAILED throw from here
+    run = {
+      runId,
+      proc: { engine: 'codex', native: true, held: false, timers: {}, get pid() { return h.pid; }, get exited() { return h.exited; } },
+      shared: true,
+      codex: true,
+      native: true,
+      tr: h,
+      log: createEventLog({ runId, sessionId: spec.sessionId || null, limit: cfg.logLimit, now }),
+      subs: new Set(),
+      finishedAt: null,
+      nextRunId: null,
+      timers: { orphan: null, retain: null },
+      startedAt: now(),
+    };
+    runs.set(runId, run);
+    const started = { type: 'run.started', engine: 'codex' };
+    if (spec.model) started.model = spec.model;
+    if (spec.cwd) started.cwd = spec.cwd;
+    if (spec.permissionMode) started.permissionMode = spec.permissionMode;
+    push(run, started);
+    if (Number.isFinite(h.pid)) push(run, { type: 'run.process', pid: h.pid });
+    for (const e of early.splice(0)) push(run, e);
+    if (endedEarly) nativeFinished(run);
+    else armOrphan(run);
+    return { runId, pid: h.pid };
+  }
+
+  function nativeFinished(run) {
+    if (run.finishedAt) return;
+    run.finishedAt = now();
+    clearTimeout(run.timers.orphan);
+    scheduleRetain(run);
+  }
+
+  // What leaves this machine of a Codex call outside a turn, whichever harness made it.
+  function codexRpcResult(method, result) {
+    // config/read is the whole of ~/.codex/config.toml, MCP server env values and
+    // bearer tokens included. The master asks it for one field (lib/codex-settings.js
+    // configuredEffort), so that field is all that leaves this machine.
+    if (method === 'config/read') {
+      const c = result && result.config;
+      return { config: c && c.model_reasoning_effort != null ? { model_reasoning_effort: c.model_reasoning_effort } : {} };
+    }
+    // The Extensions section's health read (features/01-extensions). Each server
+    // row carries every tool's full schema, and the section wants a status and a
+    // count, so that is all that leaves the child.
+    if (method === 'mcpServerStatus/list') {
+      const data = result && Array.isArray(result.data) ? result.data : [];
+      return { data: data.map((r) => ({
+        name: r && r.name, runtimeStatus: r && r.runtimeStatus != null ? r.runtimeStatus : null, pluginId: (r && r.pluginId) || null,
+        authStatus: (r && r.authStatus) || null, toolsError: r && r.toolsError ? String(r.toolsError.message || r.toolsError).slice(0, 400) : null,
+        tools: Object.fromEntries(Object.keys((r && r.tools) || {}).slice(0, 500).map((k) => [k, true])),
+      })) };
+    }
+    return result;
+  }
+
   // A call to the shared child outside any turn: the model list, the account's
   // rate limits. Spawns it if nothing has yet.
   async function rpc(spec) {
@@ -1077,27 +1193,14 @@ function createRunRegistry(opts = {}) {
     if (spec.engine !== 'codex') throw refuse(`no rpc for engine ${spec.engine}`, 'BAD_ENGINE');
     if (!CODEX_RPC.has(method)) throw refuse(`codex ${method} is not allowed here`, 'BAD_RUN');
     if (!spec.exe) throw refuse('codex is not installed on this machine', 'BAD_ENGINE');
+    if (nativeOn()) {
+      const result = codexRpcResult(method, await harness.request(method, params, { timeoutMs: Number(timeoutMs) || cfg.codexRpcMs }, spec));
+      const s = harness.servers();
+      return { result: result === undefined ? null : result, pid: s ? s.pid : null };
+    }
     const server = codexServer(spec);
     await server.init;
-    let result = await codexRequest(server, method, params, Number(timeoutMs) || cfg.codexRpcMs);
-    // config/read is the whole of ~/.codex/config.toml, MCP server env values and
-    // bearer tokens included. The master asks it for one field (lib/codex-settings.js
-    // configuredEffort), so that field is all that leaves this machine.
-    if (method === 'config/read') {
-      const c = result && result.config;
-      result = { config: c && c.model_reasoning_effort != null ? { model_reasoning_effort: c.model_reasoning_effort } : {} };
-    }
-    // The Extensions section's health read (features/01-extensions). Each server
-    // row carries every tool's full schema, and the section wants a status and a
-    // count, so that is all that leaves the child.
-    if (method === 'mcpServerStatus/list') {
-      const data = result && Array.isArray(result.data) ? result.data : [];
-      result = { data: data.map((r) => ({
-        name: r && r.name, runtimeStatus: r && r.runtimeStatus != null ? r.runtimeStatus : null, pluginId: (r && r.pluginId) || null,
-        authStatus: (r && r.authStatus) || null, toolsError: r && r.toolsError ? String(r.toolsError.message || r.toolsError).slice(0, 400) : null,
-        tools: Object.fromEntries(Object.keys((r && r.tools) || {}).slice(0, 500).map((k) => [k, true])),
-      })) };
-    }
+    const result = codexRpcResult(method, await codexRequest(server, method, params, Number(timeoutMs) || cfg.codexRpcMs));
     return { result: result === undefined ? null : result, pid: server.pid };
   }
 
@@ -1106,6 +1209,8 @@ function createRunRegistry(opts = {}) {
   // one when it started). Running turns are interrupted first, then it goes.
   function recycle(engine) {
     if (engine === 'grok') return grokRecycle();
+    // Native: a promise, settled once the old server is gone (agent/codex-harness.js).
+    if (engine === 'codex' && nativeOn()) return harness.recycle();
     if (engine !== 'codex' || !codex || codex.exited) return false;
     const server = codex;
     codex = null; // the next start spawns a fresh one even while this one winds down
@@ -1290,6 +1395,7 @@ function createRunRegistry(opts = {}) {
   }
 
   function sharedInterrupt(run) {
+    if (run.native) return run.tr.interrupt();
     return run.grok ? grokInterrupt(run) : codexInterrupt(run);
   }
 
@@ -1456,7 +1562,7 @@ function createRunRegistry(opts = {}) {
   // The shared children and their pids: the master tells its own app-server apart
   // from a terminal's by this when it reads who holds a thread.
   const servers = () => ({
-    codex: codex && !codex.exited ? { pid: codex.pid, threads: [...codex.threads.keys()] } : null,
+    codex: nativeOn() ? harness.servers() : codex && !codex.exited ? { pid: codex.pid, threads: [...codex.threads.keys()] } : null,
     grok: grok && !grok.exited ? { pid: grok.pid, sessions: [...grok.sessions.keys()] } : null,
   });
 
@@ -1485,6 +1591,7 @@ function createRunRegistry(opts = {}) {
 
   function answer(runId, requestId, decision) {
     const run = need(runId);
+    if (run.native) return run.tr.answer(requestId, decision);
     if (run.codex) return codexApply(run, run.tr.answer(requestId, decision));
     if (run.grok) return grokApply(run, run.tr.answer(requestId, decision));
     apply(run, run.tr.answer(requestId, decision));
@@ -1497,6 +1604,7 @@ function createRunRegistry(opts = {}) {
 
   function steer(runId, content) {
     const run = need(runId);
+    if (run.native) return run.tr.steer(content);
     if (run.codex) return codexSteer(run, content);
     // ACP has no mid-turn input: the master queues the message for the next turn.
     if (run.grok) throw refuse('Grok cannot take a message mid-turn', 'STEER_UNSUPPORTED');
@@ -1623,20 +1731,26 @@ function createRunRegistry(opts = {}) {
     const procs = new Set();
     for (const run of runs.values()) {
       for (const t of Object.values(run.timers)) clearTimeout(t);
-      procs.add(run.proc);
+      if (!run.native) procs.add(run.proc); // a native run's server is the harness's to kill
     }
     for (const proc of procs) {
       for (const t of Object.values(proc.timers || {})) clearTimeout(t);
       if (!proc.exited) kill(proc.child, 'SIGKILL');
     }
+    if (harness) harness.shutdown();
     if (codex && !codex.exited) kill(codex.child, 'SIGKILL');
     if (grok && !grok.exited) kill(grok.child, 'SIGKILL');
     runs.clear();
   }
 
-  return { start, subscribe, answer, steer, submit, hold, interrupt, control, stop, rpc, recycle, servers, livePid, list, busy, destroyAll, get size() { return runs.size; } };
+  // `codexHarness`: the native harness itself, for the `codex` capability ops, the
+  // codexWatch stream and the session index's thread records; null on legacy.
+  return { start, subscribe, answer, steer, submit, hold, interrupt, control, stop, rpc, recycle, servers, livePid, list, busy, destroyAll,
+    get codexNative() { return codexNative && nativeOn(); },
+    gateCodexNative(ok) { nativeAllowed = ok === null ? null : !!ok; },
+    codexHarness: harness, get size() { return runs.size; } };
 }
 
 const registry = createRunRegistry();
 
-module.exports = { createRunRegistry, registry, DEFAULTS, killTree, cmdShimSpawn, checkClaudeArgs, checkFullAccess, fullAccessAllowed };
+module.exports = { createRunRegistry, registry, DEFAULTS, killTree, cmdShimSpawn, checkClaudeArgs, checkFullAccess, fullAccessAllowed, codexNativeWanted };

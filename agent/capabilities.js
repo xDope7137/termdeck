@@ -382,16 +382,28 @@ function rewriteDuplicateTranscript(content, oldSessionId, newId, newCwd, upTo) 
 
 
 const WORKTREES_TTL_MS = 5000;
-const worktreesMemo = new Map(); // base cwd -> { at, promise }
-function worktreesOf(base) {
+const worktreesMemo = new Map(); // base cwd -> { at, promise of `git worktree list` entries | null }
+function worktreeList(base) {
   const hit = worktreesMemo.get(base);
   if (hit && Date.now() - hit.at < WORKTREES_TTL_MS) return hit.promise;
   const promise = diffLib.listWorktrees(base)
-    .then((r) => (r.worktrees || []).filter((w) => !w.main && !w.bare && w.path).map((w) => w.path))
+    .then((r) => r.worktrees || [])
     .catch(() => null);
   worktreesMemo.set(base, { at: Date.now(), promise });
   if (worktreesMemo.size > 200) worktreesMemo.delete(worktreesMemo.keys().next().value);
   return promise;
+}
+// The repo's linked checkouts (not the main one).
+function worktreesOf(base) {
+  return worktreeList(base).then((ws) => (ws ? ws.filter((w) => !w.main && !w.bare && w.path).map((w) => w.path) : null));
+}
+// The repo's main checkout, the project a linked one belongs to. Same list,
+// same memo: asking both about one folder is one `git worktree list`.
+function mainCheckoutOf(dir) {
+  return worktreeList(dir).then((ws) => {
+    const main = ws && ws.find((w) => w.main && !w.bare && w.path);
+    return main ? main.path : null;
+  });
 }
 
 // The injected reader lib/index-head.js's parse runs against — local fs, since
@@ -415,6 +427,9 @@ function headIo() {
     // folder the rollout already names. Cached briefly, since a live chat's head is
     // read on every append and each answer is two git spawns.
     worktreesOf,
+    // The main checkout of the repo a linked one belongs to, for a head built
+    // off a thread record (index-head.js codexThreadWorktreeOf). Same reach.
+    mainCheckoutOf,
     readFile: async (p, offset = 0, len = null) => {
       const fd = await fsp.open(p, 'r');
       try {
@@ -502,6 +517,51 @@ for (const kind of Object.keys(ENGINE_CANDIDATES)) {
 // A function, not a path, so a CLI installed later reaches these modules too.
 try { require('./limits').setCodexExe(() => ENGINES.codex); } catch {}
 try { require('./codex-accounts').setCodexExe(() => ENGINES.codex); } catch {}
+// On the native harness (agent/codex-harness.js) the machine has ONE long-lived
+// codex app-server, the one the turns run on, and the limits and accounts modules
+// ask it instead of spawning their own: the process asking is the one holding the
+// login, so there is no second token refresher and no guessing whose reading it is.
+// An account switch recycles that server (reloadCodex), awaited, so the next read
+// is the fresh process's. With the legacy harness none of this is wired and both
+// modules behave exactly as they did.
+//
+// Native needs a codex at least MIN_CODEX_VERSION (lib/codex-rpc.js). Asked once,
+// here, before anything reads DEFAULT_RUNS.codexNative, so the hello's cap, the
+// runs and these injections all agree for the life of the process. A codex too old,
+// or one whose `--version` fails, keeps the machine on the legacy harness. No codex
+// at all leaves native on: the one an install brings is current.
+if (DEFAULT_RUNS && DEFAULT_RUNS.codexHarness && typeof DEFAULT_RUNS.gateCodexNative === 'function') {
+  DEFAULT_RUNS.gateCodexNative(codexMeetsFloor(ENGINES.codex));
+}
+function codexMeetsFloor(exe) {
+  try { if (!exe || !fs.statSync(exe).isFile()) return null; } catch { return null; }
+  let rpc;
+  try { rpc = require('./codex-rpc'); } catch { return false; }
+  try {
+    const win = process.platform === 'win32' && /\.(cmd|bat)$/i.test(exe);
+    const out = require('child_process').execFileSync(win ? `"${exe}"` : exe, ['--version'], {
+      timeout: 8000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, ...(win ? { shell: true } : {}),
+    });
+    return rpc.meetsFloor(rpc.versionFromCli(out)) === true;
+  } catch {
+    return false;
+  }
+}
+const NATIVE_CODEX = DEFAULT_RUNS && DEFAULT_RUNS.codexNative && DEFAULT_RUNS.codexHarness ? DEFAULT_RUNS.codexHarness : null;
+if (NATIVE_CODEX) {
+  NATIVE_CODEX.useSpec(() => ({ engine: 'codex', exe: ENGINES.codex, env: process.env }));
+  const codexRpc = (method, params, { timeoutMs } = {}) => NATIVE_CODEX.request(method, params, { timeoutMs });
+  const onCodexNotification = (fn) => NATIVE_CODEX.onNotification(fn);
+  const dropLimits = () => { try { require('./limits').invalidateCodexCache(); } catch {} };
+  try { require('./limits').setCodexNative({ codexRpc, onCodexNotification }); } catch {}
+  if (codexAccountsLib && typeof codexAccountsLib.setCodexNative === 'function') {
+    codexAccountsLib.setCodexNative({ codexRpc, onCodexNotification });
+    codexAccountsLib.setInvalidateHooks({
+      reloadCodex: async () => { dropLimits(); await NATIVE_CODEX.recycle(); },
+      accountChanged: () => dropLimits(),
+    });
+  }
+}
 // Same for claude, and for the same reason — with the same cost when it lapses.
 // accounts.js resolves independently (which.js, PATHEXT order) and on a box with
 // BOTH an npm global and a WinGet install those two orders pick DIFFERENT
@@ -1111,7 +1171,12 @@ let defaultIndex;
 function agentVersion() {
   try { return require('./package.json').version || null; } catch { return null; }
 }
-function makeSessionIndex(confinedFn, file) {
+// `codexThreads`: Codex's own records of its threads, off the native harness's
+// shared app-server (agent/codex-harness.js listThreads), which the index builds a
+// codex head from instead of parsing the rollout. Null on the legacy harness, and
+// any failure (no codex, too old for thread/list, the server would not start) is
+// the index's cue to parse the bytes as it always has.
+function makeSessionIndex(confinedFn, file, codexThreads = null) {
   if (!sessionIndexLib || !indexHeadLib) return null;
   return sessionIndexLib.createSessionIndex({
     file,
@@ -1119,12 +1184,28 @@ function makeSessionIndex(confinedFn, file) {
     candidate: indexCandidate,
     readHead: (ask) => indexHeadLib.readIndexHead(ask, headIo()),
     confined: confinedFn,
+    ...(codexThreads && typeof indexHeadLib.codexThreadHead === 'function' ? {
+      codexThreads,
+      threadHead: (thread, ask) => indexHeadLib.codexThreadHead(thread, ask, headIo()),
+    } : {}),
   });
+}
+// Asks only a server that is already up, never spawns one: the index is synced on
+// every dial, and a machine whose owner has not touched Codex through Termdeck
+// since the agent started should not grow an app-server to name its sidebar rows.
+// Until the first Codex turn or `codex` op starts it, the bytes answer, as before.
+function codexThreadsOf(runs, exeFn, env) {
+  return async () => {
+    const h = runs && runs.codexHarness;
+    const exe = exeFn();
+    if (!h || !exe || !h.servers()) return null;
+    return h.listThreads({}, { engine: 'codex', exe, env: env() });
+  };
 }
 function defaultSessionIndex() {
   if (defaultIndex === undefined) {
     const home = process.env.TERMDECK_HOME || path.join(os.homedir(), '.termdeck');
-    defaultIndex = makeSessionIndex(confined, path.join(home, 'session-index.json'));
+    defaultIndex = makeSessionIndex(confined, path.join(home, 'session-index.json'), codexThreadsOf(DEFAULT_RUNS, () => ENGINES.codex, () => process.env));
   }
   return defaultIndex;
 }
@@ -1204,13 +1285,26 @@ function makeCapabilities(send, opts = {}) {
   // The session index: the process's own for the real roots, a memory-only one
   // per instance for a test's fixture roots (their confinement is not the
   // process's), or whatever the test hands in.
+  const runs = opts.runs || DEFAULT_RUNS; // engine runs; module-level, they outlive this connection
+  // The native harness's shared-server call for the Extensions page, the MCP list
+  // and the command catalog, which then ask the server the turns run on instead of
+  // reading config files or spawning a second app-server. Null on the legacy
+  // harness, and every caller keeps its old path for null.
+  const codexNativeRpc = runs && runs.codexNative && runs.codexHarness
+    ? (method, params, { timeoutMs } = {}) => runs.codexHarness.request(method, params, { timeoutMs },
+      engineExes.codex ? { engine: 'codex', exe: engineExes.codex, env: process.env } : null)
+    : null;
+  // A test that hands in the legacy rpc (extensionsCodexRpc) has chosen the legacy
+  // Extensions path; one that wants the native one hands in extensionsCodexNativeRpc.
+  const extensionsNativeRpc = opts.extensionsCodexNativeRpc !== undefined ? opts.extensionsCodexNativeRpc
+    : opts.extensionsCodexRpc ? null : codexNativeRpc;
   const sessionIndex = opts.sessionIndex !== undefined ? opts.sessionIndex
-    : opts.roots ? makeSessionIndex(confined, null) : defaultSessionIndex();
+    : opts.roots ? makeSessionIndex(confined, null, codexThreadsOf(runs, () => engineExes.codex, () => process.env)) : defaultSessionIndex();
 
   const watchers = new Map(); // watchId -> chokidar watcher
   const watchBatches = new Map(); // watchId -> { paths: Set, timer } - the fs-event coalescer (feature 73)
-  const runs = opts.runs || DEFAULT_RUNS; // engine runs; module-level, they outlive this connection
   const engineSubs = new Map(); // engineEvents id -> unsubscribe, for this connection only
+  const codexWatches = new Map(); // codexWatch id -> unsubscribe, for this connection only
 
   // ---------------------------------------------------------------------------
   // Converted ops
@@ -1881,6 +1975,7 @@ function makeCapabilities(send, opts = {}) {
         claudeDir: REAL_ROOTS[0],
         codexHome: REAL_ROOTS[1],
         grokDir: GROK_DIR,
+        ...(codexNativeRpc ? { codexRpc: codexNativeRpc } : {}),
       }),
     };
   }, { onError: (e) => ({ error: denied(e) ? 'Permission denied' : (e.message || e.code), code: denied(e) ? 'DENIED' : (e.code || 'CATALOG_FAILED') }) });
@@ -2323,6 +2418,7 @@ function makeCapabilities(send, opts = {}) {
       codexRpc: opts.extensionsCodexRpc || (engineExes.codex && runs && runs.rpc
         ? async (method, params, timeoutMs) => (await runs.rpc({ engine: 'codex', exe: engineExes.codex, env: engineEnv('codex'), home: os.homedir(), method, params, timeoutMs })).result
         : null),
+      ...(extensionsNativeRpc ? { codexNativeRpc: extensionsNativeRpc } : {}),
       readonly: extensionsReadonly,
       projectOk: opts.extensionsProjectOk || extensionsProjectOk,
     };
@@ -2619,7 +2715,7 @@ function makeCapabilities(send, opts = {}) {
     if (m.op === 'pr') return { data: await diff.createPr(cwd, { title: payload.title, body: payload.body }) };
     if (m.op === 'mcpServers') {
       if (!mcpConfig) throw fail('agent is out of date (mcp-config module missing). Update the agent', 'AGENT_OUTDATED');
-      return { data: await mcpConfig.readMcpServers(cwd, payload.engine) };
+      return { data: await mcpConfig.readMcpServers(cwd, payload.engine, codexNativeRpc ? { codexRpc: codexNativeRpc } : {}) };
     }
     throw noBranch('git', m.op);
     // `code` spelled null rather than omitted, as the hand-written catch did: git
@@ -2683,7 +2779,8 @@ function makeCapabilities(send, opts = {}) {
     // Only the master can count Codex turns on this box (see the hook note at the
     // top of this file).
     const busy = { busy: payload.busy || 0 };
-    if (m.op === 'list') return { data: codexAccounts.listAccounts() };
+    // A promise on the native harness (account/read on the shared server).
+    if (m.op === 'list') return { data: await codexAccounts.listAccounts() };
     // The ChatGPT twin, with the limitation baked into the reply rather than hidden:
     // only the active account can report windows. See codexAccountsUsage.
     if (m.op === 'usage') return { data: await limitsMod().codexAccountsUsage(codexAccounts) };
@@ -2796,6 +2893,12 @@ function makeCapabilities(send, opts = {}) {
             collab: m.collab === 'plan' ? 'plan' : null,
             permissionMode: typeof m.permissionMode === 'string' ? m.permissionMode : null,
             model: typeof m.model === 'string' ? m.model : null,
+            // The native harness's own (agent/codex-harness.js): the turn's effort,
+            // and /compact and /review, which are app-server calls of their own
+            // rather than a turn/start. The legacy harness reads none of them.
+            effort: typeof m.effort === 'string' ? m.effort : null,
+            compact: m.compact === true,
+            review: m.review && typeof m.review === 'object' ? m.review : null,
           });
         }
         // Grok: a prompt on a session of the machine's one `grok agent stdio`. The
@@ -2854,7 +2957,7 @@ function makeCapabilities(send, opts = {}) {
       if (m.op === 'control') return await runs.control(String(m.runId), m.request, Number(m.timeoutMs) || undefined);
       if (m.op === 'stop') return { stopped: runs.stop(String(m.runId)) };
       if (m.op === 'list') return { runs: runs.list(), servers: runs.servers() };
-      if (m.op === 'recycle') return { recycled: runs.recycle(String(m.engine || '')) };
+      if (m.op === 'recycle') return { recycled: await runs.recycle(String(m.engine || '')) };
       // A call to a shared child outside a turn: Codex's model list and rate limits,
       // Grok's model catalogue (the pseudo-method 'modelState').
       if (m.op === 'rpc') {
@@ -2882,6 +2985,65 @@ function makeCapabilities(send, opts = {}) {
   defineOp('engineUnsubscribe', async (m) => {
     const off = engineSubs.get(m.id);
     engineSubs.delete(m.id);
+    if (off) off();
+  });
+
+  // ---- the native Codex harness's own door (docs/codex-native.md) ---------------
+  // One whitelisted app-server call per op, on the same shared server the turns run
+  // on, so a list or a read sees exactly what a turn just wrote. The params cross
+  // agent/codex-harness.js's whitelist, never as the master sent them: a master
+  // cannot reach thread/start, turn/start or config writes through here. Every op is
+  // spelled out below rather than forwarded by name, so a row's op without a branch
+  // is a test failure (tests/agent-protocol.mjs) instead of a silent pass-through.
+  const codexHarness = () => {
+    const h = runs && runs.codexHarness;
+    if (!h) throw fail('this agent runs Codex on the legacy harness (TERMDECK_CODEX_HARNESS=legacy)', 'NOT_NATIVE');
+    return h;
+  };
+  const codexSpec = () => {
+    if (!engineExes.codex) throw fail('engine not permitted: codex', 'BAD_ENGINE');
+    return { engine: 'codex', exe: engineExes.codex, env: engineEnv('codex') };
+  };
+  defineOp('codex', async (m) => {
+    const h = codexHarness();
+    const payload = m.payload && typeof m.payload === 'object' ? m.payload : {};
+    const timeoutMs = Number(m.timeoutMs) > 0 ? Number(m.timeoutMs) : null;
+    const call = async (op) => ({ result: await h.op(op, payload, codexSpec(), { timeoutMs }) });
+    try {
+      if (m.op === 'threads') return await call('threads');
+      if (m.op === 'thread') return await call('thread');
+      if (m.op === 'turns') return await call('turns');
+      if (m.op === 'items') return await call('items');
+      if (m.op === 'rename') return await call('rename');
+      if (m.op === 'fork') return await call('fork');
+      if (m.op === 'revert') return await call('revert');
+      if (m.op === 'archive') return await call('archive');
+      if (m.op === 'unarchive') return await call('unarchive');
+      if (m.op === 'models') return await call('models');
+      if (m.op === 'mcpStatus') return await call('mcpStatus');
+      if (m.op === 'skills') return await call('skills');
+      if (m.op === 'rateLimits') return await call('rateLimits');
+      if (m.op === 'account') return await call('account');
+      if (m.op === 'config') return await call('config');
+      if (m.op === 'info') return await call('info');
+    } catch (e) {
+      throw e && e.capRefusal ? e : fail(e.message, e.code || 'CODEX_RPC');
+    }
+    throw noBranch('codex', m.op);
+  }, justMessage);
+
+  // The shared server's news that no run owns, until codexUnwatch or the link goes.
+  // Like engineEvents it is this connection's: park() drops it and the master
+  // watches again on the next link.
+  defineOp('codexWatch', async (m) => {
+    const h = codexHarness();
+    const prev = codexWatches.get(m.id);
+    if (prev) prev();
+    codexWatches.set(m.id, h.watch((method, params) => send({ t: 'codexNotification', id: m.id, method, params })));
+  });
+  defineOp('codexUnwatch', async (m) => {
+    const off = codexWatches.get(m.id);
+    codexWatches.delete(m.id);
     if (off) off();
   });
 
@@ -2988,6 +3150,8 @@ function makeCapabilities(send, opts = {}) {
   function park() {
     for (const off of engineSubs.values()) off();
     engineSubs.clear();
+    for (const off of codexWatches.values()) off();
+    codexWatches.clear();
     for (const w of watchers.values()) try { w.close(); } catch {}
     for (const b of watchBatches.values()) if (b.timer) clearTimeout(b.timer);
     watchers.clear(); watchBatches.clear();
@@ -2998,6 +3162,8 @@ function makeCapabilities(send, opts = {}) {
   // view-only-locks its session until it happens to die.
   function destroy() {
     engineSubs.clear();
+    for (const off of codexWatches.values()) off();
+    codexWatches.clear();
     runs.destroyAll();
     for (const w of watchers.values()) try { w.close(); } catch {}
     for (const b of watchBatches.values()) if (b.timer) clearTimeout(b.timer);
@@ -3007,7 +3173,9 @@ function makeCapabilities(send, opts = {}) {
   // "busy" = an engine run is unfinished: a live turn self-update must not cut off.
   // `indexPeek`: the dial's catch-up walk, whose { epoch, gen } rides the hello
   // so a master already holding that generation asks nothing (agent.js).
-  return { handle, park, destroy, roots: ROOTS, busy: () => runs.busy() > 0, engineRuns: () => runs.list(), engineServers: () => runs.servers(), indexPeek: () => (sessionIndex ? sessionIndex.refresh() : Promise.resolve(null)) };
+  // `codexNative`: whether Codex turns run on the native harness, which agent.js
+  // advertises as the `codexNative` cap (docs/codex-native.md, Cutover).
+  return { handle, park, destroy, roots: ROOTS, busy: () => runs.busy() > 0, engineRuns: () => runs.list(), engineServers: () => runs.servers(), codexNative: () => !!(runs && runs.codexNative && runs.codexHarness), indexPeek: () => (sessionIndex ? sessionIndex.refresh() : Promise.resolve(null)) };
 }
 
 // bgLogPathOk is exported for the same reason `confined` is: it is a security

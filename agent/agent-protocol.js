@@ -313,6 +313,25 @@ const TABLE = [
   },
   { name: 'engineEvents', family: 'stream', reply: 'engineEvent', note: "one run's engine events from a seq on: the missed ones, then live, deltas batched" },
   { name: 'engineUnsubscribe', family: 'none', correlate: 'existing', note: "cancels an engineEvents stream by the id it minted" },
+  // The native Codex harness's own door (docs/codex-native.md): one whitelisted
+  // app-server call per op on the shared server the turns run on, results passed
+  // through as Codex gives them. NOT_NATIVE is the answer of an agent pinned to
+  // the legacy harness (TERMDECK_CODEX_HARNESS=legacy), which advertises no
+  // `codexNative` cap, so a master that read the hello never asks it. Lists and
+  // reads may spawn the server and wait out its handshake, hence the long reads.
+  {
+    name: 'codex',
+    timeoutMs: 30_000,
+    ops: ['threads', 'thread', 'turns', 'items', 'rename', 'fork', 'revert', 'archive', 'unarchive', 'models', 'mcpStatus', 'skills', 'rateLimits', 'account', 'config', 'info'],
+    opTimeoutMs: { threads: 60_000, turns: 45_000, items: 45_000, fork: 45_000 },
+    codes: ['AGENT_OUTDATED', 'BAD_ENGINE', 'BAD_RUN', 'NOT_NATIVE', 'CODEX_RPC', 'CODEX_RPC_TIMEOUT', 'CODEX_DOWN', 'CODEX_TOO_OLD', 'SPAWN_FAILED'],
+    note: "one whitelisted call on the machine's shared codex app-server; Codex's result back as it gave it",
+  },
+  // The shared server's news that no run owns (a thread a terminal TUI wrote, a
+  // rename, an account change). Watching never spawns a server: there is no news
+  // from a server nobody started.
+  { name: 'codexWatch', family: 'stream', reply: 'codexNotification', codes: ['NOT_NATIVE'], note: "the shared codex app-server's notifications that are about no run, as (method, params)" },
+  { name: 'codexUnwatch', family: 'none', correlate: 'existing', note: 'cancels a codexWatch stream by the id it minted' },
   { name: 'killPid', codes: ['PID_NOT_OURS'], note: 'signal a pid under this agent, or a registered Claude CLI and its tree (taking a session over); any other pid is refused' },
 
   // -- background shells ----------------------------------------------------

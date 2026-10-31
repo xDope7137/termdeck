@@ -622,6 +622,125 @@ function codexRpc(method, params) {
   });
 }
 
+// ---- Codex, native: the agent's ONE shared app-server ----
+//
+// Everything above this line is the legacy path: a second app-server spawned per
+// read, the auth.json guesswork about whose reading it is, and the refresh-margin
+// stand-down that exists only because that second process could race the first
+// one's token refresh. On a machine whose agent runs the native harness
+// (agent/codex-harness.js), capabilities.js hands this module the shared
+// client's request instead, and all three problems go: the process asking is the
+// one that owns the login, it answers `account/read` for the same tokens it
+// answers the windows for, and there is no second refresher to stand down for.
+//
+//   codexRpc(method, params, { timeoutMs }) -> Promise<result>, throws on error
+//   onCodexNotification(fn(method, params)) -> unsubscribe
+//
+// The notification half is optional. With it, `account/rateLimits/updated` is
+// folded onto the cached reading between polls and `account/updated` (a login, a
+// switch, a workspace change) drops the cache, so a reading is never served
+// under the next account's name.
+let nativeRpc = null;
+let nativeUnsub = null;
+let codexRaw = null; // the last full account/rateLimits/read envelope, for merging
+let codexGen = 0; // bumped by every invalidation; a read that started before one is not cached
+
+function setCodexNative({ codexRpc: rpc = null, onCodexNotification = null } = {}) {
+  if (nativeUnsub) { try { nativeUnsub(); } catch {} }
+  nativeUnsub = null;
+  nativeRpc = typeof rpc === 'function' ? rpc : null;
+  invalidateCodexCache();
+  if (nativeRpc && typeof onCodexNotification === 'function') {
+    const un = onCodexNotification((method, params) => onCodexNotificationFor(method, params));
+    nativeUnsub = typeof un === 'function' ? un : null;
+  }
+}
+
+// One rolling snapshot over another. The update is SPARSE: a null in it means
+// "not in this update", not "cleared" (AccountRateLimitsUpdatedNotification
+// upstream), so only the values it carries replace the old ones.
+function mergeSnapshot(prev, next) {
+  const out = { ...(prev && typeof prev === 'object' ? prev : {}) };
+  for (const [k, v] of Object.entries(next && typeof next === 'object' ? next : {})) {
+    if (v !== null && v !== undefined) out[k] = v;
+  }
+  return out;
+}
+
+// The update onto the whole envelope. `rateLimits` is the backward-compatible
+// single bucket, so an update for a DIFFERENT metered limit lands only in
+// `rateLimitsByLimitId` and never relabels the bucket the widget draws.
+function mergeRateLimitsUpdate(envelope, snap) {
+  const env = envelope && typeof envelope === 'object' ? envelope : {};
+  const out = { ...env };
+  const id = (snap && snap.limitId) || null;
+  const base = env.rateLimits || null;
+  if (!id || !base || !base.limitId || id === base.limitId) out.rateLimits = mergeSnapshot(base, snap);
+  if (id) {
+    const by = env.rateLimitsByLimitId && typeof env.rateLimitsByLimitId === 'object' ? env.rateLimitsByLimitId : {};
+    out.rateLimitsByLimitId = { ...by, [id]: mergeSnapshot(by[id], snap) };
+  }
+  return out;
+}
+
+function onCodexNotificationFor(method, params) {
+  if (method === 'account/updated') { invalidateCodexCache(); return; }
+  if (method !== 'account/rateLimits/updated' || !params || !params.rateLimits) return;
+  // Nothing to merge onto yet: the next poll reads the whole envelope, which an
+  // update alone cannot stand in for (it carries no reset credits).
+  if (!codexRaw || !codexCache) return;
+  codexRaw = mergeRateLimitsUpdate(codexRaw, params.rateLimits);
+  const data = normalizeCodex(codexRaw);
+  if (!data) return;
+  data.account = codexCache.data.account;
+  // `at` is the last FULL read's. A merge keeps the numbers current; it does not
+  // make the reset credits beside them any fresher.
+  codexCache = { data, at: codexCache.at };
+}
+
+// Same { ok, result } | { ok, error } contract as the legacy codexRpc below, so
+// the consume path can tell "it said no" from "we never reached it" either way.
+async function nativeCall(method, params) {
+  try {
+    return { ok: true, result: (await nativeRpc(method, params, { timeoutMs: RPC_TIMEOUT_MS })) || null };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || 'codex rejected the request' };
+  }
+}
+
+// Who the shared server says is signed in, in the { id, email } shape the legacy
+// codexAccount() reads out of auth.json. Only a ChatGPT login has usage windows;
+// an API key or a Bedrock login is "no reading", exactly as it was before.
+function accountFromRead(read, rateLimits) {
+  const a = read && read.account;
+  if (!a || a.type !== 'chatgpt') return null;
+  const id = (read.workspaceRouting && read.workspaceRouting.chatgptAccountId) || (rateLimits && rateLimits.accountId) || null;
+  const email = a.email || null;
+  if (!id && !email) return null;
+  return { id: id || `codex:${email}`, email };
+}
+
+async function getCodexLimitsNative() {
+  if (codexCache && Date.now() - codexCache.at < CACHE_MS) return codexCache.data;
+  return once('codex-native', async () => {
+    const gen = codexGen;
+    // Params ABSENT for the rate-limit read, as the legacy note above says: it
+    // takes unit and rejects a map. account/read takes an (empty) object.
+    const [acct, rl] = await Promise.all([nativeCall('account/read', {}), nativeCall('account/rateLimits/read', undefined)]);
+    if (acct.ok && !accountFromRead(acct.result, rl.ok ? rl.result : null)) return null; // signed out, or no ChatGPT login
+    if (!rl.ok) return codexCache ? codexCache.data : null;
+    const data = normalizeCodex(rl.result);
+    if (!data) return codexCache ? codexCache.data : null;
+    // account/read failing is not "nobody": the windows are still this server's
+    // login's, and rateLimits carries the account id on its own.
+    data.account = acct.ok ? accountFromRead(acct.result, rl.result) : (rl.result && rl.result.accountId ? { id: rl.result.accountId, email: null } : null);
+    if (gen !== codexGen) return data; // a switch landed mid-read: answer, but do not keep it
+    codexRaw = rl.result;
+    codexCache = { data, at: Date.now() };
+    return data;
+  });
+}
+
 // The WHOLE response — { rateLimits, rateLimitsByLimitId, rateLimitResetCredits }.
 // Taking only `.rateLimits` here is what hid the reset-credit grant.
 async function readCodexRateLimits() {
@@ -633,18 +752,19 @@ async function readCodexRateLimits() {
 // so it runs only from an explicit user action relayed by the master, never
 // from a poll. Errors are thrown, not swallowed: a failed spend must surface as
 // a failure, since the caller cannot tell from a null whether it went through.
-// Outcome: 'reset' | 'nothingToReset' | 'alreadyRedeemed'.
+// Outcome: 'reset' | 'nothingToReset' | 'noCredit' | 'alreadyRedeemed'.
 async function consumeResetCredit({ idempotencyKey, creditId = null } = {}) {
   if (!idempotencyKey) throw new Error('idempotencyKey is required');
   const params = { idempotencyKey: String(idempotencyKey) };
   if (creditId) params.creditId = String(creditId);
-  const r = await codexRpc('account/rateLimitResetCredit/consume', params);
+  const r = nativeRpc ? await nativeCall('account/rateLimitResetCredit/consume', params) : await codexRpc('account/rateLimitResetCredit/consume', params);
   if (!r.ok) throw new Error(r.error || 'codex rejected the request');
   invalidateCodexCache(); // the windows just moved; don't serve the 30s-stale copy
   return { outcome: (r.result && r.result.outcome) || null };
 }
 
 async function getCodexLimits() {
+  if (nativeRpc) return getCodexLimitsNative();
   if (codexCache && Date.now() - codexCache.at < CACHE_MS) return codexCache.data;
   // Signed out: the RPC would only error, so don't pay for a spawn to find out.
   const account = codexAccount();
@@ -672,6 +792,8 @@ async function getCodexLimits() {
 // account's percentages under the NEW account's name until it ages out.
 function invalidateCodexCache() {
   codexCache = null;
+  codexRaw = null;
+  codexGen += 1;
 }
 
 // ---- Per-account usage, ChatGPT side ----
@@ -827,7 +949,7 @@ function invalidateClaudeCache() {
   accountCache.clear();
 }
 
-module.exports = { getLimits, claudeUsageForToken, accountsUsage, codexAccountsUsage, normalizeClaude, planLabel, normalizeCodex, normalizeGrok, consumeResetCredit, invalidateClaudeCache, invalidateCodexCache, setCodexExe };
+module.exports = { getLimits, claudeUsageForToken, accountsUsage, codexAccountsUsage, normalizeClaude, planLabel, normalizeCodex, normalizeGrok, consumeResetCredit, invalidateClaudeCache, invalidateCodexCache, setCodexExe, setCodexNative, getCodexLimits, mergeRateLimitsUpdate };
 
 // ponytail self-check: node agent/limits.js — asserts the parser without network.
 if (require.main === module) {
@@ -940,6 +1062,24 @@ if (require.main === module) {
   assert.ok(!spentGrant.resetCredits, 'a redeemed grant is not offered');
   const paidCredits = normalizeCodex({ rateLimits: { primary: { usedPercent: 4, windowDurationMins: 10080, resetsAt: soonSec }, credits: { hasCredits: true, unlimited: false, balance: '12.40' } } });
   assert.deepStrictEqual(paidCredits.spendCredits, { unlimited: false, hasCredits: true, balance: '12.40' });
+
+  // account/rateLimits/updated is SPARSE: a null in it is "not in this update",
+  // never "cleared". Folded onto the last full read, the reset grant beside the
+  // windows survives (the update has no such field) and a null secondary or plan
+  // keeps the value already seen.
+  const base = {
+    rateLimits: { limitId: 'codex', planType: 'plus', primary: { usedPercent: 4, windowDurationMins: 10080, resetsAt: soonSec }, secondary: null, credits: null },
+    rateLimitsByLimitId: { codex: { limitId: 'codex', planType: 'plus', primary: { usedPercent: 4, windowDurationMins: 10080, resetsAt: soonSec } } },
+    rateLimitResetCredits: { availableCount: 1, credits: [{ id: 'g', status: 'available', expiresAt: soonSec }] },
+  };
+  const bumped = mergeRateLimitsUpdate(base, { limitId: 'codex', planType: null, primary: { usedPercent: 9, windowDurationMins: 10080, resetsAt: soonSec }, secondary: null, credits: null });
+  assert.strictEqual(normalizeCodex(bumped).limits[0].percent, 9, 'the window moves');
+  assert.strictEqual(bumped.rateLimits.planType, 'plus', 'a null plan does not clear the one seen');
+  assert.strictEqual(normalizeCodex(bumped).resetCredits.id, 'g', 'the grant beside the windows survives a rolling update');
+  assert.strictEqual(bumped.rateLimitsByLimitId.codex.primary.usedPercent, 9, 'the keyed bucket moves too');
+  const other = mergeRateLimitsUpdate(base, { limitId: 'codex_other', primary: { usedPercent: 70, windowDurationMins: 300, resetsAt: soonSec } });
+  assert.strictEqual(normalizeCodex(other).limits[0].percent, 4, 'another metered limit never relabels the bucket the widget draws');
+  assert.strictEqual(other.rateLimitsByLimitId.codex_other.primary.usedPercent, 70);
 
   const grokCredits = normalizeGrok({
     config: {

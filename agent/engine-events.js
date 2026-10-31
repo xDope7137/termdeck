@@ -78,11 +78,16 @@ const TYPES = {
   // { key, label } is the "like this, for this turn" rule the request offers,
   // and turnRule the key of one a person already granted this turn (Codex,
   // lib/codex-events.js commandRule). toolUseId is the call it asks about, where
-  // the engine names one (Claude).
+  // the engine names one (Claude). `codex` is the native harness's server request
+  // as Codex sent it ({ method, params }) and `decisions` the answers that request
+  // offers (its availableDecisions, or the method's default set), so the card is
+  // drawn from Codex's own vocabulary and the agent can refuse anything else
+  // (lib/codex-turn.js).
   'approval.requested': {
     requestId: 'string', toolName: 'string', 'input?': 'any', 'preview?': 'string', 'description?': 'string',
     'risk?': 'string', 'questions?': 'array', 'timeoutAt?': 'number', 'suggestions?': 'array',
     'anchor?': 'object', 'likeRule?': 'object', 'turnRule?': 'string', 'toolUseId?': 'string',
+    'codex?': 'object', 'decisions?': 'array',
   },
   'approval.resolved': { requestId: 'string', outcome: APPROVAL_OUTCOMES },
   // A question the engine asked without stopping for it (Codex's
@@ -124,6 +129,15 @@ const TYPES = {
   // itself (a shell it was holding finished) or one a user submitted into it. That
   // turn is its own run; a reader follows it by subscribing to nextRunId.
   'run.continued': { nextRunId: 'string' },
+
+  // The native Codex harness (docs/codex-native.md): one `codex app-server`
+  // notification for the run's thread or one of its sub-agent threads, exactly as
+  // Codex sent it, so the browser draws Codex's own Turn/ThreadItem model rather
+  // than a translation of it. Any string in params over 256 KiB is cut and the
+  // params carry `truncated: true` (lib/codex-turn.js capParams). A Codex run
+  // emits these and the generic lifecycle around them, never message.* / block.*
+  // / tool.* / task.updated.
+  'codex.event': { method: 'string', params: 'object' },
 
   // Always the last event of a run's turn. Only AFTER_FINISH types may follow it.
   // A suggestion is one: the engine offers it after the turn is over, and holding
@@ -201,6 +215,13 @@ function eventProblems(ev) {
 // heard `gap`, and ended a turn that was still running.
 // A command's live output is the same kind of thing: its result replaces it.
 const DROPPABLE = new Set(['block.delta', 'tool.progress', 'tool.output']);
+// A native Codex run's streaming is the same bulk under one type: every
+// `item/.../delta` (agent text, reasoning, plan, command and patch output) and
+// the MCP progress ticks are superseded by the item/completed that carries the
+// item whole, so those are the droppable codex.events. The item lifecycle and
+// everything else are kept.
+const CODEX_STREAMING = /^item\/.+(?:\/delta|Delta|\/progress)$/;
+const droppable = (ev) => DROPPABLE.has(ev.type) || (ev.type === 'codex.event' && CODEX_STREAMING.test(ev.method));
 
 function createEventLog({ runId, sessionId = null, limit = 2000, now = Date.now } = {}) {
   if (typeof runId !== 'string' || !runId) throw new TypeError('createEventLog needs a runId');
@@ -218,7 +239,7 @@ function createEventLog({ runId, sessionId = null, limit = 2000, now = Date.now 
     if (problems.length) throw new TypeError(`invalid engine event: ${problems.join('; ')}`);
     if (payload.type === 'session.bound') boundId = payload.sessionId;
     const ev = { ...payload, v: VERSION, seq: ++seq, at: now(), runId, sessionId: boundId };
-    (DROPPABLE.has(ev.type) ? drops : kept).push(ev);
+    (droppable(ev) ? drops : kept).push(ev);
     if (kept.length + drops.length > limit) {
       if (drops.length) drops.shift();
       else lostThrough = kept.shift().seq;
@@ -319,4 +340,5 @@ module.exports = {
   eventProblems,
   capabilityProblems,
   createEventLog,
+  droppable,
 };

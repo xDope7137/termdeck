@@ -486,7 +486,7 @@ if (!TOKEN) { console.error('TERMDECK_AGENT_TOKEN is required'); process.exit(1)
 // capabilities.js. Refuses while a Termdeck-owned claude/codex turn is running so a live
 // session started by Termdeck isn't cut off. A terminal-held session can keep running:
 // the master passes force=true when it knows Termdeck itself does not own an active turn.
-const AGENT_FILES = ['agent.js', 'capabilities.js', 'agent-protocol.js', 'proc-tree.js', 'log.js', 'persistence.js', 'win-launcher.js', 'limits.js', 'usage.js', 'which.js', 'diff.js', 'mcp-config.js', 'accounts.js', 'codex-accounts.js', 'session-title.js', 'tail-read.js', 'checkpoints.js', 'index-head.js', 'session-index.js', 'session-settings.js', 'session-head.js', 'transcript.js', 'claude-data.js', 'pool.js', 'project-files.js', 'machine-config.js', 'command-catalog.js', 'usage-behaviour.js', 'codex-attachment.js', 'project-doc.js', 'upload-types.js', 'engine-events.js', 'claude-events.js', 'codex-events.js', 'grok-events.js', 'engine-runs.js', 'live-output.js', 'instance-lock.js', 'update-signature.js', 'engine-install.js', 'extensions.js', 'extensions-claude.js', 'extensions-codex.js', 'extensions-grok.js', 'extensions-redact.js', 'toml-edit.js', 'json-edit.js', 'endpoints.js', 'package.json'];
+const AGENT_FILES = ['agent.js', 'capabilities.js', 'agent-protocol.js', 'proc-tree.js', 'log.js', 'persistence.js', 'win-launcher.js', 'limits.js', 'usage.js', 'which.js', 'diff.js', 'mcp-config.js', 'accounts.js', 'codex-accounts.js', 'session-title.js', 'tail-read.js', 'checkpoints.js', 'index-head.js', 'session-index.js', 'session-settings.js', 'session-head.js', 'transcript.js', 'claude-data.js', 'pool.js', 'project-files.js', 'machine-config.js', 'command-catalog.js', 'usage-behaviour.js', 'codex-attachment.js', 'project-doc.js', 'upload-types.js', 'engine-events.js', 'claude-events.js', 'codex-events.js', 'codex-rpc.js', 'codex-turn.js', 'codex-harness.js', 'grok-events.js', 'engine-runs.js', 'live-output.js', 'instance-lock.js', 'update-signature.js', 'engine-install.js', 'extensions.js', 'extensions-claude.js', 'extensions-codex.js', 'extensions-grok.js', 'extensions-redact.js', 'toml-edit.js', 'json-edit.js', 'endpoints.js', 'package.json'];
 
 // Compile-check before anything is installed. A truncated download, an HTML error
 // page from the tunnel, a 200 with an empty body — all of them used to be written
@@ -998,6 +998,12 @@ function dial() {
     // an agent line that moved to 0.1.x long ago, so twelve of thirteen gated nothing
     // and nobody could see it. An agent that predates this field sends none, and a
     // missing `caps` means assume supported and let the refusal say otherwise.
+    // Plus `codexNative` when Codex turns run on the native harness here
+    // (agent/codex-harness.js; TERMDECK_CODEX_HARNESS=legacy turns it off). It is not
+    // a frame, it is how the turns' events are shaped, so the master picks its Codex
+    // runner off it (docs/codex-native.md, Cutover). The `codex` frame is in the
+    // list either way; a legacy-pinned agent answers it NOT_NATIVE.
+    const helloCaps = () => [...protocol.opNames(), ...(caps.codexNative && caps.codexNative() ? ['codexNative'] : [])];
     // `index` = the machine's session index generation after this dial's catch-up
     // walk (features/04 phase 8), so a master already holding that generation
     // rebuilds nothing. The walk started with the dial and ran under the
@@ -1007,7 +1013,7 @@ function dial() {
     Promise.race([indexPeek, new Promise((r) => setTimeout(r, INDEX_PEEK_MS, null))]).catch(() => null).then((index) => {
       if (ws.readyState !== WebSocket.OPEN) return;
       try {
-        ws.send(JSON.stringify({ type: 'hello', platform: os.platform(), version: VERSION, roots: ROOTS, caps: protocol.opNames(), runEngines: ['claude', 'codex', 'grok'], wire: protocol.WIRE, codex: fs.existsSync(ENGINES.codex), grok: fs.existsSync(ENGINES.grok), runs: caps.engineRuns(), runServers: caps.engineServers ? caps.engineServers() : undefined, persistence: PERSISTENCE || undefined, quarantine: readJson(QUARANTINE_FILE, null) || undefined, index: index || undefined, link: { endpoint: httpOf(dialledOrigin), rtt: link.rtt, failovers: link.failovers, reason: link.reason } }));
+        ws.send(JSON.stringify({ type: 'hello', platform: os.platform(), version: VERSION, roots: ROOTS, caps: helloCaps(), runEngines: ['claude', 'codex', 'grok'], wire: protocol.WIRE, codex: fs.existsSync(ENGINES.codex), grok: fs.existsSync(ENGINES.grok), runs: caps.engineRuns(), runServers: caps.engineServers ? caps.engineServers() : undefined, persistence: PERSISTENCE || undefined, quarantine: readJson(QUARANTINE_FILE, null) || undefined, index: index || undefined, link: { endpoint: httpOf(dialledOrigin), rtt: link.rtt, failovers: link.failovers, reason: link.reason } }));
       } catch { /* the socket closed under us; the redial says hello again */ }
     });
     // The origin this dial actually used, which is not always the one in agent.env: the

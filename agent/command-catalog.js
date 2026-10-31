@@ -239,9 +239,63 @@ function sourcesFor(engine, dirs) {
   return out;
 }
 
+// Codex on the native harness: its skills come from the shared app-server's
+// skills/list, which is the set Codex itself resolves (plugin skills, admin and
+// system tiers, and what [[skills.config]] turned off), where the walk above can
+// only guess. `commands/` has no RPC and is still walked.
+//
+// Each listed SKILL.md is still opened for its frontmatter, through the same
+// guarded reader: skills/list does not carry `argument-hint`, nor
+// `user-invocable: false`, which keeps a skill out of the palette.
+const SKILL_TIER = { repo: 0, user: 1, admin: 1, system: 2 };
+
+async function readCodexNative(dirs, codexRpc, state) {
+  const res = await codexRpc('skills/list', { cwds: [dirs.cwd || os.homedir()] }, { timeoutMs: 15_000 });
+  if (!res || !Array.isArray(res.data)) throw new Error('skills/list gave no list');
+  const skills = [];
+  for (const group of res.data) {
+    for (const s of (group && Array.isArray(group.skills) ? group.skills : [])) {
+      if (!s || typeof s.name !== 'string' || typeof s.path !== 'string' || s.enabled === false) continue;
+      skills.push(s);
+    }
+  }
+  // Project beats user beats plugin, as the walk orders it: a project's commands
+  // and skills, then the user's commands and skills, then the rest.
+  const tier = (s) => (s.pluginId ? 3 : SKILL_TIER[s.scope] ?? 1);
+  skills.sort((a, b) => tier(a) - tier(b));
+  if (dirs.cwd) {
+    await readCommands(path.join(dirs.cwd, '.codex', 'commands'), 'project', state);
+    await readCommands(path.join(dirs.cwd, '.agents', 'commands'), 'project', state);
+  }
+  await addSkills(skills.filter((s) => tier(s) === 0), state);
+  await readCommands(path.join(dirs.codexHome, 'commands'), 'user', state);
+  await addSkills(skills.filter((s) => tier(s) > 0), state);
+}
+
+async function addSkills(skills, state) {
+  for (const s of skills) {
+    const fm = s.path.endsWith('.md') ? (await readFrontmatter(s.path)) || {} : {};
+    if (!invocable(fm)) continue;
+    const iface = s.interface && typeof s.interface === 'object' ? s.interface : {};
+    add(state, {
+      name: clip(s.name, 120),
+      aliases: [],
+      description: clip(s.description || iface.shortDescription || fm.description),
+      argumentHint: clip(fm['argument-hint'], 120),
+      scope: s.pluginId ? 'plugin' : s.scope === 'repo' ? 'project' : 'user',
+      source: 'skill',
+      file: s.path,
+    });
+  }
+}
+
 // `cwd` is the session's own project directory, resolved by the agent from the
 // session's transcript head — never a path the master named. Everything else
 // defaults to this machine's engine homes.
+//
+// `opts.codexRpc(method, params, { timeoutMs })` is the native harness's shared
+// client (agent/capabilities.js). A Codex catalog that cannot be read from it
+// falls back to the walk: a palette with guessed rows beats an empty one.
 async function readCatalog(opts = {}) {
   const engine = ['claude', 'codex', 'grok'].includes(opts.engine) ? opts.engine : 'claude';
   const home = os.homedir();
@@ -251,6 +305,14 @@ async function readCatalog(opts = {}) {
     codexHome: opts.codexHome || process.env.CODEX_HOME || path.join(home, '.codex'),
     grokDir: opts.grokDir || process.env.GROK_HOME || path.join(home, '.grok'),
   };
+
+  if (engine === 'codex' && typeof opts.codexRpc === 'function') {
+    const state = { byName: new Map(), truncated: false };
+    try {
+      await readCodexNative(dirs, opts.codexRpc, state);
+      return { entries: [...state.byName.values()], truncated: state.truncated, root: dirs.cwd, engine };
+    } catch { /* the walk below */ }
+  }
 
   const state = { byName: new Map(), truncated: false };
   for (const src of sourcesFor(engine, dirs)) {

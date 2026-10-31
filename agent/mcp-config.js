@@ -9,7 +9,8 @@
 //   Claude — ~/.claude.json `mcpServers` (user) + `projects[cwd].mcpServers`
 //            (project), plus a project-root `.mcp.json`.
 //   Codex  — `[mcp_servers.*]` sections in $CODEX_HOME/config.toml (best-effort
-//            line scan — no TOML dep; nested/inline-table configs may be partial).
+//            line scan, no TOML dep; nested/inline-table configs may be partial),
+//            or, on the native harness, the app-server's own config/read.
 //
 // Secrets never cross the wire: auth headers, env values, and URL userinfo are
 // dropped — only a boolean `auth` flag survives. (The API is owner-scoped, but a
@@ -178,8 +179,56 @@ async function readGrok(cwd) {
   return out;
 }
 
-async function readMcpServers(cwd, engine) {
+// One effective mcp_servers entry from config/read, in the same redacted shape.
+// Unlike the line scan this sees inline tables, `url` servers and project layers,
+// and knows when a server carries credentials (env, headers, a bearer token).
+function codexServer(name, cfg, layer) {
+  const c = cfg && typeof cfg === 'object' ? cfg : {};
+  const http = typeof c.url === 'string' && c.url;
+  const nonEmpty = (o) => !!(o && typeof o === 'object' && Object.keys(o).length);
+  const target = http
+    ? redactUrl(c.url)
+    : redactCommandLine([c.command, ...(Array.isArray(c.args) ? c.args : [])].filter((x) => typeof x === 'string' && x).join(' '));
+  const auth = nonEmpty(c.env) || (Array.isArray(c.env_vars) && c.env_vars.length > 0)
+    || nonEmpty(c.http_headers) || nonEmpty(c.env_http_headers) || !!c.bearer_token_env_var
+    || (http && /\/\/[^@/]*@/.test(c.url));
+  const project = layer && layer.type === 'project';
+  return {
+    name: String(name).slice(0, 120),
+    scope: project ? 'project' : 'user',
+    transport: http ? 'http' : 'stdio',
+    target: String(target).slice(0, MAX_TARGET),
+    auth: !!auth,
+    source: project ? '.codex/config.toml' : '~/.codex/config.toml',
+  };
+}
+
+// The native read: the shared app-server's config/read, resolved for the
+// session's own folder so a project's .codex/config.toml counts as Codex counts
+// it. `codexRpc(method, params, { timeoutMs })` is the agent's shared client.
+async function readCodexNative(cwd, codexRpc) {
+  const r = await codexRpc('config/read', cwd ? { cwd } : {}, { timeoutMs: 15_000 });
+  const servers = r && r.config && r.config.mcp_servers;
+  if (!servers || typeof servers !== 'object') return [];
+  const origins = (r.origins && typeof r.origins === 'object') ? r.origins : {};
+  const layerOf = (name) => {
+    const want = `mcp_servers.${name}.`;
+    const hit = Object.entries(origins).find(([k, v]) => k.startsWith(want) && v && v.name);
+    return hit ? hit[1].name : null;
+  };
+  return Object.entries(servers).map(([name, cfg]) => codexServer(name, cfg, layerOf(name)));
+}
+
+// `opts.codexRpc` (agent/capabilities.js, the native harness's request) makes the
+// Codex half native. A read that fails falls back to the line scan: this list is
+// for looking at, and a partial answer beats none.
+async function readMcpServers(cwd, engine, opts = {}) {
   const eng = engine === 'codex' ? 'codex' : engine === 'grok' ? 'grok' : 'claude';
+  if (eng === 'codex' && typeof opts.codexRpc === 'function') {
+    try {
+      return { engine: 'codex', cwd, servers: await readCodexNative(cwd, opts.codexRpc) };
+    } catch { /* below */ }
+  }
   if (eng === 'codex') return { engine: 'codex', cwd, servers: await readCodex() };
   if (eng === 'grok') return { engine: 'grok', cwd, servers: await readGrok(cwd) };
 
@@ -196,7 +245,7 @@ async function readMcpServers(cwd, engine) {
   return { engine: 'claude', cwd, servers };
 }
 
-module.exports = { readMcpServers, redactCommandLine, redactUrl, redactUrlPath, tokenSegment, secretFlag };
+module.exports = { readMcpServers, redactCommandLine, redactUrl, redactUrlPath, tokenSegment, secretFlag, codexServer };
 
 // ponytail: runnable check — node lib/mcp-config.js
 if (require.main === module) {

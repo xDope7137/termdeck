@@ -4,6 +4,21 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1499 · 2026-10-31
+
+- **Codex, natively** *(agent)*. Codex chats now run on Codex's own app-server protocol end to end.
+  History comes from Codex itself and is drawn the way Codex records it, turn by turn; older turns
+  load their steps as you scroll to them. Approval cards offer exactly the answers Codex offers,
+  including Codex's own "allow for this chat", saved command rules and network hosts, plus
+  Termdeck's "like this, this turn". Needs Codex 0.163.0 or newer; an older Codex keeps the
+  previous support.
+- **Branch from or rewind to a Codex turn**. Under a finished turn, **Branch from here** copies the
+  chat up to that turn into a new one, and **Rewind to before this** removes that turn and the
+  ones after it. Rewind changes the conversation only, never your files.
+- **`/review` on Codex** runs Codex's own review of your uncommitted changes.
+- **Codex sub-agents and limits update live** *(agent)*: the Sub-agents panel follows workers as
+  they run, and the rate-limit panel refreshes when Codex reports new limits.
+
 ## 0.1.1497 · 2026-10-30
 
 - **The files panel follows the chat** *(agent)*. When the agent changes into another folder, the

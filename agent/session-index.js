@@ -72,6 +72,13 @@ function headAsk(row, prev) {
   };
 }
 
+// One spelling of a file path for matching Codex's `path` against the walk's:
+// resolved, and case-folded where the filesystem is (Windows).
+const pathKey = (p) => {
+  const r = path.resolve(p);
+  return process.platform === 'win32' ? r.toLowerCase() : r;
+};
+
 // Codex's TUI rename index: one {id, thread_name} per line, appended to.
 function parseCodexTitles(text, into) {
   for (const line of text.split('\n')) {
@@ -93,6 +100,12 @@ function freshState(agentVersion) {
  *   candidate   (kind, root, dir, name) -> bool, the walk's coarse filter
  *   readHead    (ask) -> head | null, lib/index-head.js against local disk
  *   confined    (path) -> bool, the agent's transcript-root confinement
+ *   codexThreads () -> Thread[] | null, Codex's own records of its threads
+ *               (thread/list on the native harness, agent/codex-harness.js). A
+ *               codex file with a record gets its head from it (threadHead)
+ *               rather than from its bytes; a file with none, or a provider
+ *               that throws or answers null, is parsed off disk as before.
+ *   threadHead  (thread, ask) -> head, lib/index-head.js codexThreadHead
  */
 function createSessionIndex(opts = {}) {
   const file = opts.file || null;
@@ -100,6 +113,8 @@ function createSessionIndex(opts = {}) {
   const candidate = opts.candidate || (() => true);
   const readHead = opts.readHead || (async () => null);
   const confined = opts.confined || (async () => true);
+  const codexThreads = typeof opts.codexThreads === 'function' && typeof opts.threadHead === 'function' ? opts.codexThreads : null;
+  const threadHead = opts.threadHead;
   let state = null;
   let chain = Promise.resolve();
   let persistTimer = null;
@@ -208,19 +223,45 @@ function createSessionIndex(opts = {}) {
         for (const [rel, e] of rec.files) all.push({ kind, rel, e, root: rec.root });
       }
       all.sort((a, b) => b.e.m - a.e.m);
-      const top = all.slice(0, max + HEAD_SLACK).filter(({ e }) => !e.h || e.h.s !== e.s || e.h.m !== e.m);
+      const window = all.slice(0, max + HEAD_SLACK);
+      const stale = ({ e }) => !e.h || e.h.s !== e.s || e.h.m !== e.m;
+      const top = window.filter(stale);
+      // A codex head the bytes answered while Codex's records were out of reach
+      // (`r` unset: no app-server was up yet, which is every row on the agent's
+      // first sync). It is asked again once the records are there, or a chat
+      // nobody has written to since would keep the rollout's guess at its title
+      // for good, under a name Codex itself does not show.
+      const unasked = codexThreads ? window.filter((t) => t.kind === 'codex' && !stale(t) && t.e.h.r === undefined) : [];
+      // Codex's records, asked once per update and only when a codex head is due.
+      const records = codexThreads && (unasked.length || top.some((t) => t.kind === 'codex')) ? await threadsByPath() : null;
+      if (records) {
+        for (const t of unasked) {
+          if (records.has(pathKey(path.join(t.root, t.rel)))) top.push(t);
+          else t.e.h.r = 0; // Codex has no record of it: the bytes are the answer
+        }
+      }
       await mapLimit(top, async ({ kind, rel, e, root }) => {
         const full = path.join(root, rel);
         if (!(await confined(full))) return;
         const prev = e.h ? { ...e.h, sizeBytes: e.h.s } : null;
+        const ask = headAsk({ path: full, engine: kind, zst: rel.endsWith('.zst'), sizeBytes: e.s }, prev);
+        const record = kind === 'codex' && records ? records.get(pathKey(full)) : null;
         let head = null;
+        let fromRecord = false;
         try {
-          head = await readHead(headAsk({ path: full, engine: kind, zst: rel.endsWith('.zst'), sizeBytes: e.s }, prev));
+          head = record ? await threadHead(record, ask) : null;
+          fromRecord = !!(head && !head.failed);
+        } catch { head = null; }
+        try {
+          if (!head || head.failed) head = await readHead(ask);
         } catch { head = null; }
         // A read that failed is not a fact about the file; the master's
         // fallback asks again rather than this pinning a null title.
         if (!head || head.failed) return;
         e.h = { ...head, s: e.s, m: e.m };
+        // Where a codex head came from: 1 a record, 0 the bytes with the records
+        // in hand (none named it), unset the bytes before there were any.
+        if (kind === 'codex' && records) e.h.r = fromRecord ? 1 : 0;
         if (!changed.includes(e)) changed.push(e);
       });
     }
@@ -273,6 +314,18 @@ function createSessionIndex(opts = {}) {
     if (titlesMoved) st.titles.g = st.gen;
     schedulePersist();
     return true;
+  }
+
+  // thread/list's records keyed by their rollout path, or null when the provider
+  // has nothing to say (legacy harness, no codex, the server would not start).
+  // A failure is never fatal: the disk parse answers every row as it always did.
+  async function threadsByPath() {
+    let list;
+    try { list = await codexThreads(); } catch { return null; }
+    if (!Array.isArray(list)) return null;
+    const out = new Map();
+    for (const t of list) if (t && typeof t.path === 'string' && t.path) out.set(pathKey(t.path), t);
+    return out;
   }
 
   // The master's one round trip. `roots`: [{ kind, path }] as the master joins
@@ -337,7 +390,7 @@ function createSessionIndex(opts = {}) {
 
 // What crosses the wire of a head: the parse's answer, not this module's stamps.
 function stripHead(h) {
-  const { s, m, ...rest } = h;
+  const { s, m, r, ...rest } = h;
   return rest;
 }
 

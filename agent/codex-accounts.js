@@ -51,9 +51,40 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { resolveCli, interactiveSpawn, killTree } = require('./which');
 
-let hooks = { invalidateModels: () => {}, reloadCodex: () => {} };
+let hooks = { invalidateModels: () => {}, reloadCodex: () => {}, accountChanged: () => {} };
 function setInvalidateHooks(h) {
   hooks = { ...hooks, ...h };
+}
+
+/* ---------- the native path: the agent's one shared app-server ---------- */
+
+// On an agent running the native Codex harness (agent/codex-harness.js), the
+// machine has ONE long-lived `codex app-server` and it is the agent's. Then the
+// questions this module used to answer by hand have a native answer:
+//
+//   who is signed in      account/read, from the process that holds the tokens
+//   add an account        account/login/start { type: 'chatgptDeviceCode' },
+//                         finished by account/login/completed, stopped by
+//                         account/login/cancel. No CLI is spawned and no output is
+//                         scraped, so the Windows .cmd shim limit goes with it.
+//
+// What has NO native equivalent stays as it is: Codex keeps one login, so the
+// saved snapshots, the switch-by-swapping-auth.json, and the refresh-token probe
+// of a snapshot that is not signed in are all still ours. After a switch the
+// shared server has to be recycled (note 3) and is then asked, with account/read,
+// who it is now on; that answer, not the file we just wrote, decides the switch.
+//
+//   codexRpc(method, params, { timeoutMs }) -> Promise<result>, throws on error
+//   onCodexNotification(fn(method, params)) -> unsubscribe   (the login needs it)
+//
+// With nothing injected every function below behaves exactly as before.
+let native = null; // { rpc, onNotification }
+const RPC_TIMEOUT_MS = 20_000;
+
+function setCodexNative({ codexRpc = null, onCodexNotification = null } = {}) {
+  native = typeof codexRpc === 'function'
+    ? { rpc: codexRpc, onNotification: typeof onCodexNotification === 'function' ? onCodexNotification : null }
+    : null;
 }
 
 // Same resolution as agent/capabilities.js so "the CLI Termdeck runs turns with"
@@ -102,6 +133,9 @@ const shimOpts = () => (winShim() ? { shell: true } : {});
 // Whether this box can be driven through a sign-in from the dashboard at all —
 // same shape and same reasons as lib/accounts.js signInSupport.
 function signInSupport() {
+  // The native sign-in is a request to a server already running, so there is no
+  // console for a .cmd shim to hold and every machine can be driven from here.
+  if (native && native.onNotification) return { remote: true, via: 'app-server', why: null, exe: codexExe(), reason: null };
   const { via, cmd, why } = interactiveSpawn(codexExe());
   return {
     remote: via !== 'shell',
@@ -213,10 +247,65 @@ function readLiveCredentials() {
 // Synchronous on purpose — unlike Claude's, this reads a file instead of
 // spawning `claude auth status`. Callers still `await` it; awaiting a plain
 // value keeps both modules interchangeable at every call site.
+//
+// On the native path it is a Promise (account/read is a round trip), which is
+// why every caller has to `await` it. Same for listAccounts.
 function authStatus() {
+  if (native) return nativeAuthStatus();
+  return diskAuthStatus();
+}
+
+function diskAuthStatus() {
   const raw = readLiveCredentials();
   const ident = raw ? identityFrom(raw) : null;
   return ident ? { loggedIn: true, ...ident } : { loggedIn: false };
+}
+
+// Pure: an account/read answer -> the status shape above. The server is the
+// authority on WHETHER someone is signed in, their email and their plan; the
+// account id comes from its workspace routing. auth.json is still read, but only
+// for what the server does not say (the org title, an API key's stable id) and
+// only when it is the same account, so a file the server has not picked up yet
+// can never put one account's name on another's login.
+function statusFromAccountRead(read, disk) {
+  const a = read && read.account;
+  if (!a || typeof a !== 'object') return { loggedIn: false };
+  if (a.type === 'chatgpt') {
+    const routed = read.workspaceRouting && read.workspaceRouting.chatgptAccountId;
+    const fromDisk = disk && disk.authMode === 'chatgpt' ? disk : null;
+    const orgId = routed || (fromDisk ? fromDisk.orgId : null) || (a.email ? `codex:${a.email}` : null);
+    const same = fromDisk && fromDisk.orgId === orgId ? fromDisk : null;
+    return {
+      loggedIn: true,
+      orgId,
+      email: a.email || (same ? same.email : null),
+      orgName: same ? same.orgName : null,
+      subscriptionType: a.planType || (same ? same.subscriptionType : null),
+      authMode: 'chatgpt',
+    };
+  }
+  if (a.type === 'apiKey') {
+    if (disk && disk.authMode === 'apikey') return { loggedIn: true, ...disk };
+    return { loggedIn: true, orgId: 'apikey', email: null, orgName: 'OpenAI API key', subscriptionType: 'api key', authMode: 'apikey' };
+  }
+  // Amazon Bedrock, and whatever Codex adds next: signed in, but not a login this
+  // module can snapshot or switch. Reported so the page does not say "signed out".
+  const kind = String(a.type || 'unknown');
+  return { loggedIn: true, orgId: kind, email: null, orgName: kind === 'amazonBedrock' ? 'Amazon Bedrock' : kind, subscriptionType: null, authMode: kind };
+}
+
+// A server that cannot answer is not "signed out": fall back to the file, which
+// is what the answer was before there was a server to ask.
+async function nativeAuthStatus() {
+  const raw = readLiveCredentials();
+  const disk = raw ? identityFrom(raw) : null;
+  let read;
+  try {
+    read = await native.rpc('account/read', {}, { timeoutMs: RPC_TIMEOUT_MS });
+  } catch {
+    return disk ? { loggedIn: true, ...disk } : { loggedIn: false };
+  }
+  return statusFromAccountRead(read, disk);
 }
 
 function publicEntry(entry, active) {
@@ -254,7 +343,11 @@ function saveCurrentAccount() {
 }
 
 function listAccounts() {
-  const status = authStatus();
+  if (native) return nativeAuthStatus().then(accountsFor);
+  return accountsFor(diskAuthStatus());
+}
+
+function accountsFor(status) {
   const accounts = readSavedEntries()
     .map((entry) => publicEntry(entry, Boolean(status.loggedIn && entry.orgId && entry.orgId === status.orgId)))
     .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
@@ -460,18 +553,23 @@ async function switchAccount(orgId, { busy = 0 } = {}) {
 
   atomicWrite(credentialsPath(), target.credentials);
   hooks.invalidateModels();
-  hooks.reloadCodex(); // note 3: without this the running app-server keeps the old login
+  // note 3: without this the running app-server keeps the old login. On the
+  // native path the hook recycles the agent's own shared server and is awaited:
+  // the account/read below has to reach the NEW process, or it would confirm the
+  // old account's identity from memory and roll back a switch that took.
+  await hooks.reloadCodex();
 
-  const status = authStatus();
+  const status = await authStatus();
   if (!switchTookEffect(status, orgId)) {
     if (prevCred != null) atomicWrite(credentialsPath(), prevCred);
     hooks.invalidateModels();
-    hooks.reloadCodex();
+    await hooks.reloadCodex();
     const err = new Error('That saved login didn’t activate — remove it and add the account again.');
     err.checks = [...pre.checks, check('activate', 'Switch and confirm', 'fail', err.message)];
     throw err;
   }
-  return { ...listAccounts(), checks: [...pre.checks, check('activate', 'Switch and confirm', 'ok', 'the machine is now on this account')] };
+  hooks.accountChanged();
+  return { ...(await listAccounts()), checks: [...pre.checks, check('activate', 'Switch and confirm', 'ok', 'the machine is now on this account')] };
 }
 
 function removeAccount(orgId) {
@@ -518,32 +616,38 @@ let loginUserCode = null;
 let loginCancelled = false;
 let loginResult = null; // { ok, account } | { ok: false, error, cancelled? } once settled; cleared on next startLogin
 
+let loginFlow = null; // the native flow in progress: { loginId, cancelled, done, early, unsub, timer }
+
 function loginStatus() {
-  return { inProgress: Boolean(loginChild), url: loginUrl, userCode: loginUserCode, result: loginResult };
+  return { inProgress: Boolean(loginChild || loginFlow), url: loginUrl, userCode: loginUserCode, result: loginResult };
 }
 
-function startLogin() {
-  if (loginChild) throw new Error('A login is already in progress');
-  loginUrl = null;
-  loginUserCode = null;
-  loginCancelled = false;
-  loginResult = null;
-  // `codex login` DELETES auth.json the instant it starts, before the person has
-  // typed anything (measured — auth.json is gone while the device code is still
-  // on screen). So merely clicking "Add account" signs this machine out, and
-  // cancelling would strand it that way. Two different losses to prevent:
-  //
-  //   - the flow FAILS: put the bytes we had straight back (restorePrevious).
-  //   - the flow SUCCEEDS: the outgoing login is overwritten by the new one, so
-  //     an account that was never saved is simply gone. Snapshot it first.
-  //
-  // But only when it is not already saved. Re-snapshotting unconditionally would
-  // overwrite a good stored snapshot with whatever is live — and "live" is not
-  // the same as "working": a spent refresh token still parses, still yields an
-  // identity, and would happily replace the last switchable copy of that account
-  // with a dead one. Keeping tokens fresh is switchAccount's job (it re-saves the
-  // outgoing account) and preflight's (it persists the rotated token); neither
-  // needs this path to do it too.
+// The code itself expires in 15 minutes, so a 3-minute cap (Claude's) would
+// kill a flow that is still perfectly valid. 16 outlives the code.
+const LOGIN_TIMEOUT_MS = 16 * 60 * 1000;
+
+// `codex login` DELETES auth.json the instant it starts, before the person has
+// typed anything (measured: auth.json is gone while the device code is still
+// on screen). So merely clicking "Add account" signs this machine out, and
+// cancelling would strand it that way. Two different losses to prevent:
+//
+//   - the flow FAILS: put the bytes we had straight back (restorePrevious).
+//   - the flow SUCCEEDS: the outgoing login is overwritten by the new one, so
+//     an account that was never saved is simply gone. Snapshot it first.
+//
+// But only when it is not already saved. Re-snapshotting unconditionally would
+// overwrite a good stored snapshot with whatever is live, and "live" is not
+// the same as "working": a spent refresh token still parses, still yields an
+// identity, and would happily replace the last switchable copy of that account
+// with a dead one. Keeping tokens fresh is switchAccount's job (it re-saves the
+// outgoing account) and preflight's (it persists the rotated token); neither
+// needs this path to do it too.
+//
+// The app-server's device flow does not delete the file up front (upstream
+// account_processor.rs), but a successful one still overwrites it, so the native
+// path takes the same snapshot and keeps the same restore as a backstop.
+// Returns the bytes that were live.
+function snapshotOutgoing() {
   const prevCred = readLiveCredentials();
   try {
     const live = identityFrom(prevCred || '');
@@ -551,6 +655,109 @@ function startLogin() {
   } catch {
     /* nothing signed in, or unreadable — nothing to preserve */
   }
+  return prevCred;
+}
+
+// Codex's own words for why a login could not start ("ChatGPT login is
+// disabled. Use API key login instead.", "failed to request device code: ..."),
+// clipped. They name the problem and carry no credential.
+const loginError = (e, fallback) => String((e && e.message) || e || fallback).trim().slice(0, 500) || fallback;
+
+// The device code over the shared app-server. Same contract as the CLI flow
+// below: synchronous to call (capabilities.js answers `{ started: true }` at
+// once), url and userCode arrive on loginStatus() a moment later, and `result`
+// settles once. The flow belongs to the server, not to a child of ours, so a
+// cancel is a request and a timeout is a cancel.
+function startNativeLogin() {
+  const prevCred = snapshotOutgoing();
+  // Held for the flow's life: an injection replaced mid-flow must not strand it.
+  const { rpc, onNotification } = native;
+  const flow = { loginId: null, cancelled: false, done: false, early: null, unsub: null, timer: null, rpc };
+  loginFlow = flow;
+  const settle = (result) => {
+    if (flow.done) return;
+    flow.done = true;
+    clearTimeout(flow.timer);
+    if (flow.unsub) { try { flow.unsub(); } catch {} }
+    if (loginFlow === flow) loginFlow = null;
+    loginResult = result;
+  };
+  // Nothing to undo unless the file is gone, which this flow does not do on its
+  // own; kept so a failed sign-in can never be the thing that signed a box out.
+  const restorePrevious = () => {
+    if (prevCred == null || identityFrom(readLiveCredentials() || '')) return;
+    try { atomicWrite(credentialsPath(), prevCred); } catch {}
+  };
+  const completed = (p) => {
+    if (flow.cancelled) {
+      restorePrevious();
+      return settle({ ok: false, cancelled: true });
+    }
+    if (!p.success) {
+      restorePrevious();
+      return settle({ ok: false, error: loginError(p.error, 'The sign-in did not complete.') });
+    }
+    // The server reloaded its own login on success and wrote auth.json (file
+    // credential store), so this snapshot is of the account just added. No
+    // recycle: unlike a switch, the shared server is already on it.
+    try {
+      const account = saveCurrentAccount();
+      hooks.invalidateModels();
+      hooks.accountChanged();
+      settle({ ok: true, account });
+    } catch (err) {
+      settle({ ok: false, error: err.message });
+    }
+  };
+  // Subscribed BEFORE the request, so a completion can never slip between the
+  // response and the subscription. One that names a login we do not know yet is
+  // held until the response says which login is ours.
+  const un = onNotification((method, params) => {
+    if (method !== 'account/login/completed' || !params || flow.done) return;
+    if (flow.loginId == null) { flow.early = params; return; }
+    if (params.loginId != null && params.loginId !== flow.loginId) return; // someone else's sign-in
+    completed(params);
+  });
+  flow.unsub = typeof un === 'function' ? un : null;
+  flow.timer = setTimeout(() => {
+    if (flow.loginId) rpc('account/login/cancel', { loginId: flow.loginId }, { timeoutMs: RPC_TIMEOUT_MS }).catch(() => {});
+    restorePrevious();
+    settle({ ok: false, error: 'The one-time code expired before the sign-in finished. Start again.' });
+  }, LOGIN_TIMEOUT_MS);
+  if (flow.timer.unref) flow.timer.unref();
+  rpc('account/login/start', { type: 'chatgptDeviceCode' }, { timeoutMs: 60_000 }).then((r) => {
+    const loginId = r && typeof r.loginId === 'string' ? r.loginId : null;
+    if (flow.done) {
+      // Cancelled while the code was being fetched: stop the flow it started.
+      if (loginId) rpc('account/login/cancel', { loginId }, { timeoutMs: RPC_TIMEOUT_MS }).catch(() => {});
+      return;
+    }
+    if (!r || r.type !== 'chatgptDeviceCode' || !loginId) return settle({ ok: false, error: 'Codex did not start a device-code sign-in on this machine.' });
+    flow.loginId = loginId;
+    loginUrl = typeof r.verificationUrl === 'string' ? r.verificationUrl : null;
+    loginUserCode = typeof r.userCode === 'string' ? r.userCode : null;
+    const early = flow.early;
+    flow.early = null;
+    if (early && (early.loginId == null || early.loginId === loginId)) completed(early);
+  }, (e) => {
+    restorePrevious();
+    settle({ ok: false, error: loginError(e, 'Codex could not start a sign-in.') });
+  });
+}
+
+function startLogin() {
+  if (loginChild || loginFlow) throw new Error('A login is already in progress');
+  loginUrl = null;
+  loginUserCode = null;
+  loginCancelled = false;
+  loginResult = null;
+  // The device code is the only flow the protocol offers that fits a browser on
+  // another device: `chatgpt` is the localhost:1455 callback (useless remotely,
+  // the same trap as plain `codex login`), `apiKey` would put a key on the wire,
+  // and `chatgptAuthTokens` is for hosts that run their own OAuth. Needs the
+  // notification half, since that is how the flow says it finished.
+  if (native && native.onNotification) return startNativeLogin();
+  const prevCred = snapshotOutgoing();
   // The device flow hands its code to the PERSON rather than reading one back,
   // so this half never hung the way Claude's paste step did — but the code and
   // the URL still have to reach us THROUGH that same cmd.exe hop, which is the
@@ -573,13 +780,11 @@ function startLogin() {
   };
   child.stdout.on('data', onData);
   child.stderr.on('data', onData);
-  // The code itself expires in 15 minutes, so a 3-minute cap (Claude's) would
-  // kill a flow that is still perfectly valid. 16 outlives the code.
   const timer = setTimeout(() => {
     try {
       child.kill();
     } catch {}
-  }, 16 * 60 * 1000);
+  }, LOGIN_TIMEOUT_MS);
   const settle = (result) => {
     clearTimeout(timer);
     loginChild = null;
@@ -624,6 +829,21 @@ function startLogin() {
 }
 
 function cancelLogin() {
+  if (loginFlow) {
+    const flow = loginFlow;
+    flow.cancelled = true;
+    // Settled here rather than on the server's failed account/login/completed: the
+    // person asked to stop, and the page should say so on its next poll whether or
+    // not the server answers. A login not yet issued is cancelled when its id
+    // arrives (startNativeLogin).
+    if (flow.loginId) flow.rpc('account/login/cancel', { loginId: flow.loginId }, { timeoutMs: RPC_TIMEOUT_MS }).catch(() => {});
+    flow.done = true;
+    clearTimeout(flow.timer);
+    if (flow.unsub) { try { flow.unsub(); } catch {} }
+    loginFlow = null;
+    loginResult = { ok: false, cancelled: true };
+    return true;
+  }
   if (!loginChild) return false;
   loginCancelled = true;
   // killTree: on the shell fallback the child is cmd.exe with the real CLI
@@ -648,6 +868,8 @@ module.exports = {
   loginStatus,
   signInSupport,
   setCodexExe,
+  setCodexNative,
+  statusFromAccountRead,
 };
 
 // ponytail self-check: node lib/codex-accounts.js — pins the pure predicates
@@ -699,6 +921,19 @@ if (require.main === module) {
   assert.strictEqual(identityFrom(chatgptAuth()).authMode, 'chatgpt', 'a null OPENAI_API_KEY does not make it an api-key login');
   assert.strictEqual(identityFrom('not json'), null, 'unparseable = nobody');
   assert.strictEqual(identityFrom(JSON.stringify({ auth_mode: 'chatgpt', tokens: {} })), null, 'no id anywhere = nobody');
+
+  // account/read is the authority; auth.json fills in only what the server does
+  // not say, and only for the same account.
+  const routed = (id, email = 'someone@example.com', planType = 'pro') => ({ account: { type: 'chatgpt', email, planType }, requiresOpenaiAuth: true, workspaceRouting: id ? { chatgptAccountId: id, backendOrigin: 'https://chatgpt.com', accountRoutingOverride: 'NO_CONSTRAINT' } : null });
+  assert.deepStrictEqual(statusFromAccountRead(routed('acct-1'), ident), { loggedIn: true, orgId: 'acct-1', email: 'someone@example.com', orgName: 'Personal', subscriptionType: 'pro', authMode: 'chatgpt' }, 'the server names the plan; the file only adds the org title');
+  const other = statusFromAccountRead(routed('acct-9', 'nine@example.com'), ident);
+  assert.strictEqual(other.orgId, 'acct-9', 'a file the server has not picked up never relabels its login');
+  assert.strictEqual(other.orgName, null, 'and lends it no org title');
+  assert.strictEqual(statusFromAccountRead(routed(null), ident).orgId, 'acct-1', 'no workspace routing: the account id comes from the file');
+  assert.strictEqual(statusFromAccountRead(routed(null, 'x@example.com'), null).orgId, 'codex:x@example.com', 'and with no file either, from the email');
+  assert.deepStrictEqual(statusFromAccountRead({ account: null, requiresOpenaiAuth: true }, ident), { loggedIn: false }, 'the server saying nobody beats a file saying somebody');
+  assert.strictEqual(statusFromAccountRead({ account: { type: 'apiKey' } }, k1).orgId, k1.orgId, 'an API key keeps its stable id from the file');
+  assert.strictEqual(statusFromAccountRead({ account: { type: 'amazonBedrock', usesCodexManagedCredentials: true } }, null).loggedIn, true, 'a Bedrock login is signed in, not signed out');
 
   assert.strictEqual(switchTookEffect({ loggedIn: true, orgId: 'A' }, 'A'), true, 'matching account = switched');
   assert.strictEqual(switchTookEffect({ loggedIn: true, orgId: 'B' }, 'A'), false, 'wrong account (mislabeled snapshot) = not switched');
