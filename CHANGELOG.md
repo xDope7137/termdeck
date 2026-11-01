@@ -4,6 +4,17 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1509 · 2026-11-01
+
+- **Agent updates wait for background shells** *(agent)*. An update restarts the agent, and the
+  restart used to end any background shell a chat had left running, such as a dev server. The
+  agent now waits until the last one ends, then updates.
+- **Chats with a running background shell count as active**. They stay in the sidebar's Active
+  section and the board's Working group for as long as the shell runs.
+- **Background shells that ended unseen say so**. A shell whose Claude process went away reads as
+  ended instead of staying listed as running with a Stop that did nothing, a Stop that fails says
+  why, and a log whose file is gone says that instead of staying blank.
+
 ## 0.1.1499 · 2026-10-31
 
 - **Codex, natively** *(agent)*. Codex chats now run on Codex's own app-server protocol end to end.

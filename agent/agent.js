@@ -696,7 +696,7 @@ async function installUpdate(ws, caps, req) {
   const ack = (ok, error) => { if (id && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: 'update', id, ok, error })); };
   log.info(`Update available from Termdeck: version ${target || 'newer'} (this machine is on ${VERSION}).`);
   if (caps.busy() && !force) {
-    log.info(`Update postponed — a chat is running on this machine right now. It will be applied within ${Math.round(UPDATE_IDLE_RETRY_MS / 1000)}s of this machine going idle.`);
+    log.info(`Update postponed — a chat on this machine is running a turn or holding background shells. It will be applied within ${Math.round(UPDATE_IDLE_RETRY_MS / 1000)}s of this machine going idle.`);
     retryUpdateWhenIdle(ws, caps, req);
     const error = 'busy: a Termdeck-held session is running on this machine';
     ack(false, error);

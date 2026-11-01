@@ -88,7 +88,7 @@ and item model rather than reshaped into another engine's.
 | **Switch model and effort mid-run** | Per turn. Drop to a cheap model for the mechanical part, jump to the big one for the hard part. |
 | **Docked diff review** | Changed files with +/− counts, next to the transcript, and a pull request opened from the same dock. |
 | **Terminals canvas** | Every chat as a live pane on one grid, across machines. |
-| **Background shells** | A dev server a chat started keeps running after the reply, and the chat picks up when a shell finishes. |
+| **Background shells** | A dev server a chat started keeps running after the reply, agent updates wait for it, and the chat picks up when a shell finishes. |
 | **Fleet-wide search** | Every session on every machine, by prompt, project or host. |
 | **Cost and pace meters** | API-equivalent cost per project, token totals, cache-read rate, and rolling and weekly limit pacing before you hit the wall. |
 | **Switch accounts** | Saved engine logins per machine, each with its own usage meter. |

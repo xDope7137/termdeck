@@ -1722,8 +1722,23 @@ function createRunRegistry(opts = {}) {
     }));
   }
 
-  // Unfinished turns, for self-update's busy() gate.
-  const busy = () => [...runs.values()].filter((r) => !r.finishedAt && !r.proc.exited).length;
+  // What self-update's busy() gate must not cut off: unfinished turns, and every
+  // CLI the master holds as a shell host. The agent restarts to apply an update,
+  // and its service manager kills the whole process tree with it, so a held host's
+  // background shells (a dev server, a watcher, a migration) died at every update
+  // that landed while only they were running, which reads as idle (chat c5a2bcae,
+  // 2026-10-31). Counting them means an update waits for as long as a shell runs;
+  // the master releases the host once its last shell ends, and the update follows.
+  const busy = () => {
+    let n = 0;
+    const held = new Set();
+    for (const r of runs.values()) {
+      if (r.proc.exited) continue;
+      if (!r.finishedAt) n += 1;
+      else if (r.proc.held && !r.shared && !held.has(r.proc)) { held.add(r.proc); n += 1; }
+    }
+    return n;
+  };
 
   // Process shutdown: nothing may outlive the agent, or an orphaned CLI's pid
   // view-only-locks its session.
