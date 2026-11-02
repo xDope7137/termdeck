@@ -4,6 +4,16 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1522 · 2026-11-02
+
+- **Machines come back sooner after a Termdeck update** *(agent)*. Termdeck now tells every agent
+  it is restarting before it goes, and the agent redials on a short step until the new master
+  answers, where it used to notice only when the link dropped and then wait a fixed second. It
+  writes one line about it in its log instead of one per attempt.
+- **A chat's model list and branch arrive with the chat**. Opening a chat no longer waits on the
+  machine for the model list, and the branch is asked for alongside the transcript instead of
+  after it.
+
 ## 0.1.1509 · 2026-11-01
 
 - **Agent updates wait for background shells** *(agent)*. An update restarts the agent, and the

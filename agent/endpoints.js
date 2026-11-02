@@ -81,6 +81,47 @@ function dialFailedOnPath({ welcomed, httpStatus, closeCode }) {
   return ![1000, 1012, 1013, 4009].includes(closeCode);
 }
 
+// A master that is restarting says so: master.js gracefulShutdown closes every agent link
+// with 1012 as it begins (relay.js sayRestarting). The next master listens about 0.6s
+// after the old one was told to stop, 0.4s of goodbye and 0.2s to start. Measured on
+// production on 2026-11-02, before the 1012 existed, agents saw a bare drop when the old
+// process exited, sat out the fixed 1s first backoff, and came back 1.0 to 1.7s after the
+// new master was already listening. So after a 1012 the agent redials on a short step that
+// grows, for a bounded window, and then the ordinary backoff takes over: a master that
+// does not come back is not dialled several times a second for long.
+const RESTART_WINDOW_MS = num('TERMDECK_AGENT_RESTART_WINDOW_MS', 10_000);
+const RESTART_STEP_MS = 150;
+const RESTART_STEP_MAX_MS = 1000;
+// Spread, so a fleet told in the same instant does not dial in the same instant.
+const RESTART_JITTER_MS = 150;
+
+// What the front end answers while nothing listens behind it: the tunnel's 502, the old
+// master's own 503 while it says goodbye (relay.js), Cloudflare's 52x and 530. Inside a
+// restart window these mean "not back yet". Anything else (a 401, a 429) is an answer from
+// a running master, and ends the window.
+const RESTART_ANSWERS = new Set([502, 503, 504, 520, 521, 522, 523, 524, 530]);
+const stillRestarting = (status) => RESTART_ANSWERS.has(status);
+
+class RestartWindow {
+  constructor({ windowMs = RESTART_WINDOW_MS } = {}) {
+    this.windowMs = windowMs;
+    this.until = 0;
+    this.n = 0;
+  }
+  // The master closed with 1012.
+  start(now) { this.until = now + this.windowMs; this.n = 0; }
+  // Connected again, refused for real, or told something that is not a restart.
+  end() { this.until = 0; this.n = 0; }
+  active(now) { return now < this.until; }
+  // The wait before the next redial of this window: 150, 300, 450ms and up, never past 1s,
+  // plus jitter.
+  next(random = Math.random) {
+    const step = Math.min(RESTART_STEP_MS * (this.n + 1), RESTART_STEP_MAX_MS);
+    this.n += 1;
+    return step + Math.floor(random() * RESTART_JITTER_MS);
+  }
+}
+
 // Heartbeat bookkeeping for one socket.
 class LinkHealth {
   constructor({ rttHighMs = RTT_HIGH_MS, window = RTT_WINDOW, missLimit = MISS_LIMIT } = {}) {
@@ -261,5 +302,6 @@ async function measure(origins, toHttp, { deadlineMs = 0, ...opts } = {}) {
 
 module.exports = {
   HEARTBEAT_MS, RTT_HIGH_MS, PROBE_TIMEOUT_MS, DIAL_FAIL_LIMIT, ROUTE_EVERY_MS, ROUTE_CONFIRM_MS, ROUTE_START_MS,
-  endpointList, dialFailedOnPath, LinkHealth, Endpoints, Reroute, ranked, better, timed, probe, latency, measure,
+  RESTART_WINDOW_MS, RESTART_STEP_MS, RESTART_STEP_MAX_MS, RESTART_JITTER_MS,
+  endpointList, dialFailedOnPath, stillRestarting, RestartWindow, LinkHealth, Endpoints, Reroute, ranked, better, timed, probe, latency, measure,
 };

@@ -866,6 +866,11 @@ const INDEX_PEEK_MS = Number(process.env.TERMDECK_AGENT_INDEX_PEEK_MS) || 1500;
 const AUTH_BACKOFF_MS = Number(process.env.TERMDECK_AGENT_AUTH_BACKOFF_MS) || 60_000;
 const AUTH_BACKOFF_MAX = AUTH_BACKOFF_MS * 30;
 let backoffMax = BACKOFF_MAX;
+// Opened by a 1012, the master saying it is restarting: until it closes, redials come on a
+// short step instead of the backoff, and a dial that fails is not held against the address
+// (endpoints.js RestartWindow). Process-wide like `backoff`, since it outlives the socket
+// that heard the 1012.
+const restart = new endpointsLib.RestartWindow();
 // How long a dial may sit between connect and 'open'. The dead-link watchdog below only
 // starts on 'open', so before this existed an upgrade that was never answered left the
 // socket with no event to come: no 'open', 'error', 'close' or 'unexpected-response'.
@@ -935,10 +940,15 @@ function dial() {
     redialled = true;
     clearTimeout(rerouteTimer);
     if (health.rtt() != null) link.rtt = health.rtt();
+    // Inside a restart window a dial that never reached a welcome says nothing about the
+    // address: the master behind every address is down for the moment. Counting it would
+    // move this machine, or drop the address the master advertised, on every deploy.
+    const restarting = restart.active(Date.now());
+    const judged = !restarting || welcomed;
     // Move to the next address when this one let us down: we cut a bad link, or a dial
     // failed on the path itself (endpoints.js dialFailedOnPath). Anything the master
     // answered, a 502 during a restart included, would be the same on every address.
-    if (endpoints) {
+    if (endpoints && judged) {
       const moved = linkLost ? endpoints.next()
         : endpointsLib.dialFailedOnPath({ welcomed, httpStatus, closeCode }) ? endpoints.dialFailed()
           : (endpoints.dialOk(), false);
@@ -955,7 +965,7 @@ function dial() {
     // what the boot watchdog reads as a bad release, so a patient retry here is how one
     // wrong origin turns into a rollback. Only without a fallback list, which has its own
     // rotation and always includes home.
-    if (!endpoints && !welcomed && dialledOrigin !== HOME_MASTER) {
+    if (!endpoints && !welcomed && !restarting && dialledOrigin !== HOME_MASTER) {
       log.warn(`Could not reach Termdeck at ${dialledOrigin}. Going back to ${HOME_MASTER}, which is where this machine was set up.`);
       try { fs.unlinkSync(WS_ORIGIN_FILE); } catch { /* never seen one, or already gone */ }
       MASTER = HOME_MASTER;
@@ -969,12 +979,15 @@ function dial() {
     // are no other handles, so an unref'd timer would let Node exit cleanly (code 0)
     // — the agent would die on the first disconnect (e.g. a master restart) instead
     // of reconnecting, and Restart=on-failure wouldn't bring back a clean exit.
-    setTimeout(dial, backoff);
-    backoff = Math.min(backoff * 2, backoffMax);
+    // The backoff does not grow inside a restart window, so a window that runs out hands
+    // over to the same 1s first wait any other drop gets.
+    setTimeout(dial, restarting ? restart.next() : backoff);
+    if (!restarting) backoff = Math.min(backoff * 2, backoffMax);
   };
 
   ws.on('open', () => {
     backoff = 1000;
+    restart.end();
     // A machine that was refused and has since been re-authorised must go straight back
     // to fast reconnects, or it would keep the half-hour ceiling for the rest of its life.
     backoffMax = BACKOFF_MAX;
@@ -1127,6 +1140,7 @@ function dial() {
     // this one: the machine works, it just does not need us. Back off the way a
     // 401 does, and say what to do, because nothing resolves this but a person.
     if (code === 4009 || detail === 'token-conflict') {
+      restart.end(); // a running master answered, and the answer is not "restarting"
       const first = backoffMax !== AUTH_BACKOFF_MAX;
       backoffMax = AUTH_BACKOFF_MAX;
       backoff = Math.max(backoff, AUTH_BACKOFF_MS);
@@ -1154,13 +1168,28 @@ function dial() {
       redial();
       return;
     }
+    // The master is restarting and said so as it began (relay.js sayRestarting). The next
+    // one listens well inside a second, so the redials come on the restart window's short
+    // step rather than the backoff.
+    if (code === 1012) {
+      restart.start(Date.now());
+      log.info('Disconnected from Termdeck: it is restarting, usually for a Termdeck update. Reconnecting as soon as it is back. Chats on this machine are paused until then.');
+      redial();
+      return;
+    }
+    // A redial inside that window that found nothing listening yet. The line above and the
+    // "Connected" that follows say what happened; one line per attempt would not add to it.
+    if (restart.active(Date.now()) && !welcomed) {
+      redial();
+      return;
+    }
     // Codes worth naming, because they are the ones customers see and they mean
     // very different things: 1001/1006 is the network or Cloudflare dropping an
     // idle tunnel (routine, reconnects), 1000 is usually Termdeck restarting for
     // a deploy, 4001 would be the machine's access being revoked.
     const why = code === 1000 ? 'Termdeck restarted (usually a Termdeck update being released)'
       : code === 1001 || code === 1006 ? 'the network connection dropped'
-      : code === 1012 || code === 1013 ? 'Termdeck asked it to reconnect'
+      : code === 1013 ? 'Termdeck asked it to reconnect'
       : `connection closed (code ${code || 'unknown'})`;
     log.info(`Disconnected from Termdeck — ${why}${detail ? `: ${detail}` : ''}. Reconnecting in ${Math.round(backoff / 1000)}s. Chats on this machine are paused until it reconnects.`);
     redial();
@@ -1178,6 +1207,11 @@ function dial() {
     res.resume();                       // drain, or the socket is held open by an unread body
     try { req.destroy(); } catch {}
     caps.park();                        // symmetry with close: never kill a run over a link answer
+    // Inside a restart window, the front end's "nobody is listening" (endpoints.js
+    // stillRestarting) is the restart still going: redial on the window's step, quietly.
+    // Any other answer comes from a running master, so the window is over.
+    const comingBack = restart.active(Date.now()) && endpointsLib.stillRestarting(status);
+    if (!comingBack) restart.end();
     // 401 = this token is not in the master's machines table (revoked, or the machine was
     // deleted and re-added, which mints a new one); 402 = the owner's plan no longer covers
     // this machine. Both are the master's considered answer rather than a transport
@@ -1195,7 +1229,7 @@ function dial() {
       const every = backoffMax >= 60_000 ? `${Math.round(backoffMax / 60_000)} min` : `${Math.round(backoffMax / 1000)}s`;
       if (first) log.warn(`Termdeck refused this machine (HTTP ${status}). ${fix}`);
       else log.info(`Still refused by Termdeck (HTTP ${status}). Retrying every ${every} until it is fixed.`);
-    } else {
+    } else if (!comingBack) {
       log.warn(`Termdeck answered this connection with HTTP ${status}. Reconnecting in ${Math.round(backoff / 1000)}s.`);
     }
     redial();
@@ -1206,6 +1240,8 @@ function dial() {
     // firewall between this machine and Termdeck.
     // A handshake timeout is said once, by the close line, rather than twice.
     if (e && e.message === HANDSHAKE_TIMEOUT_MSG) { handshakeTimedOut = true; return; }
+    // A refused redial while a restarting master comes back is expected, not a proxy.
+    if (restart.active(Date.now()) && !welcomed) return;
     log.warn(`Connection problem: ${describeError(e)}. Will keep retrying.`);
   });
 }
