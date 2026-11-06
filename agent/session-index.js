@@ -67,6 +67,7 @@ function headAsk(row, prev) {
     ...(prev && Number.isFinite(prev.sizeBytes) ? { prevSizeBytes: prev.sizeBytes } : {}),
     prevAt: prev ? prev.lastUserAt || null : null,
     prevActivityAt: prev ? prev.lastActivityAt || null : null,
+    prevModel: prev ? prev.model || null : null,
     noPromptBelow: prev ? prev.noPromptBelow ?? null : null,
     noTitleBelow: prev ? prev.noTitleBelow ?? null : null,
   };

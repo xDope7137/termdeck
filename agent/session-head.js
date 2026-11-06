@@ -210,6 +210,36 @@ function claudeTailCwd(text) {
   return null;
 }
 
+// The model a chat last ran on, read bottom-up out of a window of its transcript, which is
+// what puts it on the index row: a chat being opened can name its model while the transcript
+// is still on its way. Each engine records it once per turn in a record of its own, and each
+// rule is the one the full parse applies (lib/transcript.js), so the row and the payload
+// that replaces it agree. Claude's sidechain records are a subagent's model, not the chat's.
+const MODEL_RECORDS = {
+  claude: ['"assistant"', (rec) => {
+    const model = rec.type === 'assistant' && !rec.isSidechain && rec.message && rec.message.model;
+    return model !== '<synthetic>' ? model : null;
+  }],
+  codex: ['"turn_context"', (rec) => rec.type === 'turn_context' && rec.payload && rec.payload.model],
+  // On the user chunk, not on params._meta.
+  grok: ['"modelId"', (rec) => {
+    const update = rec.params && rec.params.update;
+    return update && update.sessionUpdate === 'user_message_chunk' && update._meta && update._meta.modelId;
+  }],
+};
+function tailModel(text, engine) {
+  const [marker, modelOf] = MODEL_RECORDS[engine] || MODEL_RECORDS.claude;
+  const lines = String(text).split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.includes(marker)) continue;
+    let rec; try { rec = JSON.parse(line); } catch { continue; }
+    const model = rec && modelOf(rec);
+    if (typeof model === 'string' && model) return model;
+  }
+  return null;
+}
+
 // The raw last user prompt (last-prompt record), scanning the tail bottom-up. Last-resort
 // title when the head first-prompt is lost — e.g. a huge image-bearing first message
 // overflows HEAD_BYTES and its line won't parse — and the CLI wrote no custom/ai title.
@@ -665,7 +695,7 @@ function codexTurnState(text) {
 module.exports = {
   codexOrigin, codexTurnState,
   claudeHead, codexHead, grokHead,
-  claudeTailTitle, claudeCustomTitle, claudeTailCwd, claudeLastPrompt, claudeLastCommand, claudeLastCommandAt,
+  claudeTailTitle, claudeCustomTitle, claudeTailCwd, claudeLastPrompt, claudeLastCommand, claudeLastCommandAt, tailModel,
   codexLastPrompt, codexTailWorktree, codexTailLeavesBase,
   isUsableTitle, readUserText, salvagePartialUserText, salvagePartialCodexUserText,
 };

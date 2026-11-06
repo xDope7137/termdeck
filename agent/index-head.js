@@ -36,7 +36,7 @@
 const { decodeRollout, lastClaudeUserInputAt, lastCodexUserInputAt, lastGrokUserInputAt, lastRecordAt, firstGrokUserInput } = require('./transcript');
 const { cleanTitle, normalizeCwd } = require('./claude-data');
 const { scanTailWidening, REVISIT_SLACK } = require('./tail-read');
-const { codexOrigin, codexTurnState, claudeHead, codexHead, grokHead, claudeTailTitle, claudeCustomTitle, claudeTailCwd, claudeLastPrompt, claudeLastCommand, claudeLastCommandAt, codexLastPrompt, codexTailWorktree, codexTailLeavesBase } = require('./session-head');
+const { codexOrigin, codexTurnState, claudeHead, codexHead, grokHead, claudeTailTitle, claudeCustomTitle, claudeTailCwd, claudeLastPrompt, claudeLastCommand, claudeLastCommandAt, tailModel, codexLastPrompt, codexTailWorktree, codexTailLeavesBase } = require('./session-head');
 
 // The index's own probe budget — deliberately not lib/tail-read.js's preview
 // budget, which is sized to render messages rather than to answer two questions.
@@ -94,6 +94,8 @@ async function scanCodexLifecycle(path, size, floor, read) {
 //   noPromptBelow  — how far a previous widening scan already searched without
 //                    finding a prompt, so a growing turn re-reads only what it added.
 //   noTitleBelow   — the same negative cache for the TITLE scan below.
+//   prevModel      : the model we already had. A turn can outgrow the tail window, and
+//                    the last model read says more than the first one in the head.
 // `io`:  { readFile(path, offset, len) -> Buffer, readAll(path) -> Buffer, path }
 //
 // Never throws: an unreadable file yields what the caller already knew.
@@ -101,6 +103,7 @@ async function readIndexHead(row, io) {
   const P = io.path;
   const prevAt = row.prevAt || null;
   const prevActivityAt = row.prevActivityAt || null;
+  const prevModel = row.prevModel || null;
   // Set wherever a tail chunk is in hand: one bottom-up pass over bytes the
   // title/prompt scans already paid for, so this costs a parse and no I/O.
   let lastActivityAt = null;
@@ -132,17 +135,24 @@ async function readIndexHead(row, io) {
         } catch {}
       }
       let lastUserAt = null;
+      let model = null;
       try {
         const tailText = await readTailText(row.path, row.sizeBytes);
         lastUserAt = lastGrokUserInputAt(tailText);
         lastActivityAt = lastRecordAt(tailText, 'grok');
+        model = tailModel(tailText, 'grok');
       } catch {}
+      model = model || prevModel;
+      if (!model && row.sizeBytes > TAIL_BYTES) {
+        try { model = tailModel(await readText(row.path, 0, HEAD_BYTES), 'grok'); } catch {}
+      }
       return {
         cwd: h.cwd ? normalizeCwd(h.cwd) : null, // one folder, one project slug
         title: h.title ? cleanTitle(h.title) : null,
         titleKind: null, // Claude-only (see the main return) — grok's title is its own file
         lastUserAt: lastUserAt || prevAt,
         lastActivityAt: lastActivityAt || prevActivityAt,
+        model,
         firstUserUuid: null,
         noPromptBelow: null,
         noTitleBelow: null,
@@ -155,6 +165,7 @@ async function readIndexHead(row, io) {
         : await readText(row.path, 0, HEAD_BYTES);
     const h = row.engine === 'codex' ? codexHead(text) : claudeHead(text);
     let lastUserAt = null;
+    let model = null;
     // The sort key's bottom rung, held aside while the prose scan widens — see
     // claudeLastCommandAt. Only ever applied once every window above has declined.
     let commandAt = null;
@@ -199,6 +210,7 @@ async function readIndexHead(row, io) {
         if (tailCwd) h.cwd = tailCwd;
         lastUserAt = lastClaudeUserInputAt(tailText);
         lastActivityAt = lastRecordAt(tailText, 'claude');
+        model = tailModel(tailText, 'claude');
         // No prose in the small tail: remember the bottom rung now, because a
         // file under TAIL_BYTES never reaches the widening block below and a
         // `/clear` stub is exactly that — 2 KB, and nothing but the command.
@@ -247,6 +259,7 @@ async function readIndexHead(row, io) {
       }
       lastUserAt = lastCodexUserInputAt(rolloutTail);
       lastActivityAt = lastRecordAt(rolloutTail, 'codex');
+      model = tailModel(rolloutTail, 'codex');
       origin = codexOrigin(text);
       if (row.zst || row.sizeBytes <= HEAD_BYTES) {
         codexTurn = codexTurnState(rolloutTail);
@@ -421,6 +434,10 @@ async function readIndexHead(row, io) {
       // leaves the key absent and the browser falls back to the mtime, which is
       // exactly what every row used to show.
       lastActivityAt: lastActivityAt || prevActivityAt,
+      // The last model the tail names, else the one carried forward, else the first in
+      // the head chunk already in hand. Additive: an agent too old to send it leaves the
+      // row without one, and the composer waits for the transcript as it always did.
+      model: model || prevModel || tailModel(text, row.engine),
       ...(row.engine === 'codex' ? { origin, codexTurn } : {}),
       firstUserUuid: row.engine === 'claude' ? h.firstUserUuid || null : null,
       // Codex collab workers announce their parent in the head (see codexHead) —
@@ -433,7 +450,7 @@ async function readIndexHead(row, io) {
       noTitleBelow,
     };
   } catch {
-    return { cwd: null, title: null, lastUserAt: prevAt, lastActivityAt: prevActivityAt, firstUserUuid: null, noPromptBelow: row.noPromptBelow ?? null, noTitleBelow: row.noTitleBelow ?? null, failed: true };
+    return { cwd: null, title: null, lastUserAt: prevAt, lastActivityAt: prevActivityAt, model: prevModel, firstUserUuid: null, noPromptBelow: row.noPromptBelow ?? null, noTitleBelow: row.noTitleBelow ?? null, failed: true };
   }
 }
 
@@ -467,6 +484,23 @@ async function codexThreadWorktreeOf(thread, cwd, io) {
     return typeof main === 'string' && main && sameSep(main) !== sameSep(cwd) ? main.replace(/[\\/]+$/, '') : null;
   } catch {
     return null;
+  }
+}
+
+// The model for a head built from a Thread record: thread/list's record does not reliably
+// name one, and the rollout does, once per turn. `whole` is a .zst rollout already decoded.
+async function codexRolloutModel(row, io, whole) {
+  const prev = row.prevModel || null;
+  try {
+    if (row.zst) return tailModel(whole ?? decodeRollout(await io.readAll(row.path), row.path), 'codex') || prev;
+    const len = Math.min(row.sizeBytes, TAIL_BYTES);
+    if (!len) return prev;
+    const read = async (offset, bytes) => (await io.readFile(row.path, offset, bytes)).toString('utf8');
+    const found = tailModel(await read(row.sizeBytes - len, len), 'codex') || prev;
+    if (found || row.sizeBytes <= TAIL_BYTES) return found;
+    return tailModel(await read(0, HEAD_BYTES), 'codex');
+  } catch {
+    return prev;
   }
 }
 
@@ -507,6 +541,7 @@ async function codexThreadHead(thread, row, io) {
       : src === 'vscode' ? 'external' : null;
   const prevTurn = Object.prototype.hasOwnProperty.call(row, 'prevCodexTurn') ? row.prevCodexTurn : null;
   let codexTurn = prevTurn;
+  let whole = null;
   const status = t.status && t.status.type;
   if (status === 'active') {
     codexTurn = { active: true, at: lastActivityAt || Date.now(), outcome: 'running' };
@@ -514,7 +549,8 @@ async function codexThreadHead(thread, row, io) {
     try {
       let scanned;
       if (row.zst) {
-        scanned = codexTurnState(decodeRollout(await io.readAll(row.path), row.path));
+        whole = decodeRollout(await io.readAll(row.path), row.path);
+        scanned = codexTurnState(whole);
       } else {
         const hasPrevious = prevTurn !== null && Number.isFinite(row.prevSizeBytes)
           && row.prevSizeBytes >= 0 && row.prevSizeBytes <= row.sizeBytes;
@@ -529,12 +565,14 @@ async function codexThreadHead(thread, row, io) {
   const title = typeof t.name === 'string' && t.name.trim() ? t.name : typeof t.preview === 'string' && t.preview.trim() ? t.preview : null;
   const cwd = typeof t.cwd === 'string' && t.cwd ? normalizeCwd(t.cwd) : null;
   const worktreeOf = await codexThreadWorktreeOf(t, cwd, io);
+  const model = typeof t.model === 'string' && t.model ? t.model : await codexRolloutModel(row, io, whole);
   return {
     cwd,
     title: title ? cleanTitle(title) : null,
     titleKind: null,
     lastUserAt,
     lastActivityAt,
+    model,
     origin,
     codexTurn,
     firstUserUuid: null,

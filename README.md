@@ -90,6 +90,7 @@ and item model rather than reshaped into another engine's.
 | **Terminals canvas** | Every chat as a live pane on one grid, across machines. |
 | **Background shells** | A dev server a chat started keeps running after the reply, agent updates wait for it, and the chat picks up when a shell finishes. |
 | **Fleet-wide search** | Every session on every machine, by prompt, project or host. |
+| **Find files and reuse prompts** | Type `@` to search project files with partial names, or pick an MCP resource in a Codex chat. `Ctrl+R` searches prompts across the project's recent chats. |
 | **Cost and pace meters** | API-equivalent cost per project, token totals, cache-read rate, and rolling and weekly limit pacing before you hit the wall. |
 | **Switch accounts** | Saved engine logins per machine, each with its own usage meter. |
 | **Install to your home screen** | PWA with a push subscription per device. The device you are looking at keeps the others quiet. |

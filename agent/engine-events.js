@@ -302,7 +302,9 @@ const CAPABILITY_SPEC = {
   compactAt: 'fraction?',  // offers /compact, hot past this share of the window; null = no /compact
   rewind: 'boolean',       // restores files to a checkpoint
   mcpStatus: 'boolean',    // reports MCP server connection status
+  mcpResources: 'boolean', // can list what its MCP servers hold, for the `@` menu
   backgroundShells: 'boolean', // runs shells that outlive the turn
+  runOptions: 'boolean',   // takes the per-chat flags of the Run options dialog
   slashCommandList: 'boolean', // reports the slash commands a session has
   // How the master tells that another client is writing this chat. Three mechanisms,
   // not a yes/no: a registry of live CLI pids, the app-server saying a client is

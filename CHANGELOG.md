@@ -4,6 +4,26 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1552 · 2026-11-06
+
+Agent release: **0.1.968**.
+
+- **Find a file without remembering its whole path** *(agent)*. Type `@` and part of its name;
+  from two letters onward, the menu also searches deeper in the project. Dependency and build
+  folders stay out of that search.
+- **Pick MCP resources from the composer** *(agent)*. In a Codex chat, the `@` menu lists resources
+  offered by your MCP servers alongside files. Tool calls also use the server's display name
+  when one is supplied.
+- **Reuse prompts from other chats** *(agent)*. With the composer focused, `Ctrl+R` searches this
+  chat and up to 30 recent chats in the same project, across engines, plus Claude Code terminal
+  prompt history. Partial words work too.
+- **See the chat's model before its messages load** *(agent)*. The composer remembers the last
+  model and shows it as the chat opens.
+- **Follow background command output** *(agent)*. Commands Claude moves to the background after
+  a timeout keep their logs. Expand a command row to follow its newest output.
+- **Set Claude run limits per chat** *(agent)*. Run options include Max turns and the CLI's
+  supported auto-compaction settings. They apply on the next turn.
+
 ## 0.1.1522 · 2026-11-02
 
 - **Machines come back sooner after a Termdeck update** *(agent)*. Termdeck now tells every agent

@@ -2,6 +2,11 @@
 
 // Live output of a command that is still running (bugs.md B7).
 //
+// FOREGROUND commands only, and the NOT ON A PLAIN INSTALL note below is about
+// them. A background shell needs none of this: its result names the id and the
+// file on every install (tool_use_result.backgroundTaskId), and the browser reads
+// it through the `bgShellLog` op (agent/capabilities.js).
+//
 // stream-json never carries partial Bash stdout: the CLI sends the call, then a
 // `tool_progress` clock once a second, then the whole result when the command
 // ends. A 40 second loop read as a frozen row. What the CLI DOES do is write a

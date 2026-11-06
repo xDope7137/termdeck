@@ -182,7 +182,11 @@ const CLAUDE_FLAG_VALUES = {
   '--fallback-model': (v) => !v.startsWith('-') && /^[\w.:\[\]/@-]{1,120}$/.test(v),
   '--effort': (v) => /^[a-z]{1,16}$/.test(v),
   '--max-budget-usd': (v) => /^\d+(\.\d+)?$/.test(v),
-  '--autocompact': (v) => v === 'true' || v === 'false',
+  // What `--autocompact <auto|tokens>` takes, and what lib/session-settings.js
+  // emits. It used to read true/false, which the CLI itself refuses, so saving
+  // Auto-compact made every later turn of that chat fail here.
+  '--autocompact': (v) => v === 'auto' || (/^\d{6,7}$/.test(v) && Number(v) >= 100_000 && Number(v) <= 1_000_000),
+  '--max-turns': (v) => /^[1-9]\d{0,3}$/.test(v) && Number(v) <= 1000,
   '--add-dir': (v) => !!v && !v.startsWith('-'),
 };
 const CLAUDE_FLAG_BARE = new Set(['--verbose', '--include-partial-messages', '--include-hook-events']);

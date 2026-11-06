@@ -13,6 +13,7 @@ const path = require('path');
 const { execFile } = require('child_process');
 const { randomUUID } = require('crypto');
 const { registry: DEFAULT_RUNS, checkClaudeArgs, checkFullAccess, fullAccessAllowed, cmdShimSpawn } = require('./engine-runs');
+const { scratchRoots } = require('./live-output');
 let engineInstallLib; try { engineInstallLib = require('./engine-install'); } catch { engineInstallLib = null; }
 // The wire protocol, written down: every frame this file answers has a row there
 // naming its reply type, its legal ops and the master's timeout for it. The switch
@@ -63,6 +64,7 @@ let checkpointsLib; try { checkpointsLib = require('./checkpoints'); } catch { c
 // like the rest: an agent that pulled a new capabilities.js before this file
 // landed still boots, and the op answers AGENT_OUTDATED instead of crash-looping.
 let projectFilesLib; try { projectFilesLib = require('./project-files'); } catch { projectFilesLib = null; }
+let promptHistoryLib; try { promptHistoryLib = require('./prompt-history'); } catch { promptHistoryLib = null; }
 // Background shells: which processes a parked shell host still owns, and which
 // output file each one writes to. Guarded like the rest — an agent that pulled a
 // new capabilities.js before this file landed still boots and answers
@@ -222,16 +224,15 @@ const GROK_DIR = DEFAULT_CONFINEMENT.dirs.grokDir;
 // master forwards. It reaches us because only the CLI's own tool_result names it
 // (and it embeds the ROOT session id, not the resumed one, so it cannot be
 // derived) — but "we can't compute it" is not "we'll read whatever we're told".
-const BG_SCRATCH_ROOT = (() => {
-  // Mirrors the CLI's own layout: <tmp>/claude-<uid>/<project-slug>/<sessionId>/tasks/.
-  // getuid is POSIX-only; Windows scratchpads carry no uid segment, so match the
-  // prefix rather than an exact directory name.
-  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
-  return { dir: os.tmpdir(), prefix: uid == null ? 'claude-' : `claude-${uid}` };
-})();
+//
+// The root is agent/live-output.js's, the one the agent already tails a running
+// command under, so the two reads cannot disagree about where the CLI writes. A
+// prefix match here used to refuse every Windows log (the CLI's dir there is plain
+// `claude`), any machine with CLAUDE_CODE_TMPDIR set, and let `claude-10000` pass
+// for `claude-1000`. `where` is for tests; the op passes the path alone.
 const BG_LOG_RE = /^b[a-z0-9]+\.output$/i;
 
-function bgLogPathOk(p) {
+function bgLogPathOk(p, where = undefined) {
   if (typeof p !== 'string' || !p) return false;
   let rp;
   // realpath, not resolve: the temp dir is a symlink on macOS (/tmp → /private/tmp),
@@ -239,13 +240,14 @@ function bgLogPathOk(p) {
   try { rp = fs.realpathSync(p); } catch { return false; }
   if (!BG_LOG_RE.test(path.basename(rp))) return false;
   if (path.basename(path.dirname(rp)) !== 'tasks') return false;
-  let tmp;
-  try { tmp = fs.realpathSync(BG_SCRATCH_ROOT.dir); } catch { tmp = path.resolve(BG_SCRATCH_ROOT.dir); }
-  if (rp !== tmp && !rp.startsWith(tmp + path.sep)) return false;
-  // The segment directly under the temp dir must be this user's scratchpad root —
-  // otherwise any world-writable `*/tasks/b*.output` under /tmp would qualify.
-  const seg = rp.slice(tmp.length + 1).split(path.sep)[0] || '';
-  if (!seg.startsWith(BG_SCRATCH_ROOT.prefix)) return false;
+  // Under this user's own scratch root and nowhere else, or any world-writable
+  // `*/tasks/b*.output` under /tmp would qualify.
+  const inRoot = scratchRoots(where).some((root) => {
+    let real;
+    try { real = fs.realpathSync(root); } catch { return false; }
+    return rp.startsWith(real + path.sep);
+  });
+  if (!inRoot) return false;
   try { return fs.statSync(rp).isFile(); } catch { return false; }
 }
 
@@ -1988,11 +1990,10 @@ function makeCapabilities(send, opts = {}) {
   // Settings, the master is the only side that holds that preference, and it can
   // only ever widen within a root already resolved from the customer's own
   // transcript. It cannot name a different root.
-  defineOp('projectFiles', async (m) => {
-    if (!projectFilesLib || !indexHeadLib) throw fail('agent is out of date (project-files module missing). Update the agent', 'AGENT_OUTDATED');
-    // The string test first, before a single fs call. See validateRelPath.
-    const v = projectFilesLib.validateRelPath(m.relPath);
-    if (v.error) throw fail(v.error, v.code);
+  //
+  // The root both projectFiles and projectFind work under, resolved off the
+  // transcript the master named. One copy, because this decides what may be read.
+  const projectRootOf = async (m) => {
     if (!(await confined(m.path))) {
       // The first chat in a new folder: the engine has not made the transcript's
       // folder yet, so confined() cannot resolve its parent. Inside a root and
@@ -2012,6 +2013,16 @@ function makeCapabilities(send, opts = {}) {
     // A transcript can name any cwd (a forged or rewritten one included), so the root
     // it names must still look like a project, never `/` or a parent of home.
     if (!cwdIsProjectShaped(root)) throw fail('path not permitted', 'OUT_OF_ROOT');
+    return root;
+  };
+  const projectFilesError = { onError: (e) => ({ error: denied(e) ? 'Permission denied' : (e.code || e.message), code: denied(e) ? 'DENIED' : 'FILES_FAILED' }) };
+
+  defineOp('projectFiles', async (m) => {
+    if (!projectFilesLib || !indexHeadLib) throw fail('agent is out of date (project-files module missing). Update the agent', 'AGENT_OUTDATED');
+    // The string test first, before a single fs call. See validateRelPath.
+    const v = projectFilesLib.validateRelPath(m.relPath);
+    if (v.error) throw fail(v.error, v.code);
+    const root = await projectRootOf(m);
 
     // Policy runs on every segment, so `.git/config` is refused by its first rather
     // than by a rule about its last. Skipped entirely when the owner has opted in,
@@ -2058,7 +2069,49 @@ function makeCapabilities(send, opts = {}) {
     }
     // `list`, the row's defaultOp.
     return { root, sep: path.sep, ...(await projectFilesLib.listDir(root, r.target, { includeHidden: !!m.includeHidden })) };
-  }, { onError: (e) => ({ error: denied(e) ? 'Permission denied' : (e.code || e.message), code: denied(e) ? 'DENIED' : 'FILES_FAILED' }) });
+  }, projectFilesError);
+
+  // `@` search over the same root, on the same hidden-files terms as a listing.
+  // The query only filters names the walk already holds; it never reaches a path.
+  const findFiles = projectFilesLib && projectFilesLib.createFinder ? projectFilesLib.createFinder() : null;
+  defineOp('projectFind', async (m) => {
+    if (!findFiles || !indexHeadLib) throw fail('agent is out of date (project-files module missing). Update the agent', 'AGENT_OUTDATED');
+    const v = projectFilesLib.validateFindQuery(m.query);
+    if (v.error) throw fail(v.error, v.code);
+    return findFiles(await projectRootOf(m), v.query, { includeHidden: !!m.includeHidden });
+  }, projectFilesError);
+
+  // A project's prompts, for Ctrl+R. Unlike the two above this never leaves the
+  // transcript roots: every source is re-confined here and must be a session file,
+  // so the master naming the chats widens nothing it could not already read. The
+  // CLI's history.jsonl is global, so its rows are filtered to the folder the newest
+  // chat's own head names, on this side.
+  const readPrompts = promptHistoryLib && transcriptLib ? promptHistoryLib.createPromptReader(transcriptLib) : null;
+  const foldPath = (p) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+  defineOp('promptHistory', async (m) => {
+    if (!readPrompts || !indexHeadLib) throw fail('agent is out of date (prompt-history module missing). Update the agent', 'AGENT_OUTDATED');
+    const sources = [];
+    for (const s of Array.isArray(m.sources) ? m.sources.slice(0, promptHistoryLib.MAX_SOURCES) : []) {
+      if (!s || typeof s.path !== 'string' || s.path.endsWith('.zst') || !(await confined(s.path))) continue;
+      const real = await fsp.realpath(s.path).catch(() => null);
+      if (real && inSessionTree(real)) sources.push({ path: real, engine: engineOf(s) });
+    }
+    const folders = new Set();
+    for (const s of sources) {
+      const cwd = await rootFromTranscript(s, s.engine).catch(() => null);
+      if (!cwd) continue;
+      folders.add(foldPath(cwd));
+      const real = await fsp.realpath(cwd).catch(() => null);
+      if (real) folders.add(foldPath(real));
+      break;
+    }
+    const history = path.join(REAL_ROOTS[0], 'history.jsonl');
+    return readPrompts({
+      sources,
+      historyFile: folders.size && (await confined(history)) ? history : null,
+      isProject: (p) => typeof p === 'string' && !!p && folders.has(foldPath(p)),
+    });
+  }, { onError: (e) => ({ error: denied(e) ? 'Permission denied' : (e.code || e.message), code: denied(e) ? 'DENIED' : (e.code || 'HISTORY_FAILED') }) });
 
   // ---- family 5: the small ones a fixture can already reach -------------------
   // Five frames that needed nothing injected beyond what families 1-3 already

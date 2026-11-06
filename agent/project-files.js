@@ -48,6 +48,19 @@ const MAX_SEGMENTS = 32;
 // One directory level per call (the tree expands on click), so this bounds ONE
 // folder — not a walk. A node_modules with 3,000 entries reports 500 + truncated.
 const MAX_ENTRIES = 500;
+// The one walk this module does, createFinder below, and every bound on it. What
+// the listing rule protects is the customer's uplink, so a search may walk the
+// tree on the box as long as only its best matches cross. These keep the walk
+// itself cheap: a home-sized folder stops at the cap and says so.
+const MAX_WALK_ENTRIES = 30000;
+const MAX_WALK_MS = 1500;
+const WALK_TTL_MS = 20000; // one walk serves a whole burst of keystrokes
+const MAX_WALKS = 4;
+const MAX_FIND_RESULTS = 40;
+const MAX_FIND_QUERY = 200;
+// Build output and dependency trees: never what someone means by `@`, and big
+// enough to eat the walk's budget. Still reachable a folder at a time.
+const WALK_SKIP = new Set(['node_modules', 'bower_components', '__pycache__', 'venv', '.venv', 'target', 'dist', 'build', '.git', '.hg', '.svn', '.next', '.cache']);
 // Enough to read a source file; small enough that a 40 MB log doesn't cross the
 // tunnel because someone tapped it.
 const MAX_TEXT_BYTES = 256 * 1024;
@@ -211,9 +224,9 @@ async function resolveTarget(root, segments, { caseInsensitive = process.platfor
   return { target };
 }
 
-// ONE level of one directory. Expand-on-click, never a tree walk: a recursive
-// listing of a real checkout is a node_modules-shaped denial of service against
-// the customer's own uplink, and the panel only ever renders what is open.
+// ONE level of one directory. Expand-on-click, never a tree on the wire: a
+// recursive listing of a real checkout is a node_modules-shaped denial of service
+// against the customer's own uplink, and the panel only ever renders what is open.
 async function listDir(root, target, { includeHidden = false, caseInsensitive = process.platform === 'win32' } = {}) {
   const ents = await fsp.readdir(target, { withFileTypes: true });
   const entries = [];
@@ -243,6 +256,91 @@ async function listDir(root, target, { includeHidden = false, caseInsensitive = 
   // here rather than in the browser so the two never disagree about a page.
   entries.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
   return { entries, truncated };
+}
+
+// The string test for a search, run on both sides like validateRelPath. A query
+// is never a path: it reaches no fs call, it only filters names already walked.
+function validateFindQuery(query) {
+  if (typeof query !== 'string') return badPath('query must be a string');
+  if (query.length > MAX_FIND_QUERY) return badPath('query too long');
+  if (/[\u0000-\u001f\u007f]/.test(query)) return badPath('query contains control characters');
+  return { query: query.replace(/\\/g, '/').trim().toLowerCase() };
+}
+
+// Every name under the root a listing would have shown, breadth first so the
+// bounds cut the deep end of the tree. Same policy as listDir, except that a
+// symlink is skipped outright: a walk that follows links can leave the root or
+// run in a circle, and one stat per entry would cost more than the walk.
+async function walkProject(root, { includeHidden = false, caseInsensitive = process.platform === 'win32', now = Date.now } = {}) {
+  const paths = [];
+  const queue = [''];
+  const deadline = now() + MAX_WALK_MS;
+  let truncated = false;
+  for (let i = 0; i < queue.length && !truncated; i += 1) {
+    if (now() > deadline) { truncated = true; break; }
+    const rel = queue[i];
+    let ents;
+    try { ents = await fsp.readdir(rel ? path.join(root, ...rel.split('/')) : root, { withFileTypes: true }); } catch { continue; }
+    for (const e of ents) {
+      if (e.isSymbolicLink() || !(e.isFile() || e.isDirectory())) continue;
+      if (!includeHidden && isHiddenOrSecret(e.name)) continue;
+      const dir = e.isDirectory();
+      if (dir && WALK_SKIP.has(e.name)) continue;
+      const child = rel ? `${rel}/${e.name}` : e.name;
+      if (isCredentialStore(path.join(root, ...child.split('/')), { caseInsensitive })) continue;
+      if (paths.length >= MAX_WALK_ENTRIES) { truncated = true; break; }
+      paths.push({ path: child, type: dir ? 'dir' : 'file' });
+      if (dir) queue.push(child);
+    }
+  }
+  return { paths, truncated };
+}
+
+function isSubsequence(q, s) {
+  let at = 0;
+  for (let i = 0; i < s.length && at < q.length; i += 1) if (s[i] === q[at]) at += 1;
+  return at === q.length;
+}
+
+// Coarse on purpose: this only has to get the right rows into the cap, and the
+// browser scores those properly (public/js/logic/fuzzy.js). Names beat folders on
+// the way to them, and a query with a `/` in it reads against the whole path.
+function matchTier(q, p) {
+  const base = p.slice(p.lastIndexOf('/') + 1);
+  if (base.startsWith(q)) return 5;
+  if (base.includes(q)) return 4;
+  if (p.includes(q)) return 3;
+  if (isSubsequence(q, base)) return 2;
+  return isSubsequence(q, p) ? 1 : 0;
+}
+
+function rankMatches(rows, query, cap = MAX_FIND_RESULTS) {
+  const hits = [];
+  for (const row of rows) {
+    const tier = matchTier(query, row.path.toLowerCase());
+    if (tier) hits.push({ row, tier });
+  }
+  hits.sort((a, b) => b.tier - a.tier || a.row.path.length - b.row.path.length || a.row.path.localeCompare(b.row.path));
+  return hits.slice(0, cap).map((h) => h.row);
+}
+
+// find(root, query, opts) -> { entries: [{ path, type }], truncated }. `path` is
+// relative with `/` whatever the box's separator, because it lands in a prompt
+// as an `@` mention. `root` must already be a realpath, as for resolveTarget.
+function createFinder({ ttlMs = WALK_TTL_MS, now = Date.now } = {}) {
+  const walks = new Map(); // `${root}\0${hidden}` -> { at, promise }
+  return async function find(root, query, opts = {}) {
+    const key = `${root}\0${opts.includeHidden ? 1 : 0}`;
+    let hit = walks.get(key);
+    if (!hit || now() - hit.at >= ttlMs) {
+      hit = { at: now(), promise: walkProject(root, { ...opts, now }) };
+      walks.delete(key);
+      walks.set(key, hit);
+      if (walks.size > MAX_WALKS) walks.delete(walks.keys().next().value);
+    }
+    const walked = await hit.promise;
+    return { entries: rankMatches(walked.paths, query), truncated: walked.truncated };
+  };
 }
 
 // One decimal, MB only: every size this formats is within an order of magnitude
@@ -308,6 +406,13 @@ module.exports = {
   imageTypeFor,
   listDir,
   readFileCapped,
+  validateFindQuery,
+  walkProject,
+  rankMatches,
+  createFinder,
+  MAX_WALK_ENTRIES,
+  MAX_FIND_RESULTS,
+  MAX_FIND_QUERY,
   MAX_REL_LEN,
   MAX_SEGMENTS,
   MAX_ENTRIES,

@@ -229,6 +229,22 @@ const TABLE = [
     codes: ['AGENT_OUTDATED', 'NO_CWD', 'HIDDEN_BLOCKED', 'DENIED', 'FILES_FAILED'],
     note: "read-only browsing of a chat's project folder, by relative path only",
   },
+  // `@` search. Its own frame rather than a projectFiles op: that row defaults to
+  // `list`, so an older agent would answer a search with a listing. Here it refuses.
+  {
+    name: 'projectFind',
+    timeoutMs: 8_000,
+    codes: ['AGENT_OUTDATED', 'NO_CWD', 'DENIED', 'FILES_FAILED'],
+    note: "fuzzy path search of a chat's project folder: one bounded walk on the box, only the best matches cross",
+  },
+  // Ctrl+R. Reads stay inside the transcript roots; the master names which chats make
+  // up the project, the agent re-confines each and works out the folder from their heads.
+  {
+    name: 'promptHistory',
+    timeoutMs: 20_000,
+    codes: ['AGENT_OUTDATED', 'DENIED'],
+    note: "the prompts of one project's chats, plus its rows of the CLI's history.jsonl",
+  },
   {
     name: 'git',
     timeoutMs: 60_000,

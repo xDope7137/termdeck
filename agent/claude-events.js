@@ -54,12 +54,25 @@ const TASK_TERMINAL = new Set(['completed', 'failed', 'killed', 'stopped', 'canc
 const HOOK_SUBTYPES = new Set(['hook_started', 'hook_progress', 'hook_response']);
 // "Output is being written to: <path>" is the only place a background shell's log
 // path appears. Non-greedy to the extension so a Windows path with spaces survives.
-const BG_LOG_RE = /Output is being written to:\s*(.+?\.output)\b/;
+const BG_LOG_RE = /Output is being written to:\s*(.+?\.output)\b/g;
 // The id, in the same text. Only a sub-agent's result needs it: the turn's own
 // shells name it in tool_use_result.backgroundTaskId.
 const BG_ID_RE = /running in background with ID:\s*([A-Za-z0-9_-]+)/;
 
+// A shell call of either spelling. Every one is noted, because a foreground
+// command that outruns its timeout is moved to the background by the CLI: its
+// result then names a backgroundTaskId for a call that never said
+// run_in_background, and it is the long build the Shells pane exists for.
+const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
+
 const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+
+// The result's text, whichever shape it came in.
+const resultText = (b) => (typeof b.content === 'string' ? b.content
+  : Array.isArray(b.content) ? b.content.map((p) => (p && typeof p.text === 'string' ? p.text : '')).join('\n') : '');
+// The CLI's sentence comes after any stdout the command printed, so the last match
+// is the CLI's own and an earlier one is the command's words.
+const bgLogIn = (text) => { const all = [...text.matchAll(BG_LOG_RE)]; return all.length ? all[all.length - 1][1] : null; };
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
 function blockKindOf(block) {
@@ -159,7 +172,7 @@ function createClaudeTranslator({ sessionId = null, resumed = false, permissionM
   // (chats a62e1315, 9daac53e). The driver refuses a steer while any is open, so the
   // message queues behind the turn instead.
   const agentCalls = new Set();
-  const bgPendingStarts = new Map(); // tool_use_id -> { command, description }
+  const shellStarts = new Map(); // tool_use_id -> { command, description, bg }, until its result
   const bgShells = new Map(shells.filter((s) => s && s.shellId).map((s) => [s.shellId, s])); // shellId -> shell.started payload
   let shellEnded = false; // a shell ended while this turn ran: the CLI owes a turn about it
   const approvals = new Map();       // CLI request_id -> original input
@@ -246,6 +259,12 @@ function createClaudeTranslator({ sessionId = null, resumed = false, permissionM
 
   function onUser(m, r) {
     const content = m.message.content;
+    onUserResults(m, content, r);
+    // A result is a call's last word, so a foreground call leaves nothing behind.
+    for (const b of content) if (b && b.type === 'tool_result') shellStarts.delete(b.tool_use_id);
+  }
+
+  function onUserResults(m, content, r) {
     for (const b of content) {
       if (b && b.type === 'tool_result' && str(b.tool_use_id)) {
         agentCalls.delete(b.tool_use_id);
@@ -270,15 +289,17 @@ function createClaudeTranslator({ sessionId = null, resumed = false, permissionM
     // to report on it never can (measured on 2.1.283; chat c8b064fb ended "[killed]").
     if (m.parent_tool_use_id && !(tr && tr.backgroundTaskId)) {
       for (const b of content) {
-        if (!b || b.type !== 'tool_result' || !bgPendingStarts.has(b.tool_use_id)) continue;
-        const text = typeof b.content === 'string' ? b.content : '';
+        // run_in_background calls only. With no structured field here, the text is
+        // all there is, and a foreground command that printed this sentence is not
+        // a shell: believing it would hold the CLI for something that never ends.
+        const start = b && b.type === 'tool_result' ? shellStarts.get(b.tool_use_id) : null;
+        if (!start || !start.bg) continue;
+        const text = resultText(b);
         const id = (BG_ID_RE.exec(text) || [])[1];
         if (!id) continue;
-        const start = bgPendingStarts.get(b.tool_use_id);
-        bgPendingStarts.delete(b.tool_use_id);
         const shell = { type: 'shell.started', shellId: id, command: start.command };
         if (start.description) shell.description = start.description;
-        const logPath = (BG_LOG_RE.exec(text) || [])[1];
+        const logPath = bgLogIn(text);
         if (logPath) shell.logPath = logPath;
         bgShells.set(id, shell);
         r.events.push(shell);
@@ -304,13 +325,20 @@ function createClaudeTranslator({ sessionId = null, resumed = false, permissionM
     if (!tr.backgroundTaskId) return;
     // A background shell announces its command in the tool_use and its id and log
     // path in the result, so the two are paired here.
-    const block = content.find((b) => b && b.type === 'tool_result' && bgPendingStarts.has(b.tool_use_id));
-    const start = block ? bgPendingStarts.get(block.tool_use_id) : null;
-    if (block) bgPendingStarts.delete(block.tool_use_id);
-    const text = block && typeof block.content === 'string' ? block.content : '';
+    // By the id it names: every shell call is noted now, so "the first one with a
+    // start" could be a sibling that ran in the same step. A result that does not
+    // repeat the id falls back to the call that asked for the background, or to the
+    // only shell call in the step.
+    const results = content.filter((b) => b && b.type === 'tool_result' && shellStarts.has(b.tool_use_id));
+    const shellIdText = String(tr.backgroundTaskId);
+    const block = results.find((b) => resultText(b).includes(shellIdText))
+      || results.find((b) => shellStarts.get(b.tool_use_id).bg)
+      || (results.length === 1 ? results[0] : null);
+    const start = block ? shellStarts.get(block.tool_use_id) : null;
+    const text = block ? resultText(block) : '';
     const shell = { type: 'shell.started', shellId: String(tr.backgroundTaskId), command: (start && start.command) || '' };
     if (start && start.description) shell.description = start.description;
-    const logPath = (BG_LOG_RE.exec(text) || [])[1];
+    const logPath = bgLogIn(text);
     if (logPath) shell.logPath = logPath;
     bgShells.set(shell.shellId, shell);
     r.events.push(shell);
@@ -365,8 +393,8 @@ function createClaudeTranslator({ sessionId = null, resumed = false, permissionM
       if (m.message.usage) tally = addUsage(tally, m.message.usage);
       for (const b of m.message.content || []) {
         if (!b || b.type !== 'tool_use') continue;
-        if (b.name === 'Bash' && b.input && b.input.run_in_background && b.id) {
-          bgPendingStarts.set(b.id, { command: String(b.input.command || ''), description: str(b.input.description) });
+        if (SHELL_TOOLS.has(b.name) && b.input && b.id) {
+          shellStarts.set(b.id, { command: String(b.input.command || ''), description: str(b.input.description), bg: !!b.input.run_in_background });
         }
         // A sub-agent's own calls carry its parent's id; only the turn's own count.
         if ((b.name === 'Agent' || b.name === 'Task') && b.id && !m.parent_tool_use_id && !(b.input && b.input.run_in_background)) {

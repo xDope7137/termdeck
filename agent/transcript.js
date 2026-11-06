@@ -371,6 +371,9 @@ function resultFacts(r) {
     }
   }
   if (r.type === 'create' && typeof r.filePath === 'string') out.created = true;
+  // The CLI's own word that this call is a background shell. Its text cannot say
+  // so reliably: a command moved there on timeout leads with its stdout.
+  if (typeof r.backgroundTaskId === 'string' && r.backgroundTaskId) out.backgroundTaskId = r.backgroundTaskId;
   if (r.replaceAll === true && typeof r.originalFile === 'string' && typeof r.oldString === 'string' && r.oldString) {
     let n = 0;
     for (let at = r.originalFile.indexOf(r.oldString); at !== -1 && n < 10000; at = r.originalFile.indexOf(r.oldString, at + r.oldString.length)) n += 1;
@@ -1503,7 +1506,12 @@ function addSubagentUsage(a, b) {
 // the raw tool_result text, which the parser folds away, and it wants to be
 // cheap enough to run on a chat open.
 const BG_START_RE = /Command running in background with ID:\s*([A-Za-z0-9_-]+)/;
-const BG_LOG_RE = /Output is being written to:\s*(.+?\.output)\b/;
+const BG_LOG_RE = /Output is being written to:\s*(.+?\.output)\b/g;
+// A foreground call the CLI moved to the background when it outran its timeout. A
+// call that left this chat's memory long ago is bounded out; its result lands
+// moments after it, whatever else happens between.
+const SHELL_CALL_TOOLS = new Set(['Bash', 'PowerShell']);
+const SHELL_PENDING_MAX = 256;
 const TASK_NOTIF_ID_RE = /<task-id>([\s\S]*?)<\/task-id>/;
 // A shell's ENDING, as the CLI itself recorded it. Same frame the live path
 // reads off the stream (lib/claude-events.js), in its on-disk spelling, so
@@ -1598,17 +1606,20 @@ function scanShellLines(text, pending, out, ended, runs = null) {
       continue;
     }
     // Cheap reject: most lines of a transcript are none of the three.
-    if (!line.includes('run_in_background') && !line.includes('running in background')) continue;
+    if (!line.includes('run_in_background') && !line.includes('running in background')
+      && !line.includes('backgroundTaskId') && !line.includes('"name":"Bash"') && !line.includes('"name":"PowerShell"')) continue;
     let rec;
     try { rec = JSON.parse(line); } catch { continue; }
     const content = rec && rec.message && rec.message.content;
     if (!Array.isArray(content)) continue;
     for (const b of content) {
-      if (b && b.type === 'tool_use' && b.name === 'Bash' && b.input && b.input.run_in_background) {
+      if (b && b.type === 'tool_use' && SHELL_CALL_TOOLS.has(b.name) && b.input) {
         pending.set(b.id, {
           command: typeof b.input.command === 'string' ? b.input.command : '',
           description: typeof b.input.description === 'string' ? b.input.description : null,
+          bg: !!b.input.run_in_background,
         });
+        if (pending.size > SHELL_PENDING_MAX) pending.delete(pending.keys().next().value);
         continue;
       }
       if (!b || b.type !== 'tool_result' || !pending.has(b.tool_use_id)) continue;
@@ -1617,8 +1628,13 @@ function scanShellLines(text, pending, out, ended, runs = null) {
       const body = typeof b.content === 'string'
         ? b.content
         : Array.isArray(b.content) ? b.content.map((p) => (p && typeof p.text === 'string' ? p.text : '')).join('\n') : '';
-      const id = (BG_START_RE.exec(body) || [])[1] || null;
-      const logPath = (BG_LOG_RE.exec(body) || [])[1] || null;
+      // A call that asked for the background may be read off its text. One that did
+      // not is a shell only on the CLI's structured word: its stdout is anything the
+      // command printed, and this repo's own chats print these sentences.
+      const named = rec.toolUseResult && typeof rec.toolUseResult.backgroundTaskId === 'string' ? rec.toolUseResult.backgroundTaskId : null;
+      const id = named || (start.bg ? (BG_START_RE.exec(body) || [])[1] : null) || null;
+      const logs = [...body.matchAll(BG_LOG_RE)];
+      const logPath = logs.length ? logs[logs.length - 1][1] : null; // after any stdout: the CLI's own
       // No id is no shell: it is the handle the log read and every later frame
       // are keyed on, and a row without one could never be opened.
       if (!id) continue;

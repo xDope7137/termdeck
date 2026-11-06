@@ -8,7 +8,7 @@
 // turn's init, held in the master's memory and nowhere else — so a master
 // restart drops it to "Default" while the reader believes they turned thinking
 // off, and a second device never knew about it at all. Run options (V3 §D:
-// --add-dir, --allowedTools, --fallback-model, --autocompact) have exactly the
+// --add-dir, --allowedTools, --fallback-model, --autocompact, --max-turns) have exactly the
 // same shape of problem: they are CLI flags chosen per chat, nothing on disk
 // records them, and a flag that silently stops applying is worse than one that
 // was never offered. The browser keeps per-chat copies in localStorage as
@@ -63,6 +63,11 @@ const MAX_STR = 512;
 // gives you a setting you did not ask for.
 const AUTOCOMPACT_MIN = 100_000;
 const AUTOCOMPACT_MAX = 1_000_000;
+// A whole number of agentic turns. The flag is hidden from `claude --help` but
+// real (it parses a number and ends the run as result `error_max_turns`), so the
+// same rule holds: outside this range it is dropped, never clamped.
+const MAX_TURNS_MIN = 1;
+const MAX_TURNS_MAX = 1000;
 
 // A tool spec is `Edit` or `Bash(git *)`. No shell metacharacters, no newlines,
 // nothing that could be read as a second argument.
@@ -106,8 +111,10 @@ function normalizeRunOptions(opts) {
     const n = Number(opts.autoCompact);
     if (Number.isFinite(n) && n >= AUTOCOMPACT_MIN && n <= AUTOCOMPACT_MAX) autoCompact = Math.floor(n);
   }
-  if (!addDirs.length && !allowedTools.length && !disallowedTools.length && !fallbackModel && autoCompact == null) return null;
-  return { addDirs, allowedTools, disallowedTools, fallbackModel, autoCompact };
+  const turns = typeof opts.maxTurns === 'boolean' ? NaN : Number(opts.maxTurns); // Number(true) is 1
+  const maxTurns = Number.isInteger(turns) && turns >= MAX_TURNS_MIN && turns <= MAX_TURNS_MAX ? turns : null;
+  if (!addDirs.length && !allowedTools.length && !disallowedTools.length && !fallbackModel && autoCompact == null && maxTurns == null) return null;
+  return { addDirs, allowedTools, disallowedTools, fallbackModel, autoCompact, maxTurns };
 }
 
 // The CLI flags a normalized run-options object becomes. ONE translation, shared
@@ -122,6 +129,7 @@ function runOptionFlags(opts) {
   if (v.disallowedTools.length) args.push('--disallowedTools', ...v.disallowedTools);
   if (v.fallbackModel) args.push('--fallback-model', v.fallbackModel);
   if (v.autoCompact != null) args.push('--autocompact', String(v.autoCompact));
+  if (v.maxTurns != null) args.push('--max-turns', String(v.maxTurns));
   return args;
 }
 
@@ -270,5 +278,5 @@ module.exports = {
   readSettings, writeSetting, writeThinking, writeRunOptions, writePlanMode,
   normalizeThinking, normalizeRunOptions, normalizePlanModes, runOptionFlags,
   isSessionId, settingsPath, FILE, SCHEMA, MAX_SESSIONS,
-  AUTOCOMPACT_MIN, AUTOCOMPACT_MAX, MAX_DIRS, MAX_TOOLS, MAX_PLAN_MODES,
+  AUTOCOMPACT_MIN, AUTOCOMPACT_MAX, MAX_TURNS_MIN, MAX_TURNS_MAX, MAX_DIRS, MAX_TOOLS, MAX_PLAN_MODES,
 };
