@@ -4,6 +4,20 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1558 · 2026-11-09
+
+Agent release: **0.1.969**.
+
+- **Usage and Check read the right login for your active Claude account** *(agent)*. An account
+  in daily use could show no usage bars, and Check could say Anthropic had rejected it, because
+  both read a saved copy of the login that Claude Code had already replaced. The active account
+  now reads the login the machine is using. If that login is idle or rate limited, the row shows
+  the last reading for that account, or says the login renews the next time Claude Code runs.
+- **Termdeck no longer invalidates your active Claude login** *(agent)*. Reading usage or running
+  Check could renew the login behind Claude Code's back and leave both copies revoked. Termdeck
+  now leaves renewing the active login to Claude Code. A login already revoked this way needs one
+  more sign-in with Add account; there is no need to remove it first.
+
 ## 0.1.1552 · 2026-11-06
 
 Agent release: **0.1.968**.

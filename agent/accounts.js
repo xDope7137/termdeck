@@ -448,8 +448,37 @@ async function probeCredentials(rawCredentials) {
 // naive `expiresAt > now` and then 401s in the caller's hand.
 const TOKEN_SKEW_MS = 60 * 1000;
 
-async function accessTokenFor(orgId) {
+// The signed-in account's refresh token belongs to the CLI, and Termdeck must
+// never spend it. The snapshot of the active account holds that same token (see
+// syncActiveSnapshot), so a refresh from here rotates it and saves the new one
+// only in the snapshot: the CLI is left holding a revoked token, and the next
+// sync copies that revoked login over the good snapshot. Both copies are then
+// dead, with Check and the usage row blaming the account (GitHub issue #10).
+const CLI_RENEWS_LOGIN = 'Claude Code renews this login the next time it runs on this machine. Usage shows after that.';
+
+// One saved account as it stands right now. For the signed-in account the live
+// file wins over whatever the snapshot holds, because the CLI may have refreshed
+// since the panel last listed accounts. Identity comes from the config so this
+// costs no CLI spawn. No live file (a CLI keeping tokens elsewhere) leaves the
+// snapshot in place, and the account still counts as active.
+function currentEntry(orgId) {
+  const who = readOAuthAccount();
+  const active = Boolean(orgId && who && who.organizationUuid === orgId);
+  if (active) {
+    try {
+      syncActiveSnapshot({ loggedIn: true, orgId });
+    } catch {
+      /* the overlay below still reads the truth; a later sync can write it */
+    }
+  }
   const entry = readSavedEntries().find((e) => e.orgId === orgId);
+  if (!entry) return { entry: null, active };
+  const live = active ? readLiveCredentials() : null;
+  return { entry: live ? { ...entry, credentials: live } : entry, active };
+}
+
+async function accessTokenFor(orgId) {
+  const { entry, active } = currentEntry(orgId);
   if (!entry) return { state: 'unknown', detail: 'No saved login for that account on this machine.' };
   if (!credentialsUsable(entry.credentials)) return { state: 'dead', detail: 'This saved login expired.' };
 
@@ -462,8 +491,9 @@ async function accessTokenFor(orgId) {
   // Still good: no network, no rotation, no write. The common case on a panel
   // reopened within the hour.
   if (oauth.accessToken && Number(oauth.expiresAt) > Date.now() + TOKEN_SKEW_MS) {
-    return { state: 'ok', token: `Bearer ${oauth.accessToken}` };
+    return { state: 'ok', token: `Bearer ${oauth.accessToken}`, active, email: entry.email || null };
   }
+  if (active) return { state: 'unknown', detail: CLI_RENEWS_LOGIN, active, email: entry.email || null };
 
   const probe = await probeCredentials(entry.credentials);
   if (probe.state === 'dead') return { state: 'dead', detail: probe.detail };
@@ -532,6 +562,24 @@ const expiryDate = (value) => {
     : d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
 };
 
+// Check for the signed-in account. Its access token can be tested without
+// rotating anything, which a refresh could not do (see CLI_RENEWS_LOGIN). Only a
+// 401 is a verdict; anything else says nothing about the login.
+async function verifyLiveLogin(oauth) {
+  if (Number(oauth.expiresAt) <= Date.now() + TOKEN_SKEW_MS) return { status: 'warn', detail: 'Claude Code renews this login the next time it runs on this machine.' };
+  try {
+    const res = await fetch('https://api.anthropic.com/api/oauth/profile', {
+      headers: { 'anthropic-version': '2023-06-01', 'anthropic-beta': 'oauth-2025-04-20', authorization: `Bearer ${oauth.accessToken}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (res.ok) return { status: 'ok', detail: 'Anthropic accepted the login this machine is signed in with' };
+    if (res.status === 401) return { status: 'fail', detail: 'Anthropic rejected the login this machine is signed in with. Sign in to this account again.' };
+    return { status: 'warn', detail: `Anthropic replied ${res.status}` };
+  } catch (err) {
+    return { status: 'warn', detail: `could not reach Anthropic (${err.message})` };
+  }
+}
+
 // Everything we can learn about a switch BEFORE touching the live login, as an
 // ordered list the UI renders step by step. `fail` blocks the switch, `warn` is
 // advisory (the caller decides), `ok` is clear. Also self-heals the snapshot: a
@@ -539,7 +587,7 @@ const expiryDate = (value) => {
 // token that's good for hours instead of one the CLI has to refresh itself.
 async function preflightSwitch(orgId) {
   const checks = [];
-  const target = readSavedEntries().find((e) => e.orgId === orgId);
+  const { entry: target, active } = currentEntry(orgId);
   if (!target) return { ok: false, checks: [check('snapshot', 'Find the saved login', 'fail', 'No saved login for that account on this machine.')] };
 
   let oauth = null;
@@ -558,6 +606,13 @@ async function preflightSwitch(orgId) {
   }
   checks.push(check('expiry', 'Check the login has not expired', 'ok', oauth.refreshTokenExpiresAt ? `valid until ${expiryDate(oauth.refreshTokenExpiresAt)}` : 'no expiry recorded'));
 
+  if (active) {
+    const verdict = await verifyLiveLogin(oauth);
+    checks.push(check('oauth', 'Verify the login with Anthropic', verdict.status, verdict.detail));
+    if (verdict.status === 'fail') return { ok: false, checks };
+    return { ok: true, checks: [...checks, busyCheck()] };
+  }
+
   const probe = await probeCredentials(target.credentials);
   if (probe.state === 'dead') {
     checks.push(check('oauth', 'Verify the login with Anthropic', 'fail', `${probe.detail}. Remove it and sign in to that account again.`));
@@ -571,14 +626,14 @@ async function preflightSwitch(orgId) {
   }
   checks.push(check('oauth', 'Verify the login with Anthropic', probe.state === 'ok' ? 'ok' : 'warn', probe.detail));
 
-  const busy = busySessionCount();
-  checks.push(
-    busy
-      ? check('busy', 'Check no chat is mid-reply', 'warn', `${busy} Claude session${busy === 1 ? ' is' : 's are'} generating on this machine. Switching now can break a reply in progress.`)
-      : check('busy', 'Check no chat is mid-reply', 'ok', 'nothing is generating right now')
-  );
+  return { ok: true, checks: [...checks, busyCheck()] };
+}
 
-  return { ok: true, checks };
+function busyCheck() {
+  const busy = busySessionCount();
+  return busy
+    ? check('busy', 'Check no chat is mid-reply', 'warn', `${busy} Claude session${busy === 1 ? ' is' : 's are'} generating on this machine. Switching now can break a reply in progress.`)
+    : check('busy', 'Check no chat is mid-reply', 'ok', 'nothing is generating right now');
 }
 
 async function switchAccount(orgId) {

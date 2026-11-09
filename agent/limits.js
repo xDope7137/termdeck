@@ -369,7 +369,18 @@ async function accountUsage(accountsLib, orgId) {
   if (memo && Date.now() - memo.at < ACCOUNT_CACHE_MS) return memo.value;
 
   const tok = await accountsLib.accessTokenFor(orgId);
+  // The signed-in account's bearer is the one the sidebar polls, so it is the one
+  // most likely to be parked on a 429, and it has no token at all while the CLI
+  // is idle. The sidebar's last good reading answers for this row then, as long as
+  // it demonstrably belongs to this account: a sign-in made outside Termdeck does
+  // not clear that cache.
+  const sidebarReading = () => {
+    const email = tok.active && cache && cache.data.account && cache.data.account.email;
+    return email && email === tok.email ? readingFrom(cache.data, cache.at) : null;
+  };
   if (tok.state !== 'ok') {
+    const kept = tok.state === 'unknown' ? sidebarReading() : null;
+    if (kept) return kept;
     const value = { state: tok.state, detail: tok.detail || null, limits: [], checkedAt: Date.now() };
     // A 'dead' verdict is a fact about the snapshot and worth holding; an
     // 'unknown' is a fact about the network and must not stick.
@@ -380,13 +391,17 @@ async function accountUsage(accountsLib, orgId) {
   const data = await claudeUsageForToken({ value: tok.token, sub: null, tier: null });
   // Rate-limited: the last good reading beats a blank row, however old.
   if (!data && memo && memo.value.state === 'ok') return memo.value;
-  if (!data) return { state: 'unknown', detail: 'Anthropic did not answer with usage for this account.', limits: [], checkedAt: Date.now() };
-  // `account` is who Anthropic says the bearer belongs to, which is not always
-  // who the snapshot's stored email says it is. Carried so a mislabelled snapshot
-  // is at least visible in the payload rather than only in the numbers.
-  const value = { state: 'ok', detail: null, plan: data.plan || null, planMult: data.planMult ?? null, account: data.account || null, limits: data.limits, checkedAt: Date.now() };
+  if (!data) return sidebarReading() || { state: 'unknown', detail: 'Anthropic did not answer with usage for this account.', limits: [], checkedAt: Date.now() };
+  const value = readingFrom(data, Date.now());
   accountCache.set(orgId, { at: Date.now(), value });
   return value;
+}
+
+// `account` is who Anthropic says the bearer belongs to, which is not always
+// who the snapshot's stored email says it is. Carried so a mislabelled snapshot
+// is at least visible in the payload rather than only in the numbers.
+function readingFrom(data, checkedAt) {
+  return { state: 'ok', detail: null, plan: data.plan || null, planMult: data.planMult ?? null, account: data.account || null, limits: data.limits, checkedAt };
 }
 
 // Every saved Claude account on this box, in parallel. One frame answers for the
@@ -949,7 +964,7 @@ function invalidateClaudeCache() {
   accountCache.clear();
 }
 
-module.exports = { getLimits, claudeUsageForToken, accountsUsage, codexAccountsUsage, normalizeClaude, planLabel, normalizeCodex, normalizeGrok, consumeResetCredit, invalidateClaudeCache, invalidateCodexCache, setCodexExe, setCodexNative, getCodexLimits, mergeRateLimitsUpdate };
+module.exports = { getLimits, getClaudeLimits, claudeUsageForToken, accountsUsage, codexAccountsUsage, normalizeClaude, planLabel, normalizeCodex, normalizeGrok, consumeResetCredit, invalidateClaudeCache, invalidateCodexCache, setCodexExe, setCodexNative, getCodexLimits, mergeRateLimitsUpdate };
 
 // ponytail self-check: node agent/limits.js — asserts the parser without network.
 if (require.main === module) {
