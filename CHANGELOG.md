@@ -4,6 +4,15 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1559 · 2026-11-09
+
+Agent release: **0.1.970**.
+
+- **Usage bars for an active Claude login you have not saved** *(agent)*. In Machines & accounts,
+  a login marked Active · unsaved showed no bars and no reason, even though the Usage page had its
+  numbers. It now shows its own bars, and reading them does not save the login or switch accounts.
+  If there is no reading, the row says why.
+
 ## 0.1.1558 · 2026-11-09
 
 Agent release: **0.1.969**.

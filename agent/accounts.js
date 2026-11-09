@@ -477,16 +477,34 @@ function currentEntry(orgId) {
   return { entry: live ? { ...entry, credentials: live } : entry, active };
 }
 
+// The signed-in login when nothing has been saved for it: the same fields as a
+// snapshot, read from the live files and never written anywhere, because reading a
+// meter must not save an account. Null when the tokens cannot be read, or when the
+// sign-in moved between the two reads, which would put this account's name on
+// another account's tokens (the pairing hazard saveCurrentAccount guards).
+function liveEntry(orgId) {
+  const credentials = readLiveCredentials();
+  const who = readOAuthAccount();
+  if (!credentials || !who || who.organizationUuid !== orgId) return null;
+  return { orgId, email: who.emailAddress || null, credentials };
+}
+
 async function accessTokenFor(orgId) {
-  const { entry, active } = currentEntry(orgId);
-  if (!entry) return { state: 'unknown', detail: 'No saved login for that account on this machine.' };
-  if (!credentialsUsable(entry.credentials)) return { state: 'dead', detail: 'This saved login expired.' };
+  const { entry: saved, active } = currentEntry(orgId);
+  const entry = saved || (active ? liveEntry(orgId) : null);
+  if (!entry) {
+    if (!active) return { state: 'unknown', detail: 'No saved login for that account on this machine.' };
+    return { state: 'unknown', detail: 'Termdeck can’t read this login’s tokens on this machine.', active, email: (readOAuthAccount() || {}).emailAddress || null };
+  }
+  const name = saved ? 'saved login' : 'login';
+  if (!credentialsUsable(entry.credentials)) return { state: 'dead', detail: `This ${name} expired.` };
 
   let oauth = null;
   try {
     oauth = JSON.parse(entry.credentials).claudeAiOauth || null;
   } catch {}
-  if (!oauth || !oauth.refreshToken) return { state: 'unknown', detail: 'The saved login is missing its tokens.' };
+  // The signed-in login's refresh token is never spent, so it does not need one.
+  if (!oauth || (!oauth.refreshToken && !active)) return { state: 'unknown', detail: `The ${name} is missing its tokens.` };
 
   // Still good: no network, no rotation, no write. The common case on a panel
   // reopened within the hour.
@@ -515,6 +533,13 @@ async function accessTokenFor(orgId) {
 // is active; a usage sweep already knows that from the list call the panel made.
 function savedAccounts() {
   return readSavedEntries().map((e) => ({ orgId: e.orgId, email: e.email }));
+}
+
+// Which account is signed in, also without spawning the CLI. It comes from the
+// same oauthAccount that `claude auth status` reports, so it names the account the
+// panel lists as active, saved or not.
+function activeOrgId() {
+  return (readOAuthAccount() || {}).organizationUuid || null;
 }
 
 // Claude sessions MID-TURN on this box right now — the pid registry, same
@@ -993,6 +1018,7 @@ module.exports = {
   switchAccount,
   preflightSwitch,
   accessTokenFor,
+  activeOrgId,
   savedAccounts,
   switchTookEffect,
   credentialsUsable,

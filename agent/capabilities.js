@@ -2783,11 +2783,11 @@ function makeCapabilities(send, opts = {}) {
     if (!accounts) throw fail('agent is out of date (accounts module missing). Update the agent', 'AGENT_OUTDATED');
     const payload = m.payload && typeof m.payload === 'object' ? m.payload : {};
     if (m.op === 'list') return { data: await accounts.listAccounts() };
-    // Usage windows for every SAVED account on this box, one frame for the whole
-    // machine, because the panel opens once and wants every row at once. Lives on
-    // this frame rather than 'limits' because 'limits' answers for the ACTIVE login
-    // and takes no argument; this one is about the saved set, which is exactly what
-    // accounts knows and limits.js does not.
+    // Usage windows for every account the panel lists on this box, one frame for the
+    // whole machine, because the panel opens once and wants every row at once. Lives
+    // on this frame rather than 'limits' because 'limits' answers for the ACTIVE login
+    // and takes no argument; this one is about the saved set plus the active login,
+    // which is exactly what accounts knows and limits.js does not.
     if (m.op === 'usage') return { data: await limitsMod().accountsUsage(accounts) };
     if (m.op === 'save') return { data: await accounts.saveCurrentAccount() };
     if (m.op === 'preflight') return { data: await accounts.preflightSwitch(String(payload.orgId || '')) };

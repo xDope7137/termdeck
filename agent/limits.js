@@ -349,10 +349,11 @@ async function getClaudeLimits() {
 
 // ---- Per-account usage, for the account meters in Settings ----
 //
-// Same windows the sidebar shows, but for every SAVED account on this box rather
-// than only the one signed in. The bearer comes from accounts.js's accessTokenFor,
-// which mints it from that account's own snapshot; nothing here switches the live
-// login and nothing here can.
+// Same windows the sidebar shows, but for every saved account on this box and the
+// signed-in login, saved or not, rather than only the one signed in. The bearer
+// comes from accounts.js's accessTokenFor, which mints it from that account's own
+// snapshot (the live file for the signed-in login); nothing here saves an account
+// or switches the live login, and nothing here can.
 //
 // Cached per account because the panel that asks is a toggle someone can flap, and
 // each miss costs an outbound call and possibly a token rotation. Dropped wholesale
@@ -404,16 +405,21 @@ function readingFrom(data, checkedAt) {
   return { state: 'ok', detail: null, plan: data.plan || null, planMult: data.planMult ?? null, account: data.account || null, limits: data.limits, checkedAt };
 }
 
-// Every saved Claude account on this box, in parallel. One frame answers for the
-// whole machine because the panel opens once and wants every row at once; serially
-// this would be N round trips to Anthropic stacked end to end.
+// Every Claude account the panel lists on this box, in parallel. One frame answers
+// for the whole machine because the panel opens once and wants every row at once;
+// serially this would be N round trips to Anthropic stacked end to end. The active
+// login is not always a saved one, and the panel renders it as a row either way
+// (see the unsaved-active row in settings/fleet/accounts.js).
 async function accountsUsage(accountsLib) {
-  const saved = accountsLib.savedAccounts().filter((a) => a.orgId);
-  const entries = await Promise.all(saved.map(async (a) => {
+  const orgIds = new Set(accountsLib.savedAccounts().map((a) => a.orgId));
+  orgIds.add(accountsLib.activeOrgId());
+  orgIds.delete(null);
+  orgIds.delete(undefined);
+  const entries = await Promise.all([...orgIds].map(async (orgId) => {
     try {
-      return [a.orgId, await accountUsage(accountsLib, a.orgId)];
+      return [orgId, await accountUsage(accountsLib, orgId)];
     } catch (e) {
-      return [a.orgId, { state: 'unknown', detail: e.message, limits: [], checkedAt: Date.now() }];
+      return [orgId, { state: 'unknown', detail: e.message, limits: [], checkedAt: Date.now() }];
     }
   }));
   return { usage: Object.fromEntries(entries) };

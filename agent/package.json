@@ -1,7 +1,7 @@
 {
   "name": "termdeck-agent",
-  "version": "0.1.969",
-  "agentFilesHash": "6fd081b7de0c8607",
+  "version": "0.1.970",
+  "agentFilesHash": "39a9c1eadc0c7742",
   "private": true,
   "description": "Termdeck thin agent — dials the cloud master and serves root-confined capabilities.",
   "main": "agent.js",
