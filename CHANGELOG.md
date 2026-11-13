@@ -4,6 +4,36 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1564 · 2026-11-13
+
+Agent release: **0.1.973**.
+
+- **Fewer background requests from each machine** *(agent)*. While connected, the agent times
+  termdeck.io and edge.termdeck.io to see which answers faster. It now does that every 15
+  minutes instead of every 5, so about a third of the requests. A connection that fails or
+  slows down is still noticed within seconds and moved, as before.
+
+## 0.1.1561 · 2026-11-12
+
+Agent release: **0.1.972**.
+
+- **A new chat names the model it will run** *(agent)*. The model button on a new chat said
+  "Default model". It now names the model: the newest Opus on Claude, and the model set in
+  Codex's own config on Codex.
+- **Plain code blocks lost their empty header**. A code block with no language drew a header
+  row holding only an icon. The copy button now sits in the block's corner.
+
+## 0.1.1560 · 2026-11-12
+
+Agent release: **0.1.971**.
+
+- **The cost of a resumed Claude turn is right** *(agent)*. Recent Claude Code versions carry a
+  chat's running cost over when it resumes, so a short reply in a long chat could show the whole
+  chat's cost. Each turn now shows what that turn cost.
+- **Background task notices read cleanly** *(agent)*. The summary and result of a finished
+  background task showed escaped characters such as `&amp;`. They are decoded now.
+- Sending a message scrolls the chat to it, and the composer's focus ring is no longer clipped.
+
 ## 0.1.1559 · 2026-11-09
 
 Agent release: **0.1.970**.

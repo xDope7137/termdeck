@@ -21,6 +21,15 @@ const TASK_NOTIF_STATUS_RE = /<status>([\s\S]*?)<\/status>/;
 const TASK_NOTIF_SUMMARY_RE = /<summary>([\s\S]*?)<\/summary>/;
 const TASK_NOTIF_TOOLUSEID_RE = /<tool-use-id>([\s\S]*?)<\/tool-use-id>/;
 const TASK_NOTIF_RESULT_RE = /<result>([\s\S]*?)<\/result>/;
+// The CLI XML-escapes the text inside a <task-notification>, so a command like
+// `a > b 2>&1` arrives as `a &gt; b 2&gt;&amp;1` and was shown that way (QA
+// 2026-11-12). Decoded once, &amp; last, so `&amp;lt;` stays the literal `&lt;`.
+function decodeXmlText(s) {
+  return String(s)
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
 // What a dying CLI writes as the cut-off turn's last user record. Two wordings in
 // the wild ("…by user]" and "…by user for tool use]"), both on records that also
 // carry `interruptedByShutdown` — see the guard in recordToMessage.
@@ -255,12 +264,12 @@ function userStringBlocks(text) {
   const taskNotif = text.match(TASK_NOTIF_RE);
   if (taskNotif) {
     const status = (taskNotif[1].match(TASK_NOTIF_STATUS_RE) || [])[1] || '';
-    const summary = (taskNotif[1].match(TASK_NOTIF_SUMMARY_RE) || [])[1] || '';
+    const summary = decodeXmlText((taskNotif[1].match(TASK_NOTIF_SUMMARY_RE) || [])[1] || '');
     const toolUseId = (taskNotif[1].match(TASK_NOTIF_TOOLUSEID_RE) || [])[1] || '';
     // Present for a background Agent's completion (never for a background bash
     // command's, which points at an <output-file> instead) — the real result of
     // a run_in_background Agent call, delivered here instead of in its tool_result.
-    const rawResult = (taskNotif[1].match(TASK_NOTIF_RESULT_RE) || [])[1] || '';
+    const rawResult = decodeXmlText((taskNotif[1].match(TASK_NOTIF_RESULT_RE) || [])[1] || '');
     const result = truncate(rawResult.trim(), TOOL_RESULT_MAX);
     return [{
       kind: 'task-notification',

@@ -43,7 +43,11 @@ const DIAL_FAIL_LIMIT = 2;
 // faster one is repeated to confirm it. Measured from an Airtel line: termdeck.io via
 // Cloudflare Marseille answered /healthz in ~250ms, edge.termdeck.io via CloudFront
 // Mumbai anywhere from 300 to 850ms, sample to sample. Hence a median, and two rounds.
-const ROUTE_EVERY_MS = num('TERMDECK_AGENT_ROUTE_EVERY_MS', 5 * 60_000);
+// A round is 4 GETs of /healthz per address. At 5 minutes that was ~96 an hour from every
+// connected machine, the larger part of termdeck.io's request log (2026-11-12). Speed is
+// the only thing this round decides: a failing link is caught by the heartbeat (two
+// missed echoes, 20 s) and a slow one by the echo median, so 15 minutes loses nothing.
+const ROUTE_EVERY_MS = num('TERMDECK_AGENT_ROUTE_EVERY_MS', 15 * 60_000);
 const ROUTE_CONFIRM_MS = num('TERMDECK_AGENT_ROUTE_CONFIRM_MS', 60_000);
 const ROUTE_ROUNDS = 2;
 // Timed requests per address, after one untimed one that pays for DNS and TLS.

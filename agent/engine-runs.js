@@ -68,6 +68,62 @@ let liveOutputLib; try { liveOutputLib = require('./live-output'); } catch { liv
 let AGENT_VERSION = '0.0.0';
 try { AGENT_VERSION = require('./package.json').version; } catch {}
 
+// The cost a resumed Claude CLI starts from. Since 2.1.3xx the CLI writes a
+// `cost-state` record (the session's running total) into the transcript and
+// restores it on --resume, so the first result of a resumed process reports the
+// WHOLE chat's spend as total_cost_usd, not this process's. Measured live
+// 2026-11-12 on 2.1.323: a ~$0.04 turn was shown as $0.285, the chat's total.
+// Reading the last cost-state back gives the translator the right starting point.
+// A CLI that writes none (older, or a fresh chat) starts from 0 as before.
+const COST_TAIL_BYTES = 512 * 1024;
+function claudeProjectSlug(cwd) {
+  return String(cwd).replace(/[^a-zA-Z0-9]/g, '-');
+}
+function sessionTranscript(env, cwd, sessionId) {
+  const fs = require('fs');
+  const path = require('path');
+  const root = path.join((env && env.CLAUDE_CONFIG_DIR) || require('os').homedir() + path.sep + '.claude', 'projects');
+  const name = `${sessionId}.jsonl`;
+  if (cwd) {
+    const direct = path.join(root, claudeProjectSlug(cwd), name);
+    if (fs.existsSync(direct)) return direct;
+  }
+  // A long cwd's folder name is shortened by the CLI, so look for the file instead.
+  try {
+    for (const d of fs.readdirSync(root)) {
+      const f = path.join(root, d, name);
+      if (fs.existsSync(f)) return f;
+    }
+  } catch {}
+  return null;
+}
+function restoredClaudeCost({ env, cwd, sessionId }) {
+  if (!sessionId || !/^[0-9a-zA-Z-]+$/.test(sessionId)) return 0;
+  const fs = require('fs');
+  const file = sessionTranscript(env, cwd, sessionId);
+  if (!file) return 0;
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, COST_TAIL_BYTES);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString('utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line.includes('"cost-state"')) continue;
+      try {
+        const r = JSON.parse(line);
+        if (r && r.type === 'cost-state' && (!r.sessionId || r.sessionId === sessionId) && typeof r.totalCostUSD === 'number' && r.totalCostUSD > 0) return r.totalCostUSD;
+      } catch {}
+    }
+  } catch {} finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+  }
+  return 0;
+}
+
 const DEFAULTS = {
   // A background Agent that never reports back stops holding the reap after this.
   asyncAgentMaxMs: 20 * 60 * 1000,
@@ -391,6 +447,8 @@ function createRunRegistry(opts = {}) {
     if (!Array.isArray(content) || !content.length) throw refuse('a run needs message content', 'BAD_RUN');
     const runId = spec.runId || randomUUID();
     if (runs.has(runId)) throw refuse(`run ${runId} already exists`, 'BAD_RUN');
+    // Read before the spawn, so the CLI's own next cost-state cannot be mistaken for it.
+    const restoredCost = engine === 'claude' && resumed ? (cfg.restoredCost || restoredClaudeCost)({ env, cwd, sessionId }) : 0;
 
     let child;
     try {
@@ -417,7 +475,7 @@ function createRunRegistry(opts = {}) {
       timers: { kill: null, undecided: null },
     };
     child.stdin.on('error', () => {}); // EPIPE from a child that already went: its exit says the rest
-    const run = newRun(proc, { runId, sessionId, resumed });
+    const run = newRun(proc, { runId, sessionId, resumed, priorCostUsd: restoredCost });
 
     let buf = '';
     child.stdout.on('data', (chunk) => {
@@ -1173,7 +1231,10 @@ function createRunRegistry(opts = {}) {
     // configuredEffort), so that field is all that leaves this machine.
     if (method === 'config/read') {
       const c = result && result.config;
-      return { config: c && c.model_reasoning_effort != null ? { model_reasoning_effort: c.model_reasoning_effort } : {} };
+      const out = {};
+      if (c && c.model_reasoning_effort != null) out.model_reasoning_effort = c.model_reasoning_effort;
+      if (c && typeof c.model === 'string' && c.model) out.model = c.model; // the default model's name, for the pill
+      return { config: out };
     }
     // The Extensions section's health read (features/01-extensions). Each server
     // row carries every tool's full schema, and the section wants a status and a
@@ -1772,4 +1833,4 @@ function createRunRegistry(opts = {}) {
 
 const registry = createRunRegistry();
 
-module.exports = { createRunRegistry, registry, DEFAULTS, killTree, cmdShimSpawn, checkClaudeArgs, checkFullAccess, fullAccessAllowed, codexNativeWanted };
+module.exports = { createRunRegistry, registry, DEFAULTS, restoredClaudeCost, killTree, cmdShimSpawn, checkClaudeArgs, checkFullAccess, fullAccessAllowed, codexNativeWanted };

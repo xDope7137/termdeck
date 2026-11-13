@@ -82,9 +82,14 @@ const ALL_SOURCE_KINDS = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'sub
 // effort runs at (lib/codex-settings.js configuredEffort), so that field is all
 // that leaves this machine, as on the legacy harness (agent/engine-runs.js
 // codexRpcResult).
+// `model` rides along (QA 2026-11-12): a model name is no secret, and it is
+// how the new-chat pill names what "Default model" will actually run.
 function effortOnly(result) {
   const c = result && result.config;
-  return { config: c && c.model_reasoning_effort != null ? { model_reasoning_effort: c.model_reasoning_effort } : {} };
+  const out = {};
+  if (c && c.model_reasoning_effort != null) out.model_reasoning_effort = c.model_reasoning_effort;
+  if (c && typeof c.model === 'string' && c.model) out.model = c.model;
+  return { config: out };
 }
 
 // The `codex` capability (docs/codex-native.md): one op, one app-server call, and
