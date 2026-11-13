@@ -47,9 +47,17 @@ function slugForCwd(cwd) {
   return normalizeCwd(cwd).replace(/[^A-Za-z0-9]/g, '-');
 }
 
-function cleanTitle(text) {
-  const words = text.replace(/\s+/g, ' ').trim().split(' ');
-  return words.slice(0, TITLE_MAX_WORDS).join(' ');
+// A derived title (the opening prompt, a Codex preview) is capped at a few words
+// for the sidebar, and says so with an ellipsis: "I want you go through each"
+// read as a broken sentence in every list (live QA 2026-11-13). A title the user
+// typed (`custom`) is theirs and is never cut by words, only bounded by length.
+const TITLE_MAX_CHARS = 120;
+function cleanTitle(text, kind) {
+  const flat = String(text).replace(/\s+/g, ' ').trim();
+  if (kind === 'custom') return flat.length > TITLE_MAX_CHARS ? `${flat.slice(0, TITLE_MAX_CHARS - 1).trimEnd()}…` : flat;
+  const words = flat.split(' ');
+  if (words.length <= TITLE_MAX_WORDS) return flat;
+  return `${words.slice(0, TITLE_MAX_WORDS).join(' ').replace(/[\s,.;:!?…-]+$/, '')}…`;
 }
 
 module.exports = {

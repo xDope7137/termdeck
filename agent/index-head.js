@@ -422,7 +422,7 @@ async function readIndexHead(row, io) {
       // the codex/grok grouping, and shows as a second copy of the same folder
       // next to the Claude one. Normalise once, here.
       cwd: h.cwd ? normalizeCwd(h.cwd) : null,
-      title: h.title ? cleanTitle(h.title) : null,
+      title: h.title ? cleanTitle(h.title, titleKind) : null,
       // Which rung answered — 'custom' | 'ai' | 'head' | 'prompt' | null, and
       // CLAUDE-only (it is the only engine with a title record to write). The key
       // being PRESENT is what says this parse could answer the question at all;

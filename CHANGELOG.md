@@ -4,6 +4,22 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1567 · 2026-11-13
+
+Agent release: **0.1.974**.
+
+- **Usage counts very long Codex runs, and opens fast** *(agent)*. Codex rollouts of several
+  hundred megabytes were too big to read in one piece, so their tokens were missing from every
+  usage report, and each visit to Usage re-read every file. The agent now reads them in chunks
+  and only the lines it counts: those runs are included, and a repeat visit answers in well
+  under a second with far less memory.
+- **Shortened chat titles end in an ellipsis** *(agent)*. A title taken from the opening prompt
+  is cut to a few words and now ends in "…" instead of reading as a broken sentence. A title
+  you typed yourself is never cut by words.
+- **Smaller fixes**. Settings > General names the model Default runs; the compaction summary
+  sits under its "compacted" line; Ctrl+K lists each chat's project and only chats from added
+  projects; an empty terminal pane's tab says "empty".
+
 ## 0.1.1564 · 2026-11-13
 
 Agent release: **0.1.973**.

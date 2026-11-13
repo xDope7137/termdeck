@@ -435,6 +435,7 @@ async function listCodexFiles(root) {
 // `resume`: the `state` a previous call over the lines ABOVE `text` returned,
 // so an appended slice is scanned exactly as if the whole file had been
 // (features/04 phase 9). Every variable the loop carries across lines is in it.
+const CODEX_USAGE_RECORD_RE = /"(?:session_meta|turn_context|task_started|token_count)"/;
 function scanCodexText(text, sessionId, allowedSlugsLower, resume = null) {
   const lines = text.split('\n');
   if (lines.length && lines[lines.length - 1] === '') lines.pop();
@@ -445,7 +446,11 @@ function scanCodexText(text, sessionId, allowedSlugsLower, resume = null) {
   };
 
   for (const line of lines) {
-    if (!line.trim()) continue;
+    // Only four record types matter here, and each names itself literally in
+    // its JSON. Everything else (tool output, reasoning, messages) is most of a
+    // long rollout's bytes and is never parsed: a 950 MB rollout cost its full
+    // JSON.parse for a few thousand token_count lines (live QA 2026-11-13).
+    if (!CODEX_USAGE_RECORD_RE.test(line)) continue;
     let rec;
     try {
       rec = JSON.parse(line);
@@ -570,7 +575,7 @@ async function scanOneFile(filePath, kind, sessionIdHint, slugHint, allowedSlugs
   }
   const cached = fileCache.get(filePath);
   if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
-    return { turns: cached.turns, skipped: cached.skipped, unreadable: 0, cached: true };
+    return { turns: cached.turns, skipped: cached.skipped, unreadable: cached.unreadable ? 1 : 0, cached: true };
   }
   let turns, skipped, bailed = false;
   let resumable = null; // what the next call needs to scan only what is appended
@@ -586,32 +591,41 @@ async function scanOneFile(filePath, kind, sessionIdHint, slugHint, allowedSlugs
       if (cached && cached.resume && st.size > cached.size) {
         try { if ((await probeAt(filePath, cached.resume.offset)) === cached.resume.probe) { from = cached.resume.offset; base = cached.resume; } } catch {}
       }
-      const buf = await readRange(filePath, from, st.size);
-      const nl = buf.lastIndexOf(0x0a);
-      const complete = nl === -1 ? '' : buf.subarray(0, nl + 1).toString('utf8');
-      const tail = buf.subarray(nl + 1).toString('utf8');
-      const offset = from + nl + 1;
+      // Read in line-aligned chunks, not as one buffer: a long Codex run writes
+      // rollouts of 600-950 MB, and one buffer of that is past V8's string limit
+      // (so the file was "unreadable" and its tokens missing from every report)
+      // and a gigabyte allocated on every Usage visit (live QA 2026-11-13).
       if (kind === 'claude') {
         const stamp = (list) => list.map((t) => ({ ...t, slug: slugHint })); // every turn in this file shares one slug
-        const c = scanClaudeText(complete);
-        const committed = (base ? base.committed : []).concat(stamp(c.turns));
-        const committedSkipped = (base ? base.committedSkipped : 0) + c.skipped;
-        const t = tail.trim() ? scanClaudeText(tail) : { turns: [], skipped: 0 };
+        let committed = base ? base.committed : [];
+        let committedSkipped = base ? base.committedSkipped : 0;
+        const r = await forEachLineChunk(filePath, from, st.size, (text) => {
+          const c = scanClaudeText(text);
+          if (c.turns.length) committed = committed.concat(stamp(c.turns));
+          committedSkipped += c.skipped;
+        }, CLAUDE_USAGE_MARKERS);
+        const t = r.tail.trim() ? scanClaudeText(r.tail) : { turns: [], skipped: 0 };
         turns = t.turns.length ? committed.concat(stamp(t.turns)) : committed;
         skipped = committedSkipped + t.skipped;
-        resumable = { offset, committed, committedSkipped };
+        resumable = { offset: r.offset, committed, committedSkipped };
       } else {
-        const c = scanCodexText(complete, sessionIdHint, allowedSlugs, base ? base.state : null);
-        if (c.bailed) {
-          bailed = true;
-        } else {
-          const committed = (base ? base.committed : []).concat(c.turns);
-          const committedSkipped = (base ? base.committedSkipped : 0) + c.skipped;
-          const t = tail.trim() ? scanCodexText(tail, sessionIdHint, allowedSlugs, { ...c.state }) : { turns: [], skipped: 0 };
+        let state = base ? base.state : null;
+        let committed = base ? base.committed : [];
+        let committedSkipped = base ? base.committedSkipped : 0;
+        const r = await forEachLineChunk(filePath, from, st.size, (text) => {
+          const c = scanCodexText(text, sessionIdHint, allowedSlugs, state);
+          if (c.bailed) { bailed = true; return false; }
+          if (c.turns.length) committed = committed.concat(c.turns);
+          committedSkipped += c.skipped;
+          state = c.state;
+          return true;
+        }, CODEX_USAGE_MARKERS);
+        if (!bailed) {
+          const t = r.tail.trim() ? scanCodexText(r.tail, sessionIdHint, allowedSlugs, state ? { ...state } : null) : { turns: [], skipped: 0 };
           if (t.bailed) bailed = true;
           turns = t.turns && t.turns.length ? committed.concat(t.turns) : committed;
           skipped = committedSkipped + (t.skipped || 0);
-          resumable = { offset, committed, committedSkipped, state: c.state };
+          resumable = { offset: r.offset, committed, committedSkipped, state };
         }
       }
       if (resumable) resumable.probe = await probeAt(filePath, resumable.offset);
@@ -634,7 +648,12 @@ async function scanOneFile(filePath, kind, sessionIdHint, slugHint, allowedSlugs
     // caller can surface "N files unreadable" instead of lying. Still serve
     // the last-known-good cache rather than losing this file's history for
     // the current scan.
-    return { turns: cached ? cached.turns : [], skipped: cached ? cached.skipped : 0, unreadable: 1, cached: Boolean(cached) };
+    // Remember the verdict against this (mtime, size): retrying a file that
+    // cannot be read cost a full re-read on every Usage visit. It is retried
+    // when the file changes, like any other cache entry.
+    const keep = cached && !cached.unreadable ? cached : cached && cached.lastGood;
+    fileCache.set(filePath, { mtimeMs: st.mtimeMs, size: st.size, turns: keep ? keep.turns : [], skipped: keep ? keep.skipped : 0, unreadable: true, lastGood: keep || null });
+    return { turns: keep ? keep.turns : [], skipped: keep ? keep.skipped : 0, unreadable: 1, cached: Boolean(keep) };
   }
   if (bailed) {
     // Landmine 5: a bailed Codex scan only proves "not wanted under TODAY's
@@ -651,15 +670,69 @@ async function scanOneFile(filePath, kind, sessionIdHint, slugHint, allowedSlugs
   return { turns, skipped, unreadable: 0, cached: false };
 }
 
-async function readRange(filePath, from, to) {
-  const len = Math.max(0, to - from);
+// Feeds fn the bytes [from, to) as whole-line text, READ_CHUNK at a time, and
+// yields to the event loop between chunks so a cold scan of a huge file never
+// stalls live chats on the same agent. fn returning false stops the read.
+// Returns where the last whole line ends and the unterminated rest after it.
+//
+// `markers`: only lines holding one of these byte strings reach fn. They are
+// found in the raw bytes, so the rest of the file is never decoded: decoding
+// was most of a cold scan (6 of 14 s on 3 GB of Codex rollouts). A marker must
+// be a literal every wanted record carries whatever its JSON spacing, e.g. a
+// key `"usage"` or a type value `"token_count"`.
+const READ_CHUNK = 32 * 1024 * 1024;
+const MAX_LINE = 256 * 1024 * 1024; // one record past this is unreadable, not an endless read
+async function forEachLineChunk(filePath, from, to, fn, markers = null, chunk = READ_CHUNK) {
   const fd = await fsp.open(filePath, 'r');
   try {
-    const buf = Buffer.alloc(len);
-    const { bytesRead } = len ? await fd.read(buf, 0, len, from) : { bytesRead: 0 };
-    return buf.subarray(0, bytesRead);
+    let pos = from;
+    let carry = null; // an unterminated line's start, carried into the next read
+    while (pos < to) {
+      const len = Math.min(chunk, to - pos);
+      const head = carry ? carry.length : 0;
+      const buf = Buffer.allocUnsafe(head + len);
+      if (carry) carry.copy(buf, 0);
+      const { bytesRead } = await fd.read(buf, head, len, pos);
+      if (!bytesRead) break;
+      pos += bytesRead;
+      const data = buf.subarray(0, head + bytesRead);
+      const nl = data.lastIndexOf(0x0a);
+      if (nl === -1) {
+        if (data.length > MAX_LINE) throw new Error(`a record over ${MAX_LINE} bytes`);
+        carry = data;
+        continue;
+      }
+      carry = nl + 1 < data.length ? Buffer.from(data.subarray(nl + 1)) : null; // a copy, so the chunk can be freed
+      const whole = data.subarray(0, nl + 1);
+      if (fn(markers ? markedLines(whole, markers) : whole.toString('utf8')) === false) break;
+      if (pos < to) await new Promise((r) => setImmediate(r));
+    }
+    return { offset: pos - (carry ? carry.length : 0), tail: carry ? carry.toString('utf8') : '' };
   } finally { await fd.close(); }
 }
+
+// The lines of `buf` (whole lines, each ending in \n) holding any marker, in
+// file order, decoded and joined. A line with two markers is taken once.
+function markedLines(buf, markers) {
+  const starts = new Set();
+  for (const m of markers) {
+    for (let i = buf.indexOf(m); i !== -1; ) {
+      const start = buf.lastIndexOf(0x0a, i) + 1;
+      starts.add(start);
+      const end = buf.indexOf(0x0a, i);
+      i = end === -1 ? -1 : buf.indexOf(m, end + 1);
+    }
+  }
+  if (!starts.size) return '';
+  let out = '';
+  for (const start of [...starts].sort((x, y) => x - y)) {
+    const end = buf.indexOf(0x0a, start);
+    out += buf.toString('utf8', start, end + 1);
+  }
+  return out;
+}
+const CLAUDE_USAGE_MARKERS = [Buffer.from('"usage"')];
+const CODEX_USAGE_MARKERS = ['"session_meta"', '"turn_context"', '"task_started"', '"token_count"'].map((m) => Buffer.from(m));
 
 // The file's identity and the bytes just before `offset`: equal on a later
 // call means the bytes a resumed scan skips are the ones it already counted.
@@ -1652,6 +1725,28 @@ if (require.main === module) {
         assert.ok(sess, '(r) session must be present even without Dirent.parentPath');
         assert.strictEqual(sess.turns, 2, '(r) main turn + subagent turn both counted under the e.path fallback');
         assert.strictEqual(sess.output, 5 + 77, '(r) FIX 3: subagent tokens must survive on a pre-parentPath runtime, not be silently dropped');
+        fs.rmSync(root, { recursive: true, force: true });
+      })
+      .then(async () => {
+        // (s) Chunked reads: lines that straddle a chunk, a line longer than a
+        // chunk, the marker filter, file order, and the unterminated tail all
+        // come out exactly as one whole read would give them.
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-selfcheck-s-'));
+        const f = path.join(root, 'r.jsonl');
+        const lines = ['{"a":1,"usage":{}}', '{"b":"' + 'x'.repeat(50) + '"}', '{"type":"token_count"}', '{"c":"ü€"}', '{"usage":2,"type":"token_count"}'];
+        fs.writeFileSync(f, lines.join('\n') + '\n{"tail":"usage"');
+        const size = fs.statSync(f).size;
+        for (const chunk of [7, 13, 64, 1 << 20]) {
+          const all = [], marked = [];
+          const r1 = await forEachLineChunk(f, 0, size, (t) => { all.push(t); }, null, chunk);
+          const r2 = await forEachLineChunk(f, 0, size, (t) => { marked.push(t); }, [Buffer.from('"usage"'), Buffer.from('"token_count"')], chunk);
+          assert.strictEqual(all.join(''), lines.join('\n') + '\n', `(s) chunk ${chunk}: every whole line, once, in order`);
+          assert.strictEqual(marked.join(''), [lines[0], lines[2], lines[4]].join('\n') + '\n', `(s) chunk ${chunk}: only marked lines, in order, a two-marker line once`);
+          for (const r of [r1, r2]) {
+            assert.strictEqual(r.tail, '{"tail":"usage"', `(s) chunk ${chunk}: the unterminated rest is the tail`);
+            assert.strictEqual(r.offset, size - Buffer.byteLength(r.tail), `(s) chunk ${chunk}: offset is where the last whole line ends`);
+          }
+        }
         fs.rmSync(root, { recursive: true, force: true });
       })
       .then(() => console.log('usage self-check ok'))
