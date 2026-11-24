@@ -237,12 +237,12 @@ if (instanceLock) {
   writeJson(STATE_FILE, st);
 })();
 
-let WebSocket, makeCapabilities, ROOTS, ENGINES, VERSION, updateSignature, endpointsLib;
+let WebSocket, makeCapabilities, ROOTS, ENGINES, findEngines, VERSION, updateSignature, endpointsLib;
 try {
   WebSocket = require('ws');
   updateSignature = require('./update-signature');
   endpointsLib = require('./endpoints');
-  ({ makeCapabilities, ROOTS, ENGINES } = require('./capabilities'));
+  ({ makeCapabilities, ROOTS, ENGINES, findEngines } = require('./capabilities'));
   // Single source of truth — package.json is one of the files self-update re-downloads
   // alongside this one, so a hardcoded copy here always drifts out of sync with it.
   VERSION = require('./package.json').version;
@@ -252,6 +252,14 @@ try {
   // burning the whole boot budget rediscovering it.
   if (readJson(STATE_FILE, null)) undoUpdate(`load failed: ${e.message}`);
   throw e;
+}
+
+// A CLI no known folder holds (agent/engine-install.js createFinder). The heartbeat
+// carries what is found after the hello. A finished search with nothing missing is
+// a few stats, so the timer costs nothing on a machine that has its CLIs.
+if (findEngines) {
+  findEngines();
+  setInterval(() => findEngines(), 60_000).unref();
 }
 
 const PERSISTENCE = persistenceLib ? persistenceLib.detect() : null;
@@ -1045,7 +1053,7 @@ function dial() {
     heartbeat = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) return;
       const n = health.beat(Date.now(), ws.bufferedAmount);
-      try { ws.send(JSON.stringify({ type: 'heartbeat', n, rtt: health.rtt() ?? undefined })); } catch {}
+      try { ws.send(JSON.stringify({ type: 'heartbeat', n, rtt: health.rtt() ?? undefined, codex: fs.existsSync(ENGINES.codex), grok: fs.existsSync(ENGINES.grok) })); } catch {}
       const verdict = endpoints && welcomed ? health.verdict() : null;
       if (!verdict) return;
       linkLost = verdict;

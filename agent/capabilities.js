@@ -472,10 +472,10 @@ function indexCandidate(kind, root, dir, name) {
 // standalone install's bin (mirrors this box's ~/.codex/packages/.../bin/codex), then PATH.
 // Returns an absolute path when found (so fs.existsSync gives an accurate availability
 // flag); falls back to the bare name for spawn's own PATH lookup.
-function resolveEngine(kind, envVar, extraDirs = []) {
+function resolveEngine(kind, envVar, extraDirs = [], lastDirs = []) {
   if (process.env[envVar]) return process.env[envVar];
   const names = process.platform === 'win32' ? [`${kind}.exe`, `${kind}.cmd`, kind] : [kind];
-  const dirs = [path.join(os.homedir(), '.local', 'bin'), ...extraDirs, ...(process.env.PATH || '').split(path.delimiter)];
+  const dirs = [path.join(os.homedir(), '.local', 'bin'), ...extraDirs, ...(process.env.PATH || process.env.Path || '').split(path.delimiter), ...lastDirs];
   for (const dir of dirs) {
     if (!dir) continue;
     for (const name of names) {
@@ -495,7 +495,9 @@ function resolveEngine(kind, envVar, extraDirs = []) {
 // picked up on the next cliStatus or spawn. The env override still wins outright.
 const ENGINE_CANDIDATES = {
   claude: ['TERMDECK_CLAUDE_EXE', () => []],
-  codex: ['TERMDECK_CODEX_EXE', () => [path.join(CODEX_HOME, 'packages', 'standalone', 'current', 'bin')]],
+  codex: ['TERMDECK_CODEX_EXE', () => [path.join(CODEX_HOME, 'packages', 'standalone', 'current', 'bin')],
+    // The copy Codex's own app-server daemon keeps, when no launcher is found.
+    () => [path.join(CODEX_HOME, 'packages', 'app-server-daemon', 'current', 'bin')]],
   // Candidate order: env override, ~/.local/bin, ~/.grok/bin, PATH.
   grok: ['TERMDECK_GROK_EXE', () => [path.join(GROK_DIR, 'bin')]],
 };
@@ -504,16 +506,22 @@ function isExeFile(p) {
   try { return fs.statSync(p).isFile(); } catch { return false; }
 }
 function engineExe(kind) {
-  const [envVar, extra] = ENGINE_CANDIDATES[kind];
+  const [envVar, extra, last] = ENGINE_CANDIDATES[kind];
   if (process.env[envVar]) return process.env[envVar];
   const prev = engineMemo[kind];
   if (prev && isExeFile(prev)) return prev;
-  return (engineMemo[kind] = resolveEngine(kind, envVar, extra()));
+  return (engineMemo[kind] = resolveEngine(kind, envVar, extra(), last ? last() : []));
 }
 const ENGINES = {};
 for (const kind of Object.keys(ENGINE_CANDIDATES)) {
   Object.defineProperty(ENGINES, kind, { enumerable: true, get: () => engineExe(kind) });
 }
+// The search past the fixed folders (agent/engine-install.js createFinder): the
+// user's shell PATH and running engines, only while an engine is missing. agent.js
+// runs it at start and on a slow timer, Recheck runs it on demand.
+const findEngines = engineInstallLib && engineInstallLib.createFinder
+  ? engineInstallLib.createFinder({ missing: () => Object.keys(ENGINE_CANDIDATES).filter((k) => !isExeFile(ENGINES[k])) })
+  : async () => {};
 // limits.js spawns a short-lived `codex app-server` to read live usage; hand it
 // the resolver used here so there is one answer to "which codex" on this box.
 // A function, not a path, so a CLI installed later reaches these modules too.
@@ -911,6 +919,7 @@ async function codexLogin() {
 }
 
 async function cliStatus() {
+  await findEngines(true);
   const engines = await Promise.all(
     ['claude', 'codex', 'grok'].map(async (engine) => {
       const exe = ENGINES[engine];
@@ -3234,4 +3243,4 @@ function makeCapabilities(send, opts = {}) {
 // bgLogPathOk is exported for the same reason `confined` is: it is a security
 // boundary, and a boundary that can only be exercised through a live WebSocket
 // is a boundary nobody tests. See tests/bg-shell-confinement.mjs.
-module.exports = { makeCapabilities, confined, bgLogPathOk, claudeEffortLevels, ROOTS, ENGINES, resolveEngine };
+module.exports = { makeCapabilities, confined, bgLogPathOk, claudeEffortLevels, ROOTS, ENGINES, resolveEngine, findEngines };

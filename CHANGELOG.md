@@ -4,6 +4,16 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1572 · 2026-11-24
+
+Agent release: **0.1.975**.
+
+- **Claude Code, Codex and Grok are found wherever you installed them** *(agent)*. The background
+  agent has a shorter path than your terminal, so a CLI in a custom npm prefix or a folder your
+  shell adds could show as Not installed, and its chats did not open. The agent now searches the
+  usual install folders, your npm prefix and the path your own shell sets up. On macOS and Linux
+  it also checks for a copy you are running.
+
 ## 0.1.1567 · 2026-11-13
 
 Agent release: **0.1.974**.
