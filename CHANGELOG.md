@@ -1,6 +1,6 @@
 # Changelog
 
-Termdeck ships continuously: 1,013 production deploys in the first 112 days. This is the
+Termdeck ships continuously: 1,110 production deploys in the first 146 days. This is the
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
