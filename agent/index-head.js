@@ -440,10 +440,11 @@ async function readIndexHead(row, io) {
       model: model || prevModel || tailModel(text, row.engine),
       ...(row.engine === 'codex' ? { origin, codexTurn } : {}),
       firstUserUuid: row.engine === 'claude' ? h.firstUserUuid || null : null,
+      // Claude teammates name their team in the head (see claudeHead).
       // Codex collab workers announce their parent in the head (see codexHead) —
       // the index uses this to keep them off the session LIST. Additive: an old
       // master ignores it, and an old agent's answers simply lack it.
-      subagentOf: row.engine === 'codex' ? h.subagentOf || null : null,
+      subagentOf: h.subagentOf || null,
       // Set only when the cwd above was followed into a worktree. Additive.
       ...(row.engine === 'codex' && h.worktreeOf ? { worktreeOf: h.worktreeOf } : {}),
       noPromptBelow,

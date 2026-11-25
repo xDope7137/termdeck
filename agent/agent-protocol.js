@@ -121,9 +121,9 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 //                one; the test asserts timeoutMs strictly outlasts it.
 //   ops          the legal `op` values for an op-carrying frame. A frame with ops
 //                declared may refuse anything else by name instead of guessing.
-//   defaultOp    what a frame that names NO op means. Three of the seven op ladders
+//   defaultOp    what a frame that names NO op means. Two of the op ladders
 //                end in a fall-through rather than a refusal (sessionSettings reads,
-//                projectDoc reads, projectFiles lists), and that fall-through is the
+//                projectFiles lists), and that fall-through is the
 //                read every one of their callers takes. Declaring it keeps an op-less
 //                frame working while a NAMED op this build lacks is still refused.
 //   codes        the NAMED error codes this frame can answer, over and above the
@@ -172,7 +172,7 @@ const TABLE = [
   { name: 'readBefore', bytes: ['data'], timeoutMs: 10_000, codes: ['AGENT_OUTDATED'], note: 'one page of scroll-back: the whole lines ending at a byte, cut at a line boundary and widened locally' },
   // The background shells a transcript records, scanned where the file lives:
   // a few hundred bytes cross the tunnel where the whole file used to.
-  { name: 'bgShellScan', timeoutMs: 30_000, codes: ['AGENT_OUTDATED'], note: "scanBackgroundShells over one transcript, run agent-side; also { runs }, how each background Agent run ended" },
+  { name: 'bgShellScan', timeoutMs: 30_000, codes: ['AGENT_OUTDATED'], note: "scanBackgroundShells over one transcript, run agent-side; also { runs }, how each background Agent run ended, and { teammates }, which calls started one" },
   // A Claude chat's subagent spend, per model, off its subagents/ transcripts,
   // which the chat's own cumulativeUsage never counts.
   { name: 'subagentUsage', timeoutMs: 10_000, codes: ['AGENT_OUTDATED'], note: "per-model token totals of one chat's subagents/agent-*.jsonl, tallied agent-side" },
@@ -186,9 +186,9 @@ const TABLE = [
   // -- the write paths ------------------------------------------------------
   {
     name: 'mutate',
-    ops: ['trash', 'duplicate', 'title', 'ai-title', 'tag'],
+    ops: ['trash', 'title', 'ai-title', 'tag'],
     codes: ['AGENT_OUTDATED'],
-    note: 'the only writes inside the transcript roots: trash, duplicate, title/tag records',
+    note: 'the only writes inside the transcript roots: trash, title/tag records',
   },
   { name: 'restore', timeoutMs: 60_000, codes: ['AGENT_OUTDATED'], note: '/rewind: the one write that lands outside the roots; 60 files means 120 disk ops' },
   // An attachment on its way to a CLI, written where the CLI can read it and
@@ -214,13 +214,6 @@ const TABLE = [
   },
 
   // -- a chat's project folder ----------------------------------------------
-  {
-    name: 'projectDoc',
-    ops: ['read', 'write', 'append'],
-    defaultOp: 'read',
-    codes: ['AGENT_OUTDATED', 'NO_CWD', 'DENIED', 'DOC_FAILED'],
-    note: "the project's instruction file; root resolved from the transcript's own head",
-  },
   { name: 'commandCatalog', codes: ['AGENT_OUTDATED', 'DENIED', 'CATALOG_FAILED'], note: 'the slash commands this chat can type, with descriptions' },
   {
     name: 'projectFiles',
@@ -248,10 +241,10 @@ const TABLE = [
   {
     name: 'git',
     timeoutMs: 60_000,
-    ops: ['diff', 'branch', 'worktrees', 'pr', 'mcpServers'],
-    opTimeoutMs: { diff: 30_000, branch: 20_000, worktrees: 20_000, pr: 60_000, mcpServers: 20_000 },
+    ops: ['diff', 'branch', 'worktrees'],
+    opTimeoutMs: { diff: 30_000, branch: 20_000, worktrees: 20_000 },
     codes: ['AGENT_OUTDATED'],
-    note: 'diff / branch / worktrees / PR, run where the checkout actually lives',
+    note: 'diff / branch / worktrees, run where the checkout actually lives',
   },
 
   // -- the machine itself ---------------------------------------------------
@@ -338,8 +331,8 @@ const TABLE = [
   {
     name: 'codex',
     timeoutMs: 30_000,
-    ops: ['threads', 'thread', 'turns', 'items', 'rename', 'fork', 'revert', 'archive', 'unarchive', 'models', 'mcpStatus', 'skills', 'rateLimits', 'account', 'config', 'info'],
-    opTimeoutMs: { threads: 60_000, turns: 45_000, items: 45_000, fork: 45_000 },
+    ops: ['threads', 'thread', 'turns', 'items', 'rename', 'revert', 'archive', 'unarchive', 'models', 'mcpStatus', 'skills', 'rateLimits', 'account', 'config', 'info'],
+    opTimeoutMs: { threads: 60_000, turns: 45_000, items: 45_000 },
     codes: ['AGENT_OUTDATED', 'BAD_ENGINE', 'BAD_RUN', 'NOT_NATIVE', 'CODEX_RPC', 'CODEX_RPC_TIMEOUT', 'CODEX_DOWN', 'CODEX_TOO_OLD', 'SPAWN_FAILED'],
     note: "one whitelisted call on the machine's shared codex app-server; Codex's result back as it gave it",
   },

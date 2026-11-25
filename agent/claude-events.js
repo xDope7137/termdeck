@@ -385,7 +385,6 @@ function createClaudeTranslator({ sessionId = null, resumed = false, permissionM
       if (str(m.model)) info.model = m.model;
       if (str(m.permissionMode)) info.permissionMode = m.permissionMode;
       if (Array.isArray(m.slash_commands)) info.slashCommands = m.slash_commands;
-      if (Array.isArray(m.mcp_servers)) info.mcpServers = m.mcp_servers;
       r.events.push(info, { type: 'run.status', status: 'running' });
     } else if (m.type === 'stream_event' && m.event) {
       onStream(m.event, r);

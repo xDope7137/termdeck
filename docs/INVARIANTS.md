@@ -1096,37 +1096,6 @@ zstd-encoded, and on the hub this is loopback, where the cost is `JSON.parse` pl
 at 2 Hz rather than bytes. Covered by `tests/throttle.mjs`, which drives both shapes at the
 real 500ms period and fails if anyone swaps it back.
 
-## A fork is a duplicate that stops (SDK-SIGNALS §F)
-
-Termdeck could already DETECT forks — the terminal makes them, and `chainParents`/
-`firstUserUuid` collapsing in `watcher.js` handles them — but it could not make one. It
-turned out to need almost no new machinery: the existing **duplicate** already clones a
-transcript under a fresh id, so a fork is that plus `upTo`, a uuid to stop at.
-
-**§F's own listed gotcha was already solved, and staying solved is the point.** The
-fork-family collapse (`forkWinner`, keyed on the first message's uuid) HIDES sibling forks in
-the sidebar, so a clone that kept the source's uuid chain is a sibling and exactly one of the
-two vanishes — with *which one* decided by timestamps, so a fork the user deliberately made
-can disappear the moment they touch either chat. `rewriteDuplicateTranscript` already
-rebuilds the whole uuid/parentUuid/leafUuid chain for that reason; `tests/session-fork.mjs`
-proves a TRUNCATED clone keeps it, against the real `forkWinner`.
-
-**An unknown fork point throws.** Cloning the whole conversation when the uuid is not found
-would be a "branch from here" that branched from the end — a wrong copy the user would only
-catch by reading it. Measured before wiring the button: across 201 transcripts on this box,
-**2,250 of 2,251** checkpoint `messageId`s resolve to a record uuid in the same file, so the
-error path is the 0.04% case and not the normal one.
-
-**The button lives on the checkpoint line, beside Restore**, because they are the two halves
-of one undo — restore puts the FILES back, branching puts the CONVERSATION back — and a
-checkpoint is exactly the point you would want to take a different path from. Unlike Restore
-there is no confirm dialog: forking only ever WRITES a new transcript, so there is no data
-loss to gate, and it navigates to the branch rather than toasting (carrying on from there is
-the whole point). The rewriter lives on the AGENT — it reads and rewrites the transcript on
-the machine's own disk — so `tests/session-fork.mjs` drives that copy directly. It reuses the
-`duplicate` route and the `mutate` duplicate op with one more field rather than inventing
-either.
-
 ## One restore point per PROMPT (`lib/transcript.js` + `lib/checkpoints.js`)
 
 The engine writes a checkpoint record every time it backs a file up, and the viewer rendered
@@ -1345,49 +1314,6 @@ nothing — "unknown" is safe to show, last week's login named as current is not
 out a TTL. Asked on `subscribed` rather than folded INTO it: the answer can cost a CLI spawn,
 and blocking a chat from opening on it trades what people notice for what they don't. Covered
 by `tests/account-info.mjs`.
-
-## The MCP panel may never invent a green light (`lib/mcp-status.js`)
-
-The panel shipped in U8 read the CONFIG files and said so out loud — *"connection status
-isn't reported by the CLI"*. It is (SDK-SIGNALS §D): `mcpServerStatus()` returns per-server
-state, the failure reason, and the tools that actually loaded. Until this landed, a server
-that was dead and a server that was fine rendered identically, which is the whole bug.
-
-**`status: null` is not `connected`.** A configured server the engine has never mentioned
-keeps a null status end to end, and the panel renders "not reported" in grey. Defaulting an
-absent reading to healthy would recreate the original bug behind a pill that now *looks*
-authoritative — strictly worse than the old honest silence. The same rule points the other
-way: a server the engine loaded at runtime (`setMcpServers`) but that is in no config file
-is **appended**, because showing fewer servers than the engine loaded is the same lie.
-
-**`config` is dropped entirely, not redacted.** `McpServerStatus.config` is the server's raw
-configuration including its URL, and a URL can carry userinfo. `lib/mcp-config.js` goes to
-real trouble to redact exactly that before anything reaches a browser; passing the engine's
-unredacted copy through a second field would undo it invisibly. The panel already has a
-redacted `target`, so nothing is lost. Tool `description`s go for size, not secrecy.
-
-**The coarse init reading is what makes the panel usable at all.** Like the context
-breakdown this is a method on the SDK's `Query`, and there is no `Query` between turns — but
-unlike the context breakdown, *nobody opens this panel mid-turn*. They open it because a tool
-didn't work. So every turn's `system/init` frame, which already carries
-`mcp_servers: [{ name, status }]` for free on both transports, is recorded as a coarse
-reading: a session that has run even once can answer *is this server dead?*, even when it
-cannot answer why. Rich beats coarse **only where they agree** — a cached "failed:
-ECONNREFUSED" stays while init keeps saying failed, and is dropped the moment init says
-anything else, because a stale reason is worse than no reason.
-
-**The controls need a live turn and say so.** `reconnectMcpServer`/`toggleMcpServer` have no
-honest fallback: with no `Query` there is no engine to reconnect anything *in*. The buttons
-disable themselves with the reason in the tooltip rather than failing on click.
-`setMcpServers()` is deliberately not wired to anything — it REPLACES the whole dynamic set,
-so hanging it off a per-row control would silently delete every other runtime-registered
-server. Actions never paint a status from their own ack; the engine reconnects
-asynchronously, so the browser re-reads. On the cloud path the ack is carried separately
-from the payload (the driver's `control_request` answers, keyed by request id, in `lib/claude-events.js`) because these succeed **empty**:
-collapsing both into "resolved with null" would make a CLI too old to know the subtype
-indistinguishable from one that carried the request out. Read state rides the existing
-`/api/mcp-servers` response rather than a new frame; only the write is a WS message.
-Covered by `tests/mcp-status.mjs`.
 
 ## The spend ceiling is enforced by the ENGINE (`lib/budget.js`)
 

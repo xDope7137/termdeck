@@ -11,7 +11,6 @@ const fsp = require('fs/promises');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
-const { randomUUID } = require('crypto');
 const { registry: DEFAULT_RUNS, checkClaudeArgs, checkFullAccess, fullAccessAllowed, cmdShimSpawn } = require('./engine-runs');
 const { scratchRoots } = require('./live-output');
 let engineInstallLib; try { engineInstallLib = require('./engine-install'); } catch { engineInstallLib = null; }
@@ -53,7 +52,6 @@ let sessionSettingsLib; try { sessionSettingsLib = require('./session-settings')
 // U5/U8 readers — distributed like diff. Guarded so an agent that pulled a new
 // capabilities.js before these files land (self-update ordering) still boots and
 // serves every other capability; the op below returns a clean "outdated" error.
-let mcpConfigLib; try { mcpConfigLib = require('./mcp-config'); } catch { mcpConfigLib = null; }
 // /rewind — the same lib/checkpoints.js the hub restores from, so a cloud restore
 // and a local one resolve the same backups by the same rules. Guarded like the
 // rest: an agent that pulled a new capabilities.js before checkpoints.js landed
@@ -75,7 +73,6 @@ let machineConfigLib; try { machineConfigLib = require('./machine-config'); } ca
 // Guarded like the rest: an agent that pulled a new capabilities.js before these
 // files landed still boots, and `extensions` answers AGENT_OUTDATED.
 let extensionsLib; try { extensionsLib = require('./extensions'); } catch { extensionsLib = null; }
-let projectDocLib; try { projectDocLib = require('./project-doc'); } catch { projectDocLib = null; }
 let commandCatalogLib; try { commandCatalogLib = require('./command-catalog'); } catch { commandCatalogLib = null; }
 let usageBehaviourLib; try { usageBehaviourLib = require('./usage-behaviour'); } catch { usageBehaviourLib = null; }
 let codexAttachmentLib; try { codexAttachmentLib = require('./codex-attachment'); } catch { codexAttachmentLib = null; }
@@ -143,7 +140,7 @@ const DEFAULT_ROOTS = {
 // The config files are here too, and that is not defense in depth: they sit inside the
 // whole-home roots TODAY and hold plaintext secrets. settings.json's `env` block is where
 // ANTHROPIC_API_KEY lives, config.toml and .claude.json carry MCP server env values and
-// bearer tokens. The machineConfig and mcpServers capabilities read them HERE and send a
+// bearer tokens. The machineConfig and extensions capabilities read them HERE and send a
 // redacted view; a raw readFile used to send the unredacted file and make that redaction
 // decorative. Nothing on the master reads them raw.
 const DENYLIST_BASENAMES = new Set([
@@ -310,77 +307,6 @@ async function moveFile(src, dst) {
 }
 
 const RECORD_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-// A straight sessionId/cwd rewrite still shares the original's record uuid/parentUuid
-// chain, so Termdeck's own fork-family collapse (keyed on the first message's uuid)
-// treats the clone as a sibling fork of the source and hides one of them in the sidebar
-// — the duplicate silently "disappears". Two passes: first collect every record's own
-// uuid into a fresh-uuid map, then rewrite uuid/parentUuid/leafUuid (last-prompt
-// records) through that map so the clone gets its own independent identity.
-//
-// `upTo` turns the same machinery into a FORK (SDK-SIGNALS §F). It names the
-// PROMPT the checkpoint sits in front of ("before this prompt"), and the branch
-// keeps everything strictly BEFORE it: that prompt is the instruction the user
-// wants to replace. Keeping it (the old cut, through the record) left it in the
-// branch unanswered, the resumed CLI injected its synthetic "No response
-// requested." reply to it, and the wrong instruction stayed in context. The
-// prompt's own submission records go with it: its checkpoint snapshot/deltas
-// (keyed on its uuid) and the queue enqueue/dequeue written just ahead of it.
-// What is left ends on the prompt's parent chain, so that is the leaf the
-// resumed CLI continues from.
-//
-// An unknown uuid THROWS rather than cloning the whole conversation, because a
-// "branch from here" that quietly branched from the end is a copy the user would
-// only catch by reading it. A cut that leaves no message at all (the first
-// prompt) throws too: there is nothing to resume, and a new chat is the answer.
-function rewriteDuplicateTranscript(content, oldSessionId, newId, newCwd, upTo) {
-  let lines = content.split('\n');
-  let records = lines.map((line) => {
-    if (!line.trim()) return undefined;
-    try { return JSON.parse(line); } catch { return undefined; }
-  });
-  if (upTo) {
-    const cut = records.findIndex((rec) => rec && rec.uuid === upTo);
-    if (cut < 0) throw Object.assign(new Error('fork point not in transcript'), { code: 'BAD_FORK_POINT' });
-    const ownRecord = (rec) => rec
-      && (rec.type === 'file-history-snapshot' || rec.type === 'file-history-delta')
-      && (rec.messageId === upTo || rec.snapshotMessageId === upTo || (rec.snapshot && rec.snapshot.messageId === upTo));
-    let end = cut;
-    while (end > 0) {
-      const rec = records[end - 1];
-      const pending = rec && rec.type === 'queue-operation' && (rec.operation === 'enqueue' || rec.operation === 'dequeue');
-      if (!pending && !ownRecord(rec) && lines[end - 1].trim()) break;
-      end -= 1;
-    }
-    const keep = [];
-    for (let i = 0; i < end; i += 1) if (!ownRecord(records[i])) keep.push(i);
-    lines = keep.map((i) => lines[i]);
-    records = keep.map((i) => records[i]);
-    if (!records.some((rec) => rec && (rec.type === 'user' || rec.type === 'assistant'))) {
-      throw Object.assign(new Error('There is nothing before the first prompt to branch from. Start a new chat instead.'), { code: 'EMPTY_FORK' });
-    }
-  }
-  const uuidMap = new Map();
-  for (const rec of records) {
-    if (rec && typeof rec.uuid === 'string' && RECORD_UUID_RE.test(rec.uuid)) uuidMap.set(rec.uuid, randomUUID());
-  }
-  const out = records
-    .map((rec, i) => {
-      if (!rec) return lines[i];
-      if (rec.sessionId === oldSessionId) rec.sessionId = newId;
-      if (newCwd && typeof rec.cwd === 'string') rec.cwd = newCwd;
-      if (typeof rec.uuid === 'string' && uuidMap.has(rec.uuid)) rec.uuid = uuidMap.get(rec.uuid);
-      if (typeof rec.parentUuid === 'string' && uuidMap.has(rec.parentUuid)) rec.parentUuid = uuidMap.get(rec.parentUuid);
-      if (typeof rec.leafUuid === 'string' && uuidMap.has(rec.leafUuid)) rec.leafUuid = uuidMap.get(rec.leafUuid);
-      return JSON.stringify(rec);
-    })
-    .join('\n');
-  // A jsonl line ends in a newline, and the CLI appends its next record straight
-  // after whatever is here. The uncut path only kept one because the source's
-  // trailing empty line survived the split; a cut drops it, and the first record
-  // the resumed CLI wrote landed glued onto the fork point, one unparseable line.
-  return out.endsWith('\n') ? out : `${out}\n`;
-}
 
 
 const WORKTREES_TTL_MS = 5000;
@@ -1171,7 +1097,8 @@ async function shellsFor(filePath) {
   // `runs` is how each backgrounded Agent run ended, by tool_use_id (a scanner
   // from an older transcript.js has no runEndings, and a master that predates
   // the field ignores it).
-  return { shells: read.result(), runs: read.runEndings ? read.runEndings() : null };
+  // `teammates` is which Agent calls started a teammate, by tool_use_id.
+  return { shells: read.result(), runs: read.runEndings ? read.runEndings() : null, teammates: read.teammates ? read.teammates() : null };
 }
 
 // ONE session index per process, like the engine-run registry: it outlives the
@@ -1269,7 +1196,6 @@ function makeCapabilities(send, opts = {}) {
   const limitsMod = opts.limits ? () => opts.limits : () => require('./limits');
   const usageMod = opts.usage ? () => opts.usage : () => require('./usage');
   const diff = opts.diff || diffLib;
-  const mcpConfig = opts.mcpConfig !== undefined ? opts.mcpConfig : mcpConfigLib;
   const accounts = opts.accounts !== undefined ? opts.accounts : accountsLib;
   const codexAccounts = opts.codexAccounts !== undefined ? opts.codexAccounts : codexAccountsLib;
   const codexAttachment = opts.codexAttachment !== undefined ? opts.codexAttachment : codexAttachmentLib;
@@ -1818,53 +1744,6 @@ function makeCapabilities(send, opts = {}) {
       return {};
     }
 
-    if (m.op === 'duplicate') {
-      // Claude-only (plain .jsonl). The master picks newId; the destination is
-      // computed HERE (same dir, using this box's own path rules) so a Windows
-      // agent doesn't get a POSIX-joined path from the master. An optional newCwd
-      // moves the clone into THAT folder's own project dir (same slug rule the CLI
-      // itself uses), mirroring the 'spawn' cwd check: an existing folder, or a
-      // clear error, never a silent wrong-directory clone.
-      if (typeof m.newId !== 'string' || !/^[0-9a-f-]{36}$/i.test(m.newId)) throw fail('bad newId');
-      const rp = await fsp.realpath(m.path);
-      let dst = path.join(path.dirname(rp), `${m.newId}.jsonl`);
-      const newCwd = typeof m.newCwd === 'string' && m.newCwd.trim() ? m.newCwd.trim() : null;
-      if (newCwd) {
-        let isDir = false;
-        try { isDir = fs.statSync(newCwd).isDirectory(); } catch {}
-        if (!isDir) throw fail('bad cwd');
-        // A clone's cwd is the root its file browser and project doc open on, so a
-        // filesystem root or an ancestor of home would hand those the whole disk.
-        if (!cwdIsProjectShaped(newCwd)) throw fail('bad cwd');
-        const destDir = path.join(CLAUDE_DIR, 'projects', newCwd.replace(/[^A-Za-z0-9]/g, '-'));
-        if (!(await confined(destDir))) throw fail('dst not permitted');
-        await fsp.mkdir(destDir, { recursive: true });
-        dst = path.join(destDir, `${m.newId}.jsonl`);
-      }
-      if (!(await confined(dst))) throw fail('dst not permitted');
-      // Validated here as well as master-side: this decides how much of a
-      // customer's transcript the clone keeps.
-      const upTo = typeof m.upTo === 'string' && /^[0-9a-f-]{36}$/i.test(m.upTo) ? m.upTo : null;
-      let out;
-      try {
-        out = rewriteDuplicateTranscript(await fsp.readFile(rp, 'utf8'), m.oldId, m.newId, newCwd, upTo);
-      } catch (e) {
-        // The two refusals a user can act on travel as refusals, sentence and
-        // code both, so the master can answer 400 with the sentence.
-        if (e && (e.code === 'BAD_FORK_POINT' || e.code === 'EMPTY_FORK')) throw fail(e.message, e.code);
-        throw e;
-      }
-      // A branch is titled as one (the master sends "<source title> (branch)"),
-      // or the sidebar shows two identical rows with nothing saying which is the
-      // copy. A custom-title record, appended last, so it beats the source's own
-      // title records the clone carries, and `claude --resume` shows it too.
-      if (upTo && typeof m.title === 'string' && m.title.trim()) {
-        out += `${JSON.stringify(require('./session-title').titleRecord(m.newId, m.title))}\n`;
-      }
-      await fsp.writeFile(dst, out);
-      return {};
-    }
-
     if (m.op === 'title' || m.op === 'tag' || m.op === 'ai-title') {
       // A title/tag the TERMINAL also sees (SDK-SIGNALS §E). Narrow and typed on
       // purpose, exactly like `limits` and `models`: the master names the session
@@ -1927,35 +1806,8 @@ function makeCapabilities(send, opts = {}) {
   };
   const engineOf = (m) => (m.engine === 'codex' || m.engine === 'grok' ? m.engine : 'claude');
 
-  // The project's instruction file, read and written (U5's editor, and V3 §B's `#`).
-  // The filename comes from a fixed table in the shared module: a name from the
-  // request would be a path from the request wearing a hat.
-  defineOp('projectDoc', async (m) => {
-    if (!projectDocLib || !indexHeadLib) throw fail('agent is out of date (project-doc module missing). Update the agent', 'AGENT_OUTDATED');
-    if (!(await confined(m.path))) throw fail('path not permitted');
-    const engine = engineOf(m);
-    const cwd = await rootFromTranscript(m, engine);
-    if (!cwd) throw fail('This chat has no project folder on disk yet', 'NO_CWD');
-    let root;
-    try { root = await fsp.realpath(cwd); } catch { throw fail(`Project folder is missing: ${cwd}`, 'NO_CWD'); }
-    // Never an engine's own home: a transcript whose cwd is ~/.claude would make this
-    // write ~/.claude/CLAUDE.md, the instructions EVERY session on the box reads.
-    if (!cwdIsProjectShaped(root) || rootOf(root)) throw fail('path not permitted', 'OUT_OF_ROOT');
-
-    if (m.op === 'write') {
-      const content = typeof m.content === 'string' ? m.content : '';
-      return { doc: { ...(await projectDocLib.writeDoc(root, engine, content)), content } };
-    }
-    if (m.op === 'append') {
-      const r = await projectDocLib.appendDoc(root, engine, m.text);
-      return { doc: await projectDocLib.readDoc(root, engine), wrote: r.bytes };
-    }
-    // `read`, the row's defaultOp.
-    return { doc: await projectDocLib.readDoc(root, engine) };
-  }, { onError: (e) => ({ error: denied(e) ? 'Permission denied' : (e.message || e.code), code: denied(e) ? 'DENIED' : (e.code || 'DOC_FAILED') }) });
-
   // What this chat can type after a slash, and what each one does. Drawn on
-  // projectDoc's terms with one difference: a chat with NO cwd is not an error. The
+  // the same terms with one difference: a chat with NO cwd is not an error. The
   // user's own commands are still a real answer, and a palette that refuses to open
   // because a folder was renamed is worse than one missing a few rows.
   //
@@ -2171,8 +2023,7 @@ function makeCapabilities(send, opts = {}) {
     const rp = await fsp.realpath(m.path);
     if (typeof m.sessionId !== 'string' || !RECORD_UUID_RE.test(m.sessionId)) throw fail('bad sessionId');
     // The ids index the backup blobs under file-history/<sessionId>/, so a junk one
-    // can only fail to resolve — but they are validated anyway, on both sides,
-    // exactly like `upTo` on duplicate.
+    // can only fail to resolve, but they are validated anyway, on both sides.
     const ids = (Array.isArray(m.messageIds) ? m.messageIds : []).filter((x) => typeof x === 'string' && RECORD_UUID_RE.test(x));
     if (!ids.length) throw fail('messageIds required');
     if (ids.length > 500) throw fail('too many checkpoints');
@@ -2744,11 +2595,11 @@ function makeCapabilities(send, opts = {}) {
   // costs at runtime in the window before anyone runs the tests.
   const noBranch = (t, op) => fail(`agent is out of date (${t} here has no '${op}'). Update the agent`, 'AGENT_OUTDATED');
 
-  // Feature 04 (cloud path): git diff / PR creation for a session, run where the
+  // Feature 04 (cloud path): the git diff for a session, run where the
   // checkout actually lives. cwd is the session's PROJECT dir (like spawn's cwd) so
   // it is NOT confined to the transcript roots, because projects live wherever the
   // user codes and the master resolves cwd from the session's own head. Still
-  // narrow: the ops are read-only reads and one explicit, browser-confirmed PR.
+  // narrow: the ops are read-only reads.
   defineOp('git', async (m) => {
     const payload = m.payload && typeof m.payload === 'object' ? m.payload : {};
     const cwd = String(payload.cwd || '');
@@ -2774,11 +2625,6 @@ function makeCapabilities(send, opts = {}) {
     // Every checkout of this repo, so a new chat can be started in one. Read only,
     // and it names no path the master did not already send.
     if (m.op === 'worktrees') return { data: await diff.listWorktrees(cwd) };
-    if (m.op === 'pr') return { data: await diff.createPr(cwd, { title: payload.title, body: payload.body }) };
-    if (m.op === 'mcpServers') {
-      if (!mcpConfig) throw fail('agent is out of date (mcp-config module missing). Update the agent', 'AGENT_OUTDATED');
-      return { data: await mcpConfig.readMcpServers(cwd, payload.engine, codexNativeRpc ? { codexRpc: codexNativeRpc } : {}) };
-    }
     throw noBranch('git', m.op);
     // `code` spelled null rather than omitted, as the hand-written catch did: git
     // shells out, so some of these failures carry an errno and some do not, and a
@@ -3010,9 +2856,9 @@ function makeCapabilities(send, opts = {}) {
       if (m.op === 'control' && !fullAccess) {
         try { checkFullAccess('claude', { request: m.request }); } catch (e) { throw fail(e.message, e.code); }
       }
-      // A chat's MCP switch (`mcp_toggle`) is the CLI writing ~/.claude.json, the
+      // An Extensions switch reaching a running chat (`mcp_toggle`) is the CLI writing ~/.claude.json, the
       // same write the Extensions page makes, so the owner's read-only switch
-      // refuses it here too. Reconnect writes nothing and stays allowed.
+      // refuses it here too.
       if (m.op === 'control' && extensionsReadonly && m.request && m.request.subtype === 'mcp_toggle') {
         throw fail('This machine is read-only (TERMDECK_CONFIG_READONLY)', 'CONFIG_READONLY');
       }
@@ -3077,7 +2923,6 @@ function makeCapabilities(send, opts = {}) {
       if (m.op === 'turns') return await call('turns');
       if (m.op === 'items') return await call('items');
       if (m.op === 'rename') return await call('rename');
-      if (m.op === 'fork') return await call('fork');
       if (m.op === 'revert') return await call('revert');
       if (m.op === 'archive') return await call('archive');
       if (m.op === 'unarchive') return await call('unarchive');

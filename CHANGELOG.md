@@ -4,6 +4,19 @@ Termdeck ships continuously: 1,013 production deploys in the first 112 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1575 · 2026-11-25
+
+Agent release: **0.1.977**.
+
+- **A smaller agent** *(agent)*. It no longer opens pull requests, edits the project instruction
+  file, or copies and branches chats, so it writes to fewer places on your machine.
+- **Removed from the app**. Create PR, the project instructions editor with its `#` shortcut,
+  Branch and Duplicate, the MCP panel in a chat's menu (Settings > Extensions has it), bulk
+  approve, the Approvals page's letter keys and History, saved and suggested approval rules, and
+  promo codes. Always allow, the refusal guards, Restore files and diffs stay.
+- **Claude teammates sit with their lead** *(agent, 0.1.976)*. An agent-teams teammate is listed
+  in the Sub-agents panel of the chat that started it, not as a chat of its own in the sidebar.
+
 ## 0.1.1572 · 2026-11-24
 
 Agent release: **0.1.975**.

@@ -66,7 +66,7 @@ A fixed list of typed capabilities, not a shell. See
 
 - **Reads** are confined to the transcript roots and the open chat's project folder, read only.
 - **Writes** are narrow and named: a file you attach (into `~/.termdeck/uploads`, never your
-  project), the project instruction file, checkpoint restore, and the engine account switching
+  project), checkpoint restore, and the engine account switching
   you ask for.
 - **Processes**: the engine CLIs it runs, and a terminal client you asked to take over.
 

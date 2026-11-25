@@ -82,11 +82,11 @@ and item model rather than reshaped into another engine's.
 |---|---|
 | **One fleet board** | Every machine you connect: laptop, desktop, VM, the box under the desk. Sessions sorted by who needs you, not by which terminal they live in. |
 | **Approve from your phone** | Web Push fires with no browser open. Allow or Deny on the notification itself, or tap through to the session. |
-| **One approvals inbox** | Every request waiting on you, across chats and machines, in one list you can answer in bulk. |
+| **One approvals inbox** | Every request waiting on you, across chats and machines, in one list. |
 | **Answer the agent inline** | `AskUserQuestion` renders as real options. No switching to a terminal to type `2`. |
 | **Take over a terminal session** | The view-only lock, released. Close the idle CLI client and drive from the web. |
 | **Switch model and effort mid-run** | Per turn. Drop to a cheap model for the mechanical part, jump to the big one for the hard part. |
-| **Docked diff review** | Changed files with +/− counts, next to the transcript, and a pull request opened from the same dock. |
+| **Docked diff review** | Changed files with +/− counts, next to the transcript. |
 | **Terminals canvas** | Every chat as a live pane on one grid, across machines. |
 | **Background shells** | A dev server a chat started keeps running after the reply, agent updates wait for it, and the chat picks up when a shell finishes. |
 | **Fleet-wide search** | Every session on every machine, by prompt, project or host. |
@@ -169,7 +169,7 @@ The second one is the whole list of what a machine will answer.
 
 ## Built in the open, and written down
 
-**53 load-bearing invariants**, each one carrying the failure that produced it:
+**51 load-bearing invariants**, each one carrying the failure that produced it:
 [docs/INVARIANTS.md](docs/INVARIANTS.md).
 
 > **A preview is a PAINT, read from the TAIL.** Seeds and `?tail=1` parse only the file's last bytes;
@@ -231,7 +231,7 @@ it is tested.
 
 Yes, natively. The agent speaks the open `codex app-server` protocol, one shared server per machine
 (Codex 0.163.0 or newer). History is read from Codex itself and drawn in Codex's own turns and items,
-approval cards offer Codex's own decisions, and plan mode, steering, `/compact`, `/review`, branching
+approval cards offer Codex's own decisions, and plan mode, steering, `/compact`, `/review`
 and rewinding are Codex's own operations. Claude Code and Grok sit in the same sidebar.
 
 #### What can the agent actually touch?
@@ -239,7 +239,7 @@ and rewinding are Codex's own operations. Claude Code and Grok sit in the same s
 A fixed list of typed capabilities, not a shell. Reads are confined to the transcript roots and the
 open chat's project folder (read only). Paths are never sent from the server: the master names a
 session id and the agent resolves it against its own disk. The writes are narrow and named: a file
-you attach (into `~/.termdeck/uploads`, never your project), the project instruction file, checkpoint
+you attach (into `~/.termdeck/uploads`, never your project), checkpoint
 restore, and the engine account switching you ask for. Processes it may signal are ones it started,
 plus a terminal client you asked to take over. The code is in
 [`agent/capabilities.js`](agent/capabilities.js); [termdeck.io/docs/security](https://termdeck.io/docs/security?ref=github) is the long version.
@@ -267,7 +267,7 @@ agent/                 the thin agent: root-confined capabilities, self-update, 
 install.sh / .ps1      the one-liners the dashboard hands you, as termdeck.io serves them
 deploy/                systemd / launchd / schtasks units, heal + uninstall scripts
 docs/ARCHITECTURE.md   how the pieces fit
-docs/INVARIANTS.md     53 load-bearing rules and the failure behind each one
+docs/INVARIANTS.md     51 load-bearing rules and the failure behind each one
 ```
 
 ### `agent/` is the installed agent

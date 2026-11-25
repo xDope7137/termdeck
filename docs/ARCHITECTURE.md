@@ -54,8 +54,8 @@ That file is the whole trust boundary, and it is short on purpose.
 - **Typed and confined.** Reads resolve against the transcript roots and the open chat's
   project folder (read only), and nothing else. Paths are never sent from the server: the
   master names a *session id*, and the agent resolves it against its own disk. The writes
-  are few and named: an attached file (into `~/.termdeck/uploads`, never the project), the
-  project instruction file, checkpoint restore, and engine account switching.
+  are few and named: an attached file (into `~/.termdeck/uploads`, never the project),
+  checkpoint restore, and engine account switching.
 - **The index lives on the machine.** Rebuilding a session index by streaming raw
   transcripts to the server measured at 124 MB across 581 reads to learn 200 titles. The
   agent now owns the index (`~/.termdeck/session-index.json`) and returns a few hundred
@@ -105,5 +105,5 @@ transcript, on screen and in the browser's cache, whenever a second chat was liv
 
 ## Further reading
 
-[docs/INVARIANTS.md](INVARIANTS.md): 53 load-bearing rules, each with the failure that
+[docs/INVARIANTS.md](INVARIANTS.md): 51 load-bearing rules, each with the failure that
 produced it. It is the honest version of this document.

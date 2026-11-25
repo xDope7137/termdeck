@@ -1,9 +1,9 @@
 'use strict';
 
-// Feature 04 — Phone Diff & PR Review. Engine-agnostic git helpers: everything
+// Feature 04: engine-agnostic git helpers. Everything
 // here operates purely on the git state of a session's cwd, so it serves Claude
 // and Codex sessions identically (it's just git state in the checkout). server.js
-// resolves a session -> cwd, then calls collectDiff()/createPr() here.
+// resolves a session -> cwd, then calls collectDiff() here.
 //
 // Cloud/agent parity: lib/cloud/machine-host.js would expose the same two routes
 // per machine (owner-scoped, confined to the transcript roots) and call straight
@@ -30,14 +30,6 @@ function run(cmd, args, cwd, opts = {}) {
 }
 
 const git = (cwd, args, opts) => run('git', args, cwd, opts);
-
-let ghCache = null;
-async function ghAvailable() {
-  if (ghCache !== null) return ghCache;
-  const r = await run('gh', ['--version'], undefined, { timeout: 5_000 });
-  ghCache = !r.err;
-  return ghCache;
-}
 
 async function repoRoot(cwd) {
   const r = await git(cwd, ['rev-parse', '--show-toplevel']);
@@ -103,16 +95,14 @@ async function collectDiff(cwd, opts = {}) {
       summary: emptySummary(),
       diff: '',
       truncated: false,
-      pr: { remote: false, gh: false },
     };
   }
 
-  const [unstagedR, stagedR, untrackedR, branchR, remoteR, headR] = await Promise.all([
+  const [unstagedR, stagedR, untrackedR, branchR, headR] = await Promise.all([
     light ? { stdout: '' } : git(root, ['diff']),
     light ? { stdout: '' } : git(root, ['diff', '--staged']),
     git(root, ['ls-files', '--others', '--exclude-standard']),
     git(root, ['rev-parse', '--abbrev-ref', 'HEAD']),
-    git(root, ['remote']),
     git(root, ['rev-parse', '--verify', 'HEAD']),
   ]);
   const hasHead = !headR.err;
@@ -140,7 +130,6 @@ async function collectDiff(cwd, opts = {}) {
     untracked,
   };
 
-  const [gh] = await Promise.all([ghAvailable()]);
   return {
     git: true,
     cwd,
@@ -150,10 +139,6 @@ async function collectDiff(cwd, opts = {}) {
     diff: text,
     truncated,
     light,
-    // Feature-detect: the UI hides PR actions unless a remote exists; `gh` gates
-    // whether the create can
-    // actually run, surfaced as a clean "unavailable" instead of a failure.
-    pr: { remote: !!remoteR.stdout.trim(), gh },
   };
 }
 
@@ -183,32 +168,6 @@ async function fileDiff(cwd, file, from) {
   return { git: true, cwd, root, file, diff: text, truncated };
 }
 
-// Create a PR via the `gh` CLI. Outward-facing, so this only ever runs from an
-// explicit POST that the browser has confirmed — never automatically. Degrades
-// cleanly: no git remote, or no `gh` installed, returns a typed error the UI
-// shows rather than a 500. Uses gh's ambient auth — no secrets are handled here.
-async function createPr(cwd, { title, body } = {}) {
-  const root = await repoRoot(cwd);
-  if (!root) return { ok: false, status: 400, code: 'NOT_GIT', error: 'Not a git repository' };
-
-  const remoteR = await git(root, ['remote']);
-  if (!remoteR.stdout.trim()) {
-    return { ok: false, status: 400, code: 'NO_REMOTE', error: 'This repository has no git remote — cannot create a pull request' };
-  }
-  if (!(await ghAvailable())) {
-    return { ok: false, status: 501, code: 'GH_UNAVAILABLE', error: 'GitHub CLI (gh) is not installed on this host' };
-  }
-
-  const args = ['pr', 'create', '--title', String(title || 'Termdeck changes').slice(0, 250), '--body', String(body || '')];
-  const r = await run('gh', args, root, { timeout: 60_000 });
-  if (r.err) {
-    const msg = (r.stderr || r.stdout || 'gh pr create failed').trim().slice(0, 2000);
-    return { ok: false, status: 400, code: 'GH_FAILED', error: msg };
-  }
-  const url = (r.stdout.match(/https?:\/\/\S+/) || [null])[0];
-  return { ok: true, url, output: r.stdout.trim().slice(0, 2000) };
-}
-
 // WHICH BRANCH is this folder on — the two git calls out of collectDiff above,
 // without the diff.
 //
@@ -224,7 +183,7 @@ async function createPr(cwd, { title, body } = {}) {
 // A branch chip that says `main` when you are not on main is worse than no chip:
 // it is the one fact a customer checks before believing their work is isolated.
 // So ask git, in the folder the chat is actually in, and cheaply enough that the
-// answer can be fetched on open — no diff, no numstat, no `gh`.
+// answer can be fetched on open: no diff, no numstat.
 async function readBranch(cwd) {
   const root = await repoRoot(cwd);
   if (!root) return { git: false, cwd, root: null, branch: null };
@@ -296,4 +255,4 @@ async function listWorktrees(cwd) {
 // parseNumstat is exported for lib/git-checkpoint.js, which reads the same
 // `--numstat` output between two checkpoint commits. ONE parser: a second copy
 // would drift on the binary-file `-` case, which is the only interesting one.
-module.exports = { collectDiff, createPr, repoRoot, readBranch, listWorktrees, parseWorktreeList, parseNumstat };
+module.exports = { collectDiff, repoRoot, readBranch, listWorktrees, parseWorktreeList, parseNumstat };

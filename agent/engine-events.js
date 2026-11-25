@@ -44,7 +44,7 @@ const TYPES = {
   // does; Claude's path follows from the cwd and the id).
   'session.bound': { sessionId: 'string', 'cwd?': 'string', 'transcriptPath?': 'string' },
   // What the engine reported about itself at the start of a turn.
-  'session.info': { 'cwd?': 'string', 'model?': 'string', 'permissionMode?': 'string', 'slashCommands?': 'array', 'mcpServers?': 'array' },
+  'session.info': { 'cwd?': 'string', 'model?': 'string', 'permissionMode?': 'string', 'slashCommands?': 'array' },
   // The OS process serving the run, so the owner can tell its own child from a
   // second writer and reap it by a pid it can prove is its own.
   'run.process': { pid: 'number' },
@@ -288,7 +288,6 @@ function createEventLog({ runId, sessionId = null, limit = 2000, now = Date.now 
 const CAPABILITY_SPEC = {
   steer: 'boolean',        // accepts a message mid-turn without aborting it
   resume: 'boolean',       // continues an existing session by id
-  fork: 'boolean',         // branches a session into a new one
   planMode: 'boolean',     // has a plan-then-approve mode
   images: 'boolean',       // accepts image attachments
   files: 'boolean',        // accepts file attachments by path
@@ -301,7 +300,6 @@ const CAPABILITY_SPEC = {
   contextBreakdown: 'boolean', // answers "what is filling the context window"
   compactAt: 'fraction?',  // offers /compact, hot past this share of the window; null = no /compact
   rewind: 'boolean',       // restores files to a checkpoint
-  mcpStatus: 'boolean',    // reports MCP server connection status
   mcpResources: 'boolean', // can list what its MCP servers hold, for the `@` menu
   backgroundShells: 'boolean', // runs shells that outlive the turn
   runOptions: 'boolean',   // takes the per-chat flags of the Run options dialog

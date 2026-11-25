@@ -16,7 +16,7 @@
 // `require('../transcript')` would resolve to nothing there. That constraint is
 // what keeps this file free of anything cloud-shaped.
 
-const { isSyntheticUserText, codexTimestampMs } = require('./transcript');
+const { isSyntheticUserText, stripTeammateText, codexTimestampMs } = require('./transcript');
 
 // A GENERATED title can come back as a bare "continue" — the user typed `continue`
 // to restart a stalled run and the summariser took that prompt at face value, so a
@@ -52,7 +52,7 @@ function isUsableTitle(text) {
 // record as the parsed path does from a whole one.
 function readUserText(text) {
   const none = { real: false, title: null };
-  const t = typeof text === 'string' ? text.trim() : '';
+  const t = typeof text === 'string' ? stripTeammateText(text).trim() : '';
   if (!t) return none;
   if (t.includes('<command-name>')) {
     // Slash command: title from its <command-args> (text after e.g. /build), skip if bare.
@@ -249,7 +249,7 @@ function claudeLastPrompt(text) {
     const line = lines[i].trim();
     if (!line) continue;
     let rec; try { rec = JSON.parse(line); } catch { continue; }
-    if (rec.type === 'last-prompt' && isUsableTitle(rec.lastPrompt)) return rec.lastPrompt.trim();
+    if (rec.type === 'last-prompt' && isUsableTitle(rec.lastPrompt)) return stripTeammateText(rec.lastPrompt).trim();
   }
   return null;
 }
@@ -344,10 +344,27 @@ function claudeLastCommandAt(text) {
   return hit ? hit.at : null;
 }
 
-// {cwd,title} from a Claude jsonl head: cwd from the first record, title from the first
+// A Claude Code TEAMMATE (agent teams) is a process of its own, so its chat is a
+// top-level transcript that looks like any other. Every record it writes names its
+// team and itself; the lead's records do not. Joined, the two are the agent id the
+// lead's Agent call came back with, which is how the chat is found from there.
+const teammateId = (agentName, teamName) => (
+  typeof agentName === 'string' && agentName && agentName !== 'team-lead' && typeof teamName === 'string' && teamName
+    ? `${agentName}@${teamName}` : null);
+
+// The same off a record the window cut in half: both fields come before `message`.
+function salvageTeammateId(line) {
+  const at = line.indexOf('"message":');
+  if (at === -1) return null;
+  const head = line.slice(0, at);
+  const of = (k) => (new RegExp(`"${k}":"([^"\\\\]+)"`).exec(head) || [])[1];
+  return teammateId(of('agentName'), of('teamName'));
+}
+
+// {cwd,title,subagentOf} from a Claude jsonl head: cwd from the first record, title from the first
 // real user message (skip slash-command / local-command-stdout wrappers).
 function claudeHead(text) {
-  let cwd = null, title = null, firstUserUuid = null;
+  let cwd = null, title = null, firstUserUuid = null, subagentOf = null;
   const lines = text.split('\n');
   // A window that does not end in a newline was cut mid-record; only its LAST
   // line can be that record.
@@ -361,9 +378,11 @@ function claudeHead(text) {
       rec = JSON.parse(line);
     } catch {
       if (li === cutAt && !title) title = readUserText(salvagePartialUserText(line)).title;
+      if (li === cutAt && !subagentOf) subagentOf = salvageTeammateId(line);
       continue;
     }
     if (!cwd && typeof rec.cwd === 'string' && rec.cwd) cwd = rec.cwd;
+    if (!subagentOf) subagentOf = teammateId(rec.agentName, rec.teamName);
     if (!title && rec.type === 'user' && !rec.isMeta && !rec.isSidechain && rec.message) {
       const c = rec.message.content;
       const txt = typeof c === 'string' ? c
@@ -380,7 +399,7 @@ function claudeHead(text) {
       if (seen.title) title = seen.title;
     }
   }
-  return { cwd, title, firstUserUuid };
+  return { cwd, title, firstUserUuid, subagentOf };
 }
 
 // TUI renames land in session_index.jsonl (thread_name), not the rollout itself — mirrors

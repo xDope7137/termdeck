@@ -105,7 +105,6 @@ const OPS = {
   turns: { method: 'thread/turns/list', params: ['threadId', 'cursor', 'limit', 'sortDirection', 'itemsView'], need: ['threadId'] },
   items: { method: 'thread/items/list', params: ['threadId', 'turnId', 'cursor', 'limit'], need: ['threadId'] },
   rename: { method: 'thread/name/set', params: ['threadId', 'name'], need: ['threadId', 'name'] },
-  fork: { method: 'thread/fork', params: ['threadId', 'lastTurnId'], fixed: { excludeTurns: true }, need: ['threadId'] },
   revert: { method: 'thread/revert', params: ['threadId', 'beforeTurnId'], need: ['threadId', 'beforeTurnId'] },
   archive: { method: 'thread/archive', params: ['threadId'], need: ['threadId'] },
   unarchive: { method: 'thread/unarchive', params: ['threadId'], need: ['threadId'] },

@@ -43,7 +43,7 @@ but nothing restarts it.
   project folder (read only) and `realpath`'d, so a symlink inside a root that points outside
   it does not escape. Paths are never sent from the server: the master names a session id and
   the agent resolves it against its own disk. The writes are few and named: an attached file
-  (into `~/.termdeck/uploads`, never the project), the project instruction file, checkpoint
+  (into `~/.termdeck/uploads`, never the project), checkpoint
   restore, and engine account switching.
 - **Outbound only.** The agent dials the master over a reverse WebSocket. No inbound port,
   no firewall rule, no tunnel. It reaches termdeck.io directly or through the fallback address

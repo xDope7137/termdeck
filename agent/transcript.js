@@ -241,7 +241,46 @@ const unwrapToolUseError = (text) => {
   return m ? m[1].trim() : text;
 };
 
+// A message between Claude Code teammates (agent teams) is written as a user
+// record: the body inside <teammate-message teammate_id="...">, and in the lead's
+// chat a sentence before and a paragraph of instructions to the model after.
+// Returns [{ from, text }] for a record that IS such a message, else null.
+// Anchored to the start: a person quoting the tag mid-prompt keeps their words.
+const TEAMMATE_OPEN_RE = /^\s*(?:Another Claude session sent a message:\s*)?<teammate-message\s[^>]*>/;
+const TEAMMATE_MSG_RE = /<teammate-message\s([^>]*)>\r?\n?([\s\S]*?)(?:\r?\n?<\/teammate-message>|$)/g;
+const isTeammateText = (text) => typeof text === 'string' && TEAMMATE_OPEN_RE.test(text);
+function teammateMessages(text) {
+  if (!isTeammateText(text)) return null;
+  const out = [];
+  for (const m of text.matchAll(TEAMMATE_MSG_RE)) {
+    const from = (/teammate_id="([^"]*)"/.exec(m[1]) || [])[1] || '';
+    out.push({ from, text: teammateBody(m[2].trim()) });
+  }
+  return out;
+}
+
+// Control messages are one JSON object, sometimes with a note to the model under it.
+function teammateBody(body) {
+  const type = (/^\{\s*"type"\s*:\s*"([a-z_]+)"/.exec(body) || [])[1];
+  if (!type) return body;
+  let msg = null;
+  try { msg = JSON.parse(body.split(/\r?\n\r?\n/)[0]); } catch {}
+  const said = msg && [msg.result, msg.reason, msg.message, msg.summary].find((v) => typeof v === 'string' && v.trim());
+  const label = type.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
+  if (type === 'idle_notification') return said ? said.trim() : 'Idle';
+  return said ? `${label}: ${said.trim()}` : label;
+}
+
+// The same message as plain words. The lead's word to a worker is that worker's
+// prompt and needs no label; a worker's word to the lead is named after it.
+function stripTeammateText(text) {
+  const msgs = teammateMessages(text);
+  if (!msgs) return text;
+  return msgs.map((m) => (m.from && m.from !== 'team-lead' && m.from !== 'system' ? `${m.from}: ${m.text}` : m.text)).join('\n\n');
+}
+
 function userStringBlocks(text) {
+  if (isTeammateText(text)) return [{ kind: 'text', text: stripTeammateText(text) }];
   const command = text.match(COMMAND_RE);
   if (command) {
     const args = text.match(COMMAND_ARGS_RE);
@@ -1555,7 +1594,11 @@ function createShellScanner(from = null) {
   // past a tab that was away (a reconnect, a background tab catching up with a
   // fresh window) is not left reading "running" forever.
   const runs = new Map(from ? from.runs : []);
-  const feed = (text) => { scanShellLines(String(text || ''), pending, out, ended, runs); };
+  // tool_use_id -> { agentId, name, agentType, startedAt } for an Agent call that
+  // started a TEAMMATE: a Claude process with a chat file of its own, whose records
+  // carry the agentId's two halves (session-head.js claudeHead).
+  const mates = new Map(from ? from.mates : []);
+  const feed = (text) => { scanShellLines(String(text || ''), pending, out, ended, runs, mates); };
   // `status` is absent when the transcript never recorded an ending, and absent
   // is meaningful: it is the shell that may STILL BE RUNNING, which the caller
   // must not claim to know the outcome of.
@@ -1564,8 +1607,9 @@ function createShellScanner(from = null) {
     return end ? { ...s, status: end.status, endedAt: end.endedAt } : { ...s };
   });
   const runEndings = () => Object.fromEntries(runs);
-  const clone = () => createShellScanner({ pending, out, ended, runs });
-  return { feed, result, runEndings, clone };
+  const teammates = () => Object.fromEntries(mates);
+  const clone = () => createShellScanner({ pending, out, ended, runs, mates });
+  return { feed, result, runEndings, teammates, clone };
 }
 
 function scanBackgroundShells(text) {
@@ -1585,7 +1629,37 @@ function scanRunEndings(text) {
 // 'running' and anything else the CLI adds later end nothing.
 const RUN_END_STATUSES = new Set(['completed', 'failed', 'stopped', 'killed', 'cancelled']);
 
-function scanShellLines(text, pending, out, ended, runs = null) {
+function noteTeammate(line, mates) {
+  let rec;
+  try { rec = JSON.parse(line); } catch { return; }
+  const r = rec && rec.toolUseResult;
+  if (!r || typeof r !== 'object' || r.status !== 'teammate_spawned' || typeof r.agentId !== 'string' || !r.agentId) return;
+  const content = rec.message && rec.message.content;
+  const res = Array.isArray(content) ? content.find((b) => b && b.type === 'tool_result' && typeof b.tool_use_id === 'string') : null;
+  if (!res) return;
+  mates.set(res.tool_use_id, {
+    agentId: r.agentId,
+    name: typeof r.name === 'string' ? r.name : '',
+    agentType: typeof r.agent_type === 'string' ? r.agent_type : '',
+    startedAt: Date.parse(rec.timestamp || '') || null,
+  });
+}
+
+// "<name> has shut down." in the lead's chat: the one record of a teammate's end.
+// A COPY is stored, because a cloned scanner shares these objects.
+function noteTeammateEnd(line, mates) {
+  let rec;
+  try { rec = JSON.parse(line); } catch { return; }
+  const content = rec && rec.type === 'user' && rec.message && rec.message.content;
+  if (!isTeammateText(content)) return;
+  for (const m of content.matchAll(/"type":"teammate_terminated","message":"([^"\s]+) has shut down/g)) {
+    for (const [id, mate] of mates) {
+      if (mate.name === m[1] && !mate.endedAt) mates.set(id, { ...mate, endedAt: Date.parse(rec.timestamp || '') || null });
+    }
+  }
+}
+
+function scanShellLines(text, pending, out, ended, runs = null, mates = null) {
   for (const line of text.split('\n')) {
     if (!line) continue;
     // The CLI writes the same notification up to three times (a queue enqueue, a
@@ -1593,6 +1667,8 @@ function scanShellLines(text, pending, out, ended, runs = null) {
     // task id and the status, so this reads whichever comes first and lets the
     // rest overwrite it with the same values rather than picking a record type
     // and being wrong when the CLI adds a fourth.
+    if (mates && line.includes('"teammate_spawned"')) noteTeammate(line, mates);
+    if (mates && line.includes('teammate_terminated')) noteTeammateEnd(line, mates);
     if (line.includes('<task-notification>')) {
       let rec;
       try { rec = JSON.parse(line); } catch { continue; }
@@ -2170,7 +2246,7 @@ function lastClaudeUserInputAt(text) {
       : Array.isArray(c) ? c.filter((x) => x && x.type === 'text' && typeof x.text === 'string').map((x) => x.text) : [];
     const typed = parts.some((t) => {
       const tt = t.trim();
-      return tt && !tt.startsWith('<command-') && !tt.startsWith('<local-command') && !tt.startsWith('<task-notification');
+      return tt && !tt.startsWith('<command-') && !tt.startsWith('<local-command') && !tt.startsWith('<task-notification') && !isTeammateText(tt);
     });
     if (!typed) continue;
     const ts = Date.parse(rec.timestamp);
@@ -2238,7 +2314,7 @@ function claudeUserInputTimestamp(rec) {
     : Array.isArray(c) ? c.filter((x) => x && x.type === 'text' && typeof x.text === 'string').map((x) => x.text) : [];
   const typed = parts.some((t) => {
     const tt = t.trim();
-    return tt && !tt.startsWith('<command-') && !tt.startsWith('<local-command') && !tt.startsWith('<task-notification');
+    return tt && !tt.startsWith('<command-') && !tt.startsWith('<local-command') && !tt.startsWith('<task-notification') && !isTeammateText(tt);
   });
   if (!typed) return null;
   const ts = Date.parse(rec.timestamp);
@@ -4308,7 +4384,7 @@ function finishPartialPreview(parsed, { startLine = 0, whole = true, preview = 0
 
 module.exports = {
   inputDescription,
-  parseTranscript, parseRollout, readRolloutRaw, isSyntheticUserText, inputPreview, isCodexRejection,
+  parseTranscript, parseRollout, readRolloutRaw, isSyntheticUserText, stripTeammateText, inputPreview, isCodexRejection,
   finishPartialPreview,
   // Prompt-anchored preview window — shared by the hub and the cloud master so a
   // chat opens the same length on either product. earlierWindow is its backwards
