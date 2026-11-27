@@ -11,7 +11,7 @@ const fsp = require('fs/promises');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
-const { registry: DEFAULT_RUNS, checkClaudeArgs, checkFullAccess, fullAccessAllowed, cmdShimSpawn } = require('./engine-runs');
+const { registry: DEFAULT_RUNS, checkClaudeArgs, cmdShimSpawn } = require('./engine-runs');
 const { scratchRoots } = require('./live-output');
 let engineInstallLib; try { engineInstallLib = require('./engine-install'); } catch { engineInstallLib = null; }
 // The wire protocol, written down: every frame this file answers has a row there
@@ -250,7 +250,7 @@ function bgLogPathOk(p, where = undefined) {
 
 // Where an attachment lands on its way to a CLI: ~/.termdeck/uploads, with
 // TERMDECK_HOME overriding the home the same way every other consumer of that
-// var does (lib/cloud/db.js, lib/policies.js, agent/agent.js).
+// var does (lib/cloud/db.js, agent/agent.js).
 //
 // Read at CALL time, not at module load. A module-level constant here would bake
 // whatever the environment held when this file was first required, which is the
@@ -1216,8 +1216,6 @@ function makeCapabilities(send, opts = {}) {
   // an engine run narrow, and until it was injectable the only way to exercise it
   // was to run a real coding CLI, which the suite rules forbid outside the live tier.
   const engineExes = opts.engines || ENGINES;
-  // The owner's ceiling on permission modes (engine-runs.js checkFullAccess).
-  const fullAccess = opts.fullAccess != null ? !!opts.fullAccess : fullAccessAllowed();
 
   // The session index: the process's own for the real roots, a memory-only one
   // per instance for a test's fixture roots (their confinement is not the
@@ -2273,8 +2271,8 @@ function makeCapabilities(send, opts = {}) {
   //     it is dropped before the module sees it
   //   * the engine CLIs run from the allowlist this instance was built with, with
   //     a timeout, never through a shell except the Windows .cmd shim
-  //   * TERMDECK_CONFIG_READONLY (the owner's switch, read at construction like
-  //     TERMDECK_FULL_ACCESS) refuses every write
+  //   * TERMDECK_CONFIG_READONLY (the owner's switch, read at construction)
+  //     refuses every write
   // The two config files the denylist keeps from a raw readFile are read here and
   // only a redacted view leaves, the same posture as machineConfig.
   const extensionsReadonly = opts.configReadonly != null ? !!opts.configReadonly : (extensionsLib ? extensionsLib.readonlyFrom() : false);
@@ -2782,9 +2780,6 @@ function makeCapabilities(send, opts = {}) {
         const exe = engineExes[m.engine];
         if (!exe) throw fail(`engine not permitted: ${m.engine}`, 'BAD_ENGINE');
         const cwd = m.cwd && typeof m.cwd === 'string' ? checkCwd(m.cwd, 'BAD_CWD') : null;
-        if (!fullAccess) {
-          try { checkFullAccess(m.engine, m); } catch (e) { throw fail(e.message, e.code); }
-        }
         // Codex: a turn on a thread of the machine's one app-server. The master sends
         // the turn's input items and settings; the argv is the agent's own.
         if (m.engine === 'codex') {
@@ -2853,9 +2848,6 @@ function makeCapabilities(send, opts = {}) {
       if (m.op === 'submit') return runs.submit(String(m.runId), m.content, m.thinking || null);
       if (m.op === 'hold') return { held: runs.hold(String(m.runId)) };
       if (m.op === 'interrupt') { runs.interrupt(String(m.runId)); return { ok: true }; }
-      if (m.op === 'control' && !fullAccess) {
-        try { checkFullAccess('claude', { request: m.request }); } catch (e) { throw fail(e.message, e.code); }
-      }
       // An Extensions switch reaching a running chat (`mcp_toggle`) is the CLI writing ~/.claude.json, the
       // same write the Extensions page makes, so the owner's read-only switch
       // refuses it here too.

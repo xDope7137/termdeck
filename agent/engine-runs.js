@@ -277,41 +277,6 @@ function checkClaudeArgs(args) {
   return args;
 }
 
-// TERMDECK_FULL_ACCESS=off in the agent's env: the machine owner's ceiling, which the
-// master cannot raise. Every mode that lets an engine act without asking is refused
-// at the agent: Claude bypassPermissions (argv or a mid-run switch), Codex approval
-// 'never' or an unsandboxed policy, Grok's bypassPermissions mode. Each action then
-// waits for an answer instead of running unasked.
-const FULL_ACCESS_OFF = 'full access is turned off on this machine (TERMDECK_FULL_ACCESS=off)';
-function fullAccessAllowed(env = process.env) {
-  return String(env.TERMDECK_FULL_ACCESS || '').trim().toLowerCase() !== 'off';
-}
-function checkFullAccess(engine, spec) {
-  const s = spec || {};
-  const deny = () => { throw refuse(FULL_ACCESS_OFF, 'FULL_ACCESS_OFF'); };
-  if (engine === 'claude') {
-    const args = Array.isArray(s.args) ? s.args : [];
-    for (let i = 0; i < args.length; i++) {
-      if (args[i] === '--dangerously-skip-permissions') deny();
-      if (args[i] === '--permission-mode' && args[i + 1] === 'bypassPermissions') deny();
-    }
-    if (s.permissionMode === 'bypassPermissions') deny();
-    const r = s.request;
-    if (r && r.subtype === 'set_permission_mode' && r.mode === 'bypassPermissions') deny();
-  } else if (engine === 'codex') {
-    const th = s.thread || {};
-    const turn = s.turn || {};
-    if (th.approvalPolicy === 'never' || turn.approvalPolicy === 'never') deny();
-    if (th.sandbox === 'danger-full-access') deny();
-    const sp = turn.sandboxPolicy;
-    if (sp && typeof sp === 'object' && (sp.type === 'dangerFullAccess' || sp.type === 'externalSandbox')) deny();
-    if (s.permissionMode === 'full-access') deny();
-  } else if (engine === 'grok') {
-    if (s.modeId === 'bypassPermissions' || s.permissionMode === 'full-access') deny();
-  }
-  return spec;
-}
-
 const isActiveWriterRefusal =(err) => /active writer/i.test(String((err && (err.message || err)) || ''));
 
 const ADAPTERS = {
@@ -1833,4 +1798,4 @@ function createRunRegistry(opts = {}) {
 
 const registry = createRunRegistry();
 
-module.exports = { createRunRegistry, registry, DEFAULTS, restoredClaudeCost, killTree, cmdShimSpawn, checkClaudeArgs, checkFullAccess, fullAccessAllowed, codexNativeWanted };
+module.exports = { createRunRegistry, registry, DEFAULTS, restoredClaudeCost, killTree, cmdShimSpawn, checkClaudeArgs, codexNativeWanted };

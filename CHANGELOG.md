@@ -4,6 +4,22 @@ Termdeck ships continuously: 1,110 production deploys in the first 146 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1586 · 2026-11-27
+
+Agent release: **0.1.978**.
+
+- **Your CLI decides what needs approval**. Termdeck has no permission rules of its own any more.
+  Claude Code, Codex and Grok ask according to their own modes, rules and hooks, and Termdeck
+  shows the request and sends back your answer.
+- **Removed from the app**. Always allow, the refusal guards, the Settings > Approvals page, the
+  per-chat Termdeck rules switch, and the risk word on approval cards and in the Approvals inbox.
+  The inbox lists requests oldest first.
+- **Stop asking uses the CLI's own rules**. On a Claude card, For this chat and Always, on this
+  machine save the rule Claude suggested, in its session rules or its user settings, and appear
+  only when Claude suggested one. Codex cards offer the answers Codex offered.
+- **`TERMDECK_FULL_ACCESS` is gone** *(agent)*. The agent no longer refuses Full access mode on a
+  machine. An approval nobody answers is still denied after five minutes.
+
 ## 0.1.1575 · 2026-11-25
 
 Agent release: **0.1.977**.

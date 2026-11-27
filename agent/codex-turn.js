@@ -121,136 +121,6 @@ function shellCommand(command) {
   return m ? m[1].replace(/'\\''/g, "'") : text;
 }
 
-// "Approve commands like this for the rest of this turn" (features/02 1.11b).
-// A turn that escalates six times should not be six clicks, and the grant that
-// replaces them must never become a blanket allow. So "like this" is narrow and
-// written down here, once, for the agent that enforces it and the master that
-// offers it:
-//
-//   - the command is ONE simple command: plain words, quotes allowed, and no
-//     pipe, redirect, `;`, `&&`, subshell, `$`, backtick, glob or newline, so
-//     `npm test && rm -rf ~` is never "like" `npm test`;
-//   - it names a program and a first subcommand word (`git status`,
-//     `cargo test`, `pytest tests`). For a `run` subcommand the thing it runs is
-//     part of it too (`npm run build`, `uv run pytest`), and so is the first
-//     plain word after a subcommand that groups others (`git stash drop`,
-//     `docker compose down`), so `git stash` never covers `git stash clear`;
-//   - neither word runs some OTHER command (sudo, env, xargs, a shell, ssh,
-//     find, `npm exec`, `docker exec`...), the program is not one that deletes,
-//     moves, copies, fetches or changes permissions (rm, mv, cp, curl,
-//     chmod...), and the subcommand does not delete (`git rm`);
-//   - it runs in the same folder;
-//   - it carries NO FLAG the approved command did not. Plain arguments may
-//     differ (another file, another branch), flags may not: `git push` does not
-//     cover `git push --force`, `git clean -n` does not cover `git clean -fdx`,
-//     `git branch` does not cover `git branch -D`. A flag is any word starting
-//     with `-`, compared whole (`--force-with-lease=main` is not
-//     `--force-with-lease`); combined short flags count letter by letter (`-fdx`
-//     is `-f -d -x`); and a word starting with `+` or `:` counts as one too,
-//     since that is how git spells a force push (`+main`) and a remote delete
-//     (`:main`). A list of the flags approved rather than a list of dangerous
-//     flags, because the next dangerous flag is the one nobody wrote down.
-//
-// The key says which commands are alike; `flags` says how far a grant reaches.
-// The master still runs its guards on every match and asks again for one the
-// risk grader scores above what was approved (lib/cloud/codex-native-runner.js).
-// Anything else (a flag first, a path, `ls` on its own) has no rule and is asked
-// one at a time. Codex's own `acceptWithExecpolicyAmendment` is not used for
-// this: it saves a rule to the machine's execpolicy for every future session,
-// terminal included, which is "always" and not "this turn"; and acceptForSession
-// is Codex's own session cache, which outlives the turn. A "like this" grant is
-// answered `accept`, request by request.
-//
-// Copied from lib/codex-events.js, which keeps its own copy until the legacy
-// harness is deleted; the two must not drift before then.
-const RULE_CHAR = /^[A-Za-z0-9_./~+:,@%^=-]$/;
-const RULE_PROGRAM = /^[A-Za-z0-9_.~/+-]+$/;
-const RULE_WORD = /^[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,63}$/;
-// Words that run some OTHER command, as a program (`sudo rm`) or a subcommand
-// (`npm exec`, `docker exec`, `pnpm dlx`).
-const RULE_WRAPPERS = new Set([
-  'sudo', 'doas', 'su', 'runuser', 'pkexec', 'env', 'xargs', 'nohup', 'nice', 'ionice', 'time', 'timeout',
-  'watch', 'command', 'builtin', 'exec', 'eval', 'source', 'bash', 'sh', 'zsh', 'dash', 'ksh', 'fish', 'csh',
-  'tcsh', 'pwsh', 'powershell', 'cmd', 'ssh', 'find', 'busybox', 'chroot', 'strace', 'parallel', 'stdbuf',
-  'unbuffer', 'script', 'flock', 'setsid', 'dlx', 'x', 'shell',
-]);
-// Programs that delete, move, overwrite, fetch or re-permission.
-const RULE_DESTRUCTIVE = new Set([
-  'rm', 'rmdir', 'unlink', 'shred', 'dd', 'mkfs', 'mv', 'cp', 'ln', 'install', 'truncate', 'tee', 'chmod',
-  'chown', 'chgrp', 'kill', 'killall', 'pkill', 'curl', 'wget', 'scp', 'rsync', 'sftp',
-]);
-// Subcommands that delete (`git rm`, `docker rm`).
-const RULE_DELETE_SUBS = new Set(['rm', 'rmdir', 'unlink', 'shred']);
-// Subcommands that group others, whose next plain word is part of the rule.
-const RULE_GROUP_SUBS = new Set(['stash', 'remote', 'worktree', 'submodule', 'compose', 'bisect', 'notes', 'reflog']);
-const isRuleFlag = (w) => /^[-+:]/.test(w);
-
-// The words of one simple command, quotes removed, or null when it is not one.
-function ruleWords(script) {
-  const s = String(script || '').trim();
-  if (!s || s.length > 2000) return null;
-  const words = [];
-  let cur = null;
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    if (ch === ' ' || ch === '\t') {
-      if (cur !== null) words.push(cur);
-      cur = null;
-    } else if (ch === "'" || ch === '"') {
-      const end = s.indexOf(ch, i + 1);
-      if (end < 0) return null;
-      const inner = s.slice(i + 1, end);
-      if (ch === '"' && /[$`\\!]/.test(inner)) return null; // still expands inside double quotes
-      cur = (cur || '') + inner;
-      i = end;
-    } else if (RULE_CHAR.test(ch)) {
-      cur = (cur || '') + ch;
-    } else {
-      return null;
-    }
-  }
-  if (cur !== null) words.push(cur);
-  return words;
-}
-
-const ruleName = (word) => String(word).split('/').pop().toLowerCase().replace(/\.exe$/, '');
-
-// { key, label, flags } for a command and the folder it runs in, or null.
-function commandRule(command, cwd) {
-  const words = ruleWords(command);
-  if (!words || words.length < 2) return null;
-  const [program, sub] = words;
-  if (!RULE_PROGRAM.test(program) || program.startsWith('-')) return null;
-  const name = ruleName(program);
-  if (RULE_WRAPPERS.has(name) || RULE_DESTRUCTIVE.has(name) || name.startsWith('mkfs')) return null;
-  const rest = words.slice(2);
-  const parts = [program, sub];
-  if (sub === 'run' || RULE_GROUP_SUBS.has(sub)) {
-    const at = rest.findIndex((w) => !isRuleFlag(w));
-    if (at >= 0) parts.push(rest.splice(at, 1)[0]);
-    else if (sub === 'run') return null;
-  }
-  for (const w of parts.slice(1)) {
-    if (!w || !RULE_WORD.test(w)) return null;
-    const lower = w.toLowerCase();
-    if (RULE_WRAPPERS.has(lower) || RULE_DELETE_SUBS.has(lower)) return null;
-  }
-  const flags = [];
-  for (const w of rest) {
-    if (!isRuleFlag(w)) continue;
-    const split = /^-[A-Za-z]{2,}$/.test(w) ? [...w.slice(1)].map((ch) => `-${ch}`) : [w];
-    for (const f of split) if (!flags.includes(f)) flags.push(f);
-  }
-  return { key: JSON.stringify([...parts, String(cwd || '')]), label: [...parts, ...flags].join(' '), flags: [...flags].sort() };
-}
-
-// A later command is covered by a grant when it is alike (the same key, which
-// the caller checks) and every flag it carries was on a command approved.
-function ruleCovers(grantedFlags, flags) {
-  const have = new Set(Array.isArray(grantedFlags) ? grantedFlags : []);
-  return Array.isArray(flags) && flags.every((f) => have.has(f));
-}
-
 // The answers a request offers, as Codex lists them. With experimentalApi on (it
 // always is: lib/codex-rpc.js) a command approval carries `availableDecisions`;
 // without it, the set Codex's own core falls back to
@@ -340,8 +210,6 @@ function card(method, params) {
     case 'item/commandExecution/requestApproval': {
       const command = shellCommand(params.command);
       const c = { preview: command, description: why, input: { command, cwd: params.cwd || null } };
-      const rule = commandRule(command, params.cwd);
-      if (rule) c.likeRule = rule;
       return c;
     }
     case 'item/fileChange/requestApproval':
@@ -402,7 +270,6 @@ function createCodexTurn({ threadId = null } = {}) {
   const planDeltas = new Map(); // plan itemId -> streamed text, for a plan the turn ended inside of
   const open = new Map();       // own agentMessage itemId -> streamed text, until it completes
   const pending = new Map();    // requestId -> { method, params, rpcId, decisions, rule }
-  const turnRules = new Map();  // commandRule key -> [the flags of each command allowed "like this" this turn]
   const subTurns = new Map();   // sub-agent threadId -> its running turn id
   const workers = new Map();    // sub-agent threadId -> { nickname, role, agentPath }
 
@@ -568,24 +435,15 @@ function createCodexTurn({ threadId = null } = {}) {
     const p = params && typeof params === 'object' ? params : {};
     const toolName = CARDS[method];
     if (!toolName) return out([], [{ id: rpcId, error: { code: REFUSED, message: `Termdeck does not handle ${method}` } }]);
-    const entry = { method, params: p, rpcId, decisions: defaultDecisions(method, p), rule: null };
+    const entry = { method, params: p, rpcId, decisions: defaultDecisions(method, p) };
     if (ended) return out([], [refusalReply(entry, 'cancel')]);
     const c = card(method, p);
     const requestId = `codex-${rpcId}`;
-    entry.rule = c.likeRule || null;
     pending.set(requestId, entry);
     const ev = { type: 'approval.requested', requestId, toolName, input: c.input };
     if (c.preview) ev.preview = c.preview;
     if (c.description) ev.description = c.description;
     if (c.questions) ev.questions = c.questions;
-    if (c.likeRule) {
-      // Offered, and (when a person already said yes to one like it this turn)
-      // vouched for. The master still runs its guards first and must hold the
-      // same grant itself before it answers without asking.
-      ev.likeRule = c.likeRule;
-      const granted = turnRules.get(c.likeRule.key) || [];
-      if (granted.some((flags) => ruleCovers(flags, c.likeRule.flags))) ev.turnRule = c.likeRule.key;
-    }
     // A worker's request is this run's to answer: the person is watching the chat
     // that spawned it, and nobody is watching the worker's thread.
     if (!own(p)) {
@@ -622,13 +480,6 @@ function createCodexTurn({ threadId = null } = {}) {
           // widen what Codex asked.
           const ok = offered(p.decisions, want);
           const value = ok ? want : refusalOf(p.decisions);
-          // "Like this, for this turn": the rule is the one derived from the
-          // request raised here, never one the answer describes, and it lives on
-          // this follower, which follows one turn, so it ends with the turn.
-          if (ok && value === 'accept' && p.rule && d.scope === 'turn') {
-            if (!turnRules.has(p.rule.key)) turnRules.set(p.rule.key, []);
-            turnRules.get(p.rule.key).push(p.rule.flags);
-          }
           reply = { id: p.rpcId, result: { decision: value } };
           outcome = ok && isAccept(value) ? 'allow' : 'deny';
           break;
@@ -729,8 +580,6 @@ module.exports = {
   forwarded,
   capParams,
   shellCommand,
-  commandRule,
-  ruleCovers,
   defaultDecisions,
   usageEvent,
   workerName,

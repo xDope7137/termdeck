@@ -24,7 +24,7 @@ const protocol = require('./agent-protocol');
 const { UPDATE_BOUNDS } = protocol;
 
 // The agent's own settings file, read by the agent itself. The docs tell an owner to put
-// a setting such as TERMDECK_FULL_ACCESS=off in agent.env and restart, and that used to
+// a setting such as TERMDECK_CONFIG_READONLY=1 in agent.env and restart, and that used to
 // work only where the SUPERVISOR loaded the file: systemd's EnvironmentFile= did, but the
 // macOS launchd plist carries just the token and the master URL, so on a Mac the safety
 // switch and the TERMDECK_*_EXE overrides were silently ignored (QA 2026-10-08).

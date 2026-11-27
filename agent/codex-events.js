@@ -21,11 +21,8 @@
 //
 // `writes` are JSON-RPC messages the driver must put on the app-server's stdin.
 //
-// What deliberately stays OUT of here and on the master: whether an approval is
-// answered by a policy, a remembered "allow for this chat" or a person. The
-// broker that decides is owner-scoped and lives on the master (lib/approval-broker.js),
-// so every approval is raised as an event and the master answers it, even the ones
-// it answers in a millisecond.
+// What deliberately stays OUT of here: answering an approval. Every one is raised
+// as an event and the master relays the person's answer (or the chat's mode).
 
 const { inputPreview } = require('./transcript');
 
@@ -108,132 +105,6 @@ function shellCommand(command) {
   return m ? m[1].replace(/'\\''/g, "'") : text;
 }
 
-// "Approve commands like this for the rest of this turn" (features/02 1.11b).
-// A turn that escalates six times should not be six clicks, and the grant that
-// replaces them must never become a blanket allow. So "like this" is narrow and
-// written down here, once, for the agent that enforces it and the master that
-// offers it:
-//
-//   - the command is ONE simple command: plain words, quotes allowed, and no
-//     pipe, redirect, `;`, `&&`, subshell, `$`, backtick, glob or newline, so
-//     `npm test && rm -rf ~` is never "like" `npm test`;
-//   - it names a program and a first subcommand word (`git status`,
-//     `cargo test`, `pytest tests`). For a `run` subcommand the thing it runs is
-//     part of it too (`npm run build`, `uv run pytest`), and so is the first
-//     plain word after a subcommand that groups others (`git stash drop`,
-//     `docker compose down`), so `git stash` never covers `git stash clear`;
-//   - neither word runs some OTHER command (sudo, env, xargs, a shell, ssh,
-//     find, `npm exec`, `docker exec`...), the program is not one that deletes,
-//     moves, copies, fetches or changes permissions (rm, mv, cp, curl,
-//     chmod...), and the subcommand does not delete (`git rm`);
-//   - it runs in the same folder;
-//   - it carries NO FLAG the approved command did not. Plain arguments may
-//     differ (another file, another branch), flags may not: `git push` does not
-//     cover `git push --force`, `git clean -n` does not cover `git clean -fdx`,
-//     `git branch` does not cover `git branch -D`. A flag is any word starting
-//     with `-`, compared whole (`--force-with-lease=main` is not
-//     `--force-with-lease`); combined short flags count letter by letter (`-fdx`
-//     is `-f -d -x`); and a word starting with `+` or `:` counts as one too,
-//     since that is how git spells a force push (`+main`) and a remote delete
-//     (`:main`). A list of the flags approved rather than a list of dangerous
-//     flags, because the next dangerous flag is the one nobody wrote down.
-//
-// The key says which commands are alike; `flags` says how far a grant reaches.
-// The master still runs its guards on every match and asks again for one the
-// risk grader scores above what was approved (lib/cloud/agent-codex-runner.js
-// turnRuleDecision). Anything else (a flag first, a path, `ls` on its own) has
-// no rule and is asked one at a time. Codex's
-// own `acceptWithExecpolicyAmendment` is not used for this: it saves a rule to
-// the machine's execpolicy for every future session, terminal included, which is
-// "always" and not "this turn".
-const RULE_CHAR = /^[A-Za-z0-9_./~+:,@%^=-]$/;
-const RULE_PROGRAM = /^[A-Za-z0-9_.~/+-]+$/;
-const RULE_WORD = /^[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,63}$/;
-// Words that run some OTHER command, as a program (`sudo rm`) or a subcommand
-// (`npm exec`, `docker exec`, `pnpm dlx`).
-const RULE_WRAPPERS = new Set([
-  'sudo', 'doas', 'su', 'runuser', 'pkexec', 'env', 'xargs', 'nohup', 'nice', 'ionice', 'time', 'timeout',
-  'watch', 'command', 'builtin', 'exec', 'eval', 'source', 'bash', 'sh', 'zsh', 'dash', 'ksh', 'fish', 'csh',
-  'tcsh', 'pwsh', 'powershell', 'cmd', 'ssh', 'find', 'busybox', 'chroot', 'strace', 'parallel', 'stdbuf',
-  'unbuffer', 'script', 'flock', 'setsid', 'dlx', 'x', 'shell',
-]);
-// Programs that delete, move, overwrite, fetch or re-permission.
-const RULE_DESTRUCTIVE = new Set([
-  'rm', 'rmdir', 'unlink', 'shred', 'dd', 'mkfs', 'mv', 'cp', 'ln', 'install', 'truncate', 'tee', 'chmod',
-  'chown', 'chgrp', 'kill', 'killall', 'pkill', 'curl', 'wget', 'scp', 'rsync', 'sftp',
-]);
-// Subcommands that delete (`git rm`, `docker rm`).
-const RULE_DELETE_SUBS = new Set(['rm', 'rmdir', 'unlink', 'shred']);
-// Subcommands that group others, whose next plain word is part of the rule.
-const RULE_GROUP_SUBS = new Set(['stash', 'remote', 'worktree', 'submodule', 'compose', 'bisect', 'notes', 'reflog']);
-const isRuleFlag = (w) => /^[-+:]/.test(w);
-
-// The words of one simple command, quotes removed, or null when it is not one.
-function ruleWords(script) {
-  const s = String(script || '').trim();
-  if (!s || s.length > 2000) return null;
-  const words = [];
-  let cur = null;
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    if (ch === ' ' || ch === '\t') {
-      if (cur !== null) words.push(cur);
-      cur = null;
-    } else if (ch === "'" || ch === '"') {
-      const end = s.indexOf(ch, i + 1);
-      if (end < 0) return null;
-      const inner = s.slice(i + 1, end);
-      if (ch === '"' && /[$`\\!]/.test(inner)) return null; // still expands inside double quotes
-      cur = (cur || '') + inner;
-      i = end;
-    } else if (RULE_CHAR.test(ch)) {
-      cur = (cur || '') + ch;
-    } else {
-      return null;
-    }
-  }
-  if (cur !== null) words.push(cur);
-  return words;
-}
-
-const ruleName = (word) => String(word).split('/').pop().toLowerCase().replace(/\.exe$/, '');
-
-// { key, label } for a command and the folder it runs in, or null.
-function commandRule(command, cwd) {
-  const words = ruleWords(command);
-  if (!words || words.length < 2) return null;
-  const [program, sub] = words;
-  if (!RULE_PROGRAM.test(program) || program.startsWith('-')) return null;
-  const name = ruleName(program);
-  if (RULE_WRAPPERS.has(name) || RULE_DESTRUCTIVE.has(name) || name.startsWith('mkfs')) return null;
-  const rest = words.slice(2);
-  const parts = [program, sub];
-  if (sub === 'run' || RULE_GROUP_SUBS.has(sub)) {
-    const at = rest.findIndex((w) => !isRuleFlag(w));
-    if (at >= 0) parts.push(rest.splice(at, 1)[0]);
-    else if (sub === 'run') return null;
-  }
-  for (const w of parts.slice(1)) {
-    if (!w || !RULE_WORD.test(w)) return null;
-    const lower = w.toLowerCase();
-    if (RULE_WRAPPERS.has(lower) || RULE_DELETE_SUBS.has(lower)) return null;
-  }
-  const flags = [];
-  for (const w of rest) {
-    if (!isRuleFlag(w)) continue;
-    const split = /^-[A-Za-z]{2,}$/.test(w) ? [...w.slice(1)].map((ch) => `-${ch}`) : [w];
-    for (const f of split) if (!flags.includes(f)) flags.push(f);
-  }
-  return { key: JSON.stringify([...parts, String(cwd || '')]), label: [...parts, ...flags].join(' '), flags: [...flags].sort() };
-}
-
-// A later command is covered by a grant when it is alike (the same key, which
-// the caller checks) and every flag it carries was on a command approved.
-function ruleCovers(grantedFlags, flags) {
-  const have = new Set(Array.isArray(grantedFlags) ? grantedFlags : []);
-  return Array.isArray(flags) && flags.every((f) => have.has(f));
-}
-
 // What a person is shown for each of the four approval RPCs. `reason` is the
 // model's own justification for asking (the `justification` it passed with the
 // escalation), and it is the card's WHY rather than a field in its input dump.
@@ -242,8 +113,6 @@ function approvalCard(method, params) {
   if (method === 'item/commandExecution/requestApproval') {
     const command = shellCommand(params.command);
     const card = { toolName: 'shell', preview: command, description: why, detail: { command, cwd: params.cwd } };
-    const rule = commandRule(command, params.cwd);
-    if (rule) card.likeRule = rule;
     return card;
   }
   if (method === 'item/fileChange/requestApproval') {
@@ -338,7 +207,6 @@ function createCodexTranslator({ threadId = null } = {}) {
   const itemBlocks = new Map(); // itemId -> every block index it opened
   const summaryPart = new Map(); // reasoning itemId -> the summary part being written
   const pending = new Map();   // requestId -> { method, params, rpcId, rule }
-  const turnRules = new Map(); // commandRule key -> [the flags of each command a person allowed "like this" this turn]
   const agents = new Map();    // sub-agent threadId -> { name, toolUses, lastText } (subagentNotification)
 
   const out = (events = [], writes = [], extra = {}) => ({ events, writes, ended: false, ...extra });
@@ -702,19 +570,11 @@ function createCodexTranslator({ threadId = null } = {}) {
     }
     const card = approvalCard(method, params);
     const requestId = `codex-${rpcId}`;
-    pending.set(requestId, { method, params, rpcId, rule: card.likeRule || null });
+    pending.set(requestId, { method, params, rpcId });
     const ev = { type: 'approval.requested', requestId, toolName: card.toolName, input: card.detail || {} };
     if (card.preview) ev.preview = card.preview;
     if (card.description) ev.description = card.description;
     if (card.questions) ev.questions = card.questions;
-    if (card.likeRule) {
-      // Offered, and (when a person already said yes to one like it this turn)
-      // vouched for. The master still runs its guards first and must hold the
-      // same grant itself before it answers without asking.
-      ev.likeRule = card.likeRule;
-      const granted = turnRules.get(card.likeRule.key) || [];
-      if (granted.some((flags) => ruleCovers(flags, card.likeRule.flags))) ev.turnRule = card.likeRule.key;
-    }
     // The live row this call already has ("shell · npm test"), so the browser can
     // put the question on that row instead of saying the command twice.
     const row = params.itemId != null ? itemBlock.get(params.itemId) : undefined;
@@ -726,15 +586,6 @@ function createCodexTranslator({ threadId = null } = {}) {
     const p = pending.get(requestId);
     if (!p) return out(); // already settled: a second copy of an answer is harmless
     pending.delete(requestId);
-    // "Like this, for this turn": the rule is the one this agent derived from
-    // the request it raised, never one the answer describes, so a master cannot
-    // widen it. It lives on this translator, which follows one turn, so it ends
-    // with the turn. The request itself is answered `accept`, not
-    // acceptForSession: the app-server's own cache outlives the turn.
-    if (p.rule && decision && decision.behavior === 'allow' && decision.scope === 'turn') {
-      if (!turnRules.has(p.rule.key)) turnRules.set(p.rule.key, []);
-      turnRules.get(p.rule.key).push(p.rule.flags);
-    }
     const events = [];
     const outcome = decision && decision.timedOut ? 'timeout'
       : decision && decision.cancelled ? 'cancelled'
@@ -791,8 +642,6 @@ function createCodexTranslator({ threadId = null } = {}) {
 module.exports = {
   itemToolName,
   shellCommand,
-  commandRule,
-  ruleCovers,
   approvalCard,
   approvalReply,
   usageEvent,

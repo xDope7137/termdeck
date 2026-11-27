@@ -45,7 +45,7 @@
 
 const { inputPreview, grokPromptId, TERMINAL_TOOL_STATUSES } = require('./transcript');
 
-// toolCall.kind -> Termdeck's tool vocabulary, so risk scoring and policies read a
+// toolCall.kind -> Termdeck's tool vocabulary, so the card and the chat's mode read a
 // Grok call like the other two engines' calls. The master's mode decision reads it
 // too: Read and Edit are what a mode may wave through.
 function approvalToolName(toolCall) {

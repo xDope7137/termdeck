@@ -74,15 +74,14 @@ const TYPES = {
 
   // The engine is blocked until someone answers. questions is set for ask-the-user
   // prompts; timeoutAt is epoch ms, null when the request waits forever.
-  // anchor { messageId, blockIndex } is the call's own live row; likeRule
-  // { key, label } is the "like this, for this turn" rule the request offers,
-  // and turnRule the key of one a person already granted this turn (Codex,
-  // lib/codex-events.js commandRule). toolUseId is the call it asks about, where
+  // anchor { messageId, blockIndex } is the call's own live row. toolUseId is the call it asks about, where
   // the engine names one (Claude). `codex` is the native harness's server request
   // as Codex sent it ({ method, params }) and `decisions` the answers that request
   // offers (its availableDecisions, or the method's default set), so the card is
   // drawn from Codex's own vocabulary and the agent can refuse anything else
-  // (lib/codex-turn.js).
+  // (lib/codex-turn.js). likeRule and turnRule are what an agent older than
+  // 0.1.1586 still sends with a Codex command; they are accepted so its frame
+  // is not refused, and read by nothing.
   'approval.requested': {
     requestId: 'string', toolName: 'string', 'input?': 'any', 'preview?': 'string', 'description?': 'string',
     'risk?': 'string', 'questions?': 'array', 'timeoutAt?': 'number', 'suggestions?': 'array',
