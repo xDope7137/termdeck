@@ -190,6 +190,15 @@ const TABLE = [
     codes: ['AGENT_OUTDATED'],
     note: 'the only writes inside the transcript roots: trash, title/tag records',
   },
+  // Claude's recap for a chat left alone in the browser: the CLI's own /recap on
+  // a fork that writes nothing, appended as the `away_summary` record the terminal
+  // writes (lib/recap-due.js). A cold CLI start plus one short model call.
+  {
+    name: 'recap',
+    timeoutMs: 120_000,
+    codes: ['AGENT_OUTDATED', 'BAD_ENGINE', 'RECAP_FAILED'],
+    note: "Claude's away recap: the CLI's /recap on a non-persisting fork, written back as an away_summary record",
+  },
   { name: 'restore', timeoutMs: 60_000, codes: ['AGENT_OUTDATED'], note: '/rewind: the one write that lands outside the roots; 60 files means 120 disk ops' },
   // An attachment on its way to a CLI, written where the CLI can read it and
   // nowhere else: ~/.termdeck/uploads/<bucket>/<name>, one level deep, one file

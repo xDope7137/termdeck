@@ -16,6 +16,7 @@ const PREVIEW_MAX = 100;
 const COMMAND_RE = /<command-name>([\s\S]*?)<\/command-name>/;
 const COMMAND_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
 const COMMAND_STDOUT_RE = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/;
+const RECAP_CONFIG_HINT_RE = /\s*\(turn off recaps in \/config\)\s*$/;
 const TASK_NOTIF_RE = /<task-notification>([\s\S]*?)<\/task-notification>/;
 const TASK_NOTIF_STATUS_RE = /<status>([\s\S]*?)<\/status>/;
 const TASK_NOTIF_SUMMARY_RE = /<summary>([\s\S]*?)<\/summary>/;
@@ -926,6 +927,37 @@ function recordToMessage(rec, allowSidechain = false) {
         fallbackModel: fallback ? rec.fallbackModel || rec.fallback_model || null : null,
         category: rec.apiRefusalCategory || rec.api_refusal_category || null,
       }],
+    };
+  }
+  // Claude's session recap: one or two sentences on the goal, where it stands and
+  // the next step. It reaches disk two ways, both rendered as the same row:
+  //
+  //   away_summary:  written by the CLI itself when the person comes back to a
+  //                   session after being away (the terminal's own "recap" line),
+  //                   and by Termdeck's agent for a chat left alone in the browser
+  //                   (lib/recap-due.js). Not model context; a system record.
+  //   local_command: the answer to a typed `/recap`. The record carries
+  //                   `commandRun.command`, so it is told apart from every other
+  //                   command's output without reading the words.
+  //
+  // The terminal adds " (turn off recaps in /config)" to its first few recaps.
+  // That is the terminal's own hint about its own menu, not part of the recap.
+  if (rec.type === 'system' && (rec.subtype === 'away_summary'
+    || (rec.subtype === 'local_command' && rec.commandRun && rec.commandRun.command === 'recap'))) {
+    const away = rec.subtype === 'away_summary';
+    let text = typeof rec.content === 'string' ? rec.content : '';
+    if (!away) {
+      const m = text.match(COMMAND_STDOUT_RE);
+      text = m ? stripAnsi(m[1]) : '';
+    }
+    text = text.replace(RECAP_CONFIG_HINT_RE, '').trim();
+    if (!text) return null;
+    return {
+      role: 'recap',
+      messageId: rec.uuid || null,
+      uuid: rec.uuid || null,
+      timestamp: rec.timestamp || null,
+      blocks: [{ kind: 'recap', text, source: away ? 'away' : 'command' }],
     };
   }
   if (rec.type !== 'user' && rec.type !== 'assistant') return null;

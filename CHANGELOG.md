@@ -4,6 +4,13 @@ Termdeck ships continuously: 1,110 production deploys in the first 146 days. Thi
 curated version: the changes a user would notice, newest first. Agents self-update, so
 anything marked *(agent)* reaches connected machines on its own.
 
+## 0.1.1588 · 2026-11-27
+
+Agent release: **0.1.980**.
+
+- **Claude's recap shows in your chats**. The one or two sentence recap Claude Code writes when you come back to a session now appears as a Recap line in the transcript, including recaps written in the terminal. Type `/recap` in a Claude chat to ask for one.
+- **A recap while you were away** *(agent)*. About three minutes after a turn ends, if no open window shows the chat, Termdeck asks Claude for a recap and adds it to the chat, as the terminal does. It follows the terminal's rules and its Session recap switch.
+
 ## 0.1.1586 · 2026-11-27
 
 Agent release: **0.1.978**.

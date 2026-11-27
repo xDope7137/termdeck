@@ -239,8 +239,8 @@ and rewinding are Codex's own operations. Claude Code and Grok sit in the same s
 A fixed list of typed capabilities, not a shell. Reads are confined to the transcript roots and the
 open chat's project folder (read only). Paths are never sent from the server: the master names a
 session id and the agent resolves it against its own disk. The writes are narrow and named: a file
-you attach (into `~/.termdeck/uploads`, never your project), checkpoint
-restore, and the engine account switching you ask for. Processes it may signal are ones it started,
+you attach (into `~/.termdeck/uploads`, never your project), Claude's recap line appended to a
+Claude chat, checkpoint restore, and the engine account switching you ask for. Processes it may signal are ones it started,
 plus a terminal client you asked to take over. The code is in
 [`agent/capabilities.js`](agent/capabilities.js); [termdeck.io/docs/security](https://termdeck.io/docs/security?ref=github) is the long version.
 

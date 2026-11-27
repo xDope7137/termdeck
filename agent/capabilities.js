@@ -2035,6 +2035,109 @@ function makeCapabilities(send, opts = {}) {
     return { data };
   });
 
+  // Claude's recap for a chat left alone in the browser (lib/recap-due.js says
+  // why and when). The master names a CONFINED transcript and its session, never
+  // a cwd, a model or an argv: the cwd and model are read out of the transcript,
+  // and the argv is fixed here. The CLI's own `/recap` runs on a fork of the
+  // session that writes nothing (--fork-session --no-session-persistence), and
+  // its answer is appended as the `away_summary` record the terminal itself
+  // writes. Every rule is checked again here, on the file as it is now, because
+  // the master's view can be seconds old and only the box knows if a turn began.
+  // Skips are answers ({ skipped: reason }), not failures: nothing went wrong.
+  const RECAP_TAIL_BYTES = 4 * 1024 * 1024;
+  const RECAP_TIMEOUT_MS = 90_000;
+  const readRecapTail = async (rp) => {
+    const fh = await fsp.open(rp, 'r');
+    try {
+      const { size } = await fh.stat();
+      const len = Math.min(size, RECAP_TAIL_BYTES);
+      const buf = Buffer.alloc(len);
+      await fh.read(buf, 0, len, size - len);
+      let text = buf.toString('utf8');
+      if (len < size) text = text.slice(text.indexOf('\n') + 1);
+      const records = [];
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue;
+        try { records.push(JSON.parse(line)); } catch {}
+      }
+      return { size, records, partial: len < size };
+    } finally { await fh.close(); }
+  };
+  const runRecapCli = (spawnOpts) => new Promise((resolve) => {
+    const { spawn } = require('child_process');
+    const exe = engineExes.claude;
+    const args = ['-p', '/recap', '--resume', spawnOpts.sessionId, '--fork-session', '--no-session-persistence', '--output-format', 'json'];
+    if (spawnOpts.model) args.push('--model', spawnOpts.model);
+    let child;
+    try {
+      const viaCmd = /\.(cmd|bat)$/i.test(exe) ? cmdShimSpawn(exe, args) : null;
+      child = viaCmd
+        ? spawn(viaCmd.file, viaCmd.args, { cwd: spawnOpts.cwd, env: spawnOpts.env, windowsVerbatimArguments: viaCmd.verbatim, stdio: ['ignore', 'pipe', 'pipe'] })
+        : spawn(exe, args, { cwd: spawnOpts.cwd, env: spawnOpts.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) { resolve({ error: e.message }); return; }
+    let out = '';
+    child.stdout.on('data', (d) => { if (out.length < 1024 * 1024) out += d; });
+    child.stderr.on('data', () => {});
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, RECAP_TIMEOUT_MS);
+    child.on('error', (e) => { clearTimeout(timer); resolve({ error: e.message }); });
+    child.on('close', () => {
+      clearTimeout(timer);
+      try {
+        const r = JSON.parse(out.trim().split('\n').pop());
+        resolve(r && !r.is_error && typeof r.result === 'string' ? { text: r.result } : { error: 'no recap in the answer' });
+      } catch { resolve({ error: 'unreadable answer' }); }
+    });
+  });
+  defineOp('recap', async (m) => {
+    let recapLib; try { recapLib = require('./recap-due'); } catch { recapLib = null; }
+    if (!recapLib) throw fail('agent is out of date (recap module missing). Update the agent', 'AGENT_OUTDATED');
+    if (!engineExes.claude) throw fail('engine not permitted: claude', 'BAD_ENGINE');
+    if (typeof m.sessionId !== 'string' || !RECORD_UUID_RE.test(m.sessionId)) throw fail('bad sessionId');
+    if (!(await confined(m.path))) throw fail('path not permitted');
+    const rp = await fsp.realpath(m.path);
+    if (!inSessionTree(rp) || !/\.jsonl$/i.test(rp) || path.basename(rp, '.jsonl') !== m.sessionId) throw fail('path not permitted');
+
+    const env = engineEnv('claude');
+    let settings = null;
+    try { settings = JSON.parse(await fsp.readFile(path.join(env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'settings.json'), 'utf8')); } catch {}
+    if (!recapLib.recapsEnabled(settings, env)) return { skipped: 'off' };
+    const busy = () => runs.list().some((r) => r.sessionId === m.sessionId && !r.exited && (r.current || r.held));
+    if (busy()) return { skipped: 'busy' };
+
+    const before = await readRecapTail(rp);
+    const due = recapLib.recapDue(before.records, { partial: before.partial });
+    if (!due.due) return { skipped: due.reason };
+    const last = recapLib.lastMessage(before.records);
+    if (!last || !last.cwd) return { skipped: 'no-cwd' };
+    let cwdOk = false;
+    try { cwdOk = (await fsp.stat(last.cwd)).isDirectory(); } catch {}
+    if (!cwdOk) return { skipped: 'cwd-gone' };
+
+    const got = await (opts.runRecap || runRecapCli)({ sessionId: m.sessionId, cwd: last.cwd, env, model: recapLib.lastModel(before.records) });
+    if (got.error) throw fail(`recap failed: ${got.error}`, 'RECAP_FAILED');
+    const text = recapLib.cleanRecap(got.text);
+    if (!text) return { skipped: 'no-recap' };
+
+    // The CLI drops a recap that lands after a new turn began; so does this.
+    if (busy()) return { skipped: 'busy' };
+    let size = -1;
+    try { size = (await fsp.stat(rp)).size; } catch {}
+    if (size !== before.size) return { skipped: 'changed' };
+    const record = recapLib.awaySummaryRecord({ text, last, sessionId: m.sessionId, uuid: require('crypto').randomUUID() });
+    // A file whose last line has no newline yet would swallow ours into it.
+    let lead = '';
+    if (size > 0) {
+      const fh = await fsp.open(rp, 'r');
+      try {
+        const b = Buffer.alloc(1);
+        await fh.read(b, 0, 1, size - 1);
+        if (b[0] !== 0x0a) lead = '\n';
+      } finally { await fh.close(); }
+    }
+    await fsp.appendFile(rp, `${lead}${JSON.stringify(record)}\n`, 'utf8');
+    return { written: true, text, uuid: record.uuid };
+  });
+
   // The agent's own log, tailed back to its owner's dashboard. Deliberately NOT
   // part of the readFile capability: that one is confined to the transcript roots
   // and must stay that way — this is one fixed file, no path parameter, and
